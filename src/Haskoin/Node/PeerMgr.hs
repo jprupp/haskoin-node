@@ -382,7 +382,7 @@ dispatch (Connect sa) = do
 dispatch (PeerDied a e) = do
   processPeerOffline a e
 dispatch (CheckPeer p) = do
-  $(logDebugS) "PeerManager" $
+  $(logDebugS) "PeerMgr" $
     "Housekeeping for peer " <> p.label
   checkPeer p
 
@@ -426,7 +426,7 @@ sendPing p = do
           n <- liftIO randomIO
           now <- liftIO getCurrentTime
           atomically (setPeerPing b n now p)
-          $(logDebugS) " PeerManager" $
+          $(logDebugS) "PeerMgr" $
             "Sending ping "
               <> cs (show n)
               <> " to: "
