@@ -25,6 +25,7 @@ module Haskoin.Node.PeerMgr
     peerMgrVerAck,
     getPeers,
     getOnlinePeer,
+    ticklePeer,
     buildVersion,
     myVersion,
     toSockAddr,
@@ -386,6 +387,12 @@ dispatch (CheckPeer p) = do
     "Housekeeping for peer " <> p.label
   checkPeer p
 
+ticklePeer :: ( MonadLoggerIO m) => PeerMgr -> Peer -> m ()
+ticklePeer m p = do
+  $(logDebugS) "PeerMgr" $ "Tickle peer " <> p.label
+  t <- liftIO getCurrentTime
+  atomically $ modifyPeer m.peers p $ \o -> o {tickled = t}
+
 checkPeer :: (MonadManager m, MonadLoggerIO m) => Peer -> m ()
 checkPeer p = do
   busy <- getBusy p
@@ -633,8 +640,7 @@ gotPong b nonce now p = void . runMaybeT $ do
       b
       o
         { ping = Nothing,
-          pings = sort $ take 11 $ diff : o.pings,
-          tickled = now
+          pings = sort $ take 11 $ diff : o.pings
         }
 
 setPeerPing :: TVar [OnlinePeer] -> Word64 -> UTCTime -> Peer -> STM ()
