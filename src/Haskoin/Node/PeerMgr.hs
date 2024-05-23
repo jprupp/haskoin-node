@@ -4,6 +4,7 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TemplateHaskell #-}
@@ -22,7 +23,6 @@ module Haskoin.Node.PeerMgr
     peerMgrPong,
     peerMgrAddrs,
     peerMgrVerAck,
-    peerMgrTickle,
     getPeers,
     getOnlinePeer,
     buildVersion,
@@ -68,7 +68,7 @@ import Control.Monad.Trans.Maybe (MaybeT (..), runMaybeT)
 import Data.Bits ((.&.))
 import Data.Function (on)
 import Data.List (dropWhileEnd, elemIndex, find, nub, sort)
-import Data.Maybe (fromMaybe, isJust)
+import Data.Maybe (fromMaybe, isJust, isNothing)
 import Data.Set (Set)
 import qualified Data.Set as Set
 import Data.String.Conversions (cs)
@@ -177,7 +177,6 @@ data PeerMgrMessage
   | PeerPing !Peer !Word64
   | PeerPong !Peer !Word64
   | PeerAddrs !Peer ![NetworkAddress]
-  | PeerTickle !Peer
 
 -- | Data structure representing an online peer.
 data OnlinePeer = OnlinePeer
@@ -386,14 +385,6 @@ dispatch (CheckPeer p) = do
   $(logDebugS) "PeerManager" $
     "Housekeeping for peer " <> p.label
   checkPeer p
-dispatch (PeerTickle p) = do
-  $(logDebugS) "PeerMgr" $
-    "Tickled peer " <> p.label
-  b <- asks (.peers)
-  now <- liftIO getCurrentTime
-  atomically $
-    modifyPeer b p $ \o ->
-      o {tickled = now}
 
 checkPeer :: (MonadManager m, MonadLoggerIO m) => Peer -> m ()
 checkPeer p = do
@@ -402,27 +393,26 @@ checkPeer p = do
   mp <- asks (.peers) >>= atomically . flip findPeer p
   case mp of
     Nothing -> return ()
-    Just o ->
-      liftIO getCurrentTime >>= \now -> do
-        maxLife <- asks (.config.maxPeerLife)
-        let disconnect = maxLife `addUTCTime` o.connected
-        when (now > disconnect) $ do
-          $(logErrorS) "PeerMgr" $
-            "Disconnecting old peer "
-              <> p.label
-              <> " online since "
-              <> cs (show o.connected)
-          killPeer PeerTooOld p
-        timeout <- asks (.config.timeout)
-        let pingTime = timeout `addUTCTime` o.tickled
-        when (now > pingTime) $
-          case o.ping of
-            Nothing ->
-              sendPing p
-            Just _ -> do
-              $(logWarnS) "PeerMgr" $
-                "Peer ping timeout: " <> p.label
-              killPeer PeerTimeout p
+    Just o -> do
+      now <- liftIO getCurrentTime
+      maxLife <- asks (.config.maxPeerLife)
+      let expired = maxLife `addUTCTime` o.connected
+      timeout <- asks (.config.timeout)
+      let deadline = timeout `addUTCTime` o.tickled
+      if
+        | now > expired -> do
+            $(logErrorS) "PeerMgr" $
+              "Disconnecting old peer "
+                <> p.label
+                <> " online since "
+                <> cs (show o.connected)
+            killPeer PeerTooOld p
+        | now > deadline -> do
+            $(logWarnS) "PeerMgr" $ "Peer timeout: " <> p.label
+            killPeer PeerTimeout p
+        | isNothing o.ping ->
+            sendPing p
+        | otherwise -> return ()
 
 sendPing :: (MonadManager m, MonadLoggerIO m) => Peer -> m ()
 sendPing p = do
@@ -585,21 +575,20 @@ connectPeer sa = do
       | otherwise = 0
     launch pc busy inbox p =
       ask >>= \mgr ->
-        withPeerLoop sa p mgr $ \a ->
+        withPeerLoop p mgr $ \a ->
           link a >> peer pc busy inbox
 
 withPeerLoop ::
   (MonadUnliftIO m, MonadLogger m) =>
-  SockAddr ->
   Peer ->
   PeerMgr ->
   (Async a -> m a) ->
   m a
-withPeerLoop _ p mgr =
+withPeerLoop p mgr =
   withAsync . forever $ do
-    let x = mgr.config.timeout
-        y = floor (x * 1000000)
-    r <- liftIO $ randomRIO (y * 3 `div` 4, y)
+    let timeout = mgr.config.timeout
+        ms = floor (timeout * 1000 * 1000)
+    r <- liftIO $ randomRIO (ms `div` 4, ms `div` 2)
     threadDelay r
     managerCheck p mgr
 
@@ -644,7 +633,8 @@ gotPong b nonce now p = void . runMaybeT $ do
       b
       o
         { ping = Nothing,
-          pings = sort $ take 11 $ diff : o.pings
+          pings = sort $ take 11 $ diff : o.pings,
+          tickled = now
         }
 
 setPeerPing :: TVar [OnlinePeer] -> Word64 -> UTCTime -> Peer -> STM ()
@@ -786,14 +776,6 @@ peerMgrAddrs ::
   m ()
 peerMgrAddrs p addrs mgr =
   PeerAddrs p addrs `send` mgr.mailbox
-
-peerMgrTickle ::
-  (MonadIO m) =>
-  Peer ->
-  PeerMgr ->
-  m ()
-peerMgrTickle p mgr =
-  PeerTickle p `send` mgr.mailbox
 
 toHostService :: String -> (Maybe String, Maybe String)
 toHostService str =

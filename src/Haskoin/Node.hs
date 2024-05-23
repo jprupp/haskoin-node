@@ -170,7 +170,6 @@ peerEvents ch mgr input output = forever $ do
         MHeaders (Headers hs) ->
           chainHeaders p (map fst hs) ch
         _ -> return ()
-      peerMgrTickle p mgr
   publish (PeerEvent event) output
 
 -- | Launch node process in the foreground.
