@@ -1,11 +1,7 @@
-resolver: lts-22.22
+resolver: lts-23.0
 nix:
   packages:
     - rocksdb
     - secp256k1
     - zlib
     - pkg-config
-extra-deps:
-  - secp256k1-haskell-1.2.0@sha256:1a21581b0c54be26e1fb706d06dce51ef10cb72c13abfc3614a70189f23d6d50,2235
-  - haskoin-core-1.1.0@sha256:16c9bb689da0efdcedf571de7b0f0e7aa2df8c0c546b8ec7ad0c0fbec85ab135,5639
-
