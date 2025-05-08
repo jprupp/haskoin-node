@@ -1,4 +1,4 @@
-resolver: lts-23.0
+resolver: lts-23.21
 nix:
   packages:
     - rocksdb

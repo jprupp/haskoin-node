@@ -1,19 +1,19 @@
 cabal-version: 1.12
 
--- This file has been generated from package.yaml by hpack version 0.36.0.
+-- This file has been generated from package.yaml by hpack version 0.38.0.
 --
 -- see: https://github.com/sol/hpack
 --
--- hash: 345e7baf0677c96be51bb4f0abff6d4cf748d03bdffff9fcee58a1daa01d850d
+-- hash: 0ae2d590b665e1063c502d7cb80a6eb8a01540512190560089f88f2642aa8a7d
 
 name:           haskoin-node
-version:        1.1.3
+version:        1.1.4
 synopsis:       P2P library for Bitcoin and Bitcoin Cash
-description:    Please see the README on GitHub at <https://github.com/haskoin/haskoin-node#readme>
+description:    Please see the README on GitHub at <https://github.com/jprupp/haskoin-node#readme>
 category:       Bitcoin, Finance, Network
-homepage:       http://github.com/haskoin/haskoin#readme
-bug-reports:    http://github.com/haskoin/haskoin/issues
-author:         Jean-Pierre Rupp
+homepage:       http://github.com/jprupp/haskoin-node#readme
+bug-reports:    http://github.com/jprupp/haskoin-node/issues
+author:         JP Rupp
 maintainer:     jprupp@protonmail.ch
 license:        MIT
 license-file:   LICENSE
@@ -24,7 +24,7 @@ extra-source-files:
 
 source-repository head
   type: git
-  location: https://github.com/haskoin/haskoin.git
+  location: https://github.com/jprupp/haskoin-node.git
 
 library
   exposed-modules:
