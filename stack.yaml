@@ -1,7 +1,10 @@
-resolver: lts-23.21
+resolver: nightly-2026-08-11
 nix:
   packages:
     - rocksdb
     - secp256k1
     - zlib
     - pkg-config
+extra-deps:
+  - github: jprupp/haskoin-core
+    commit: '512919eb0eea61f8e43dce58c97e7e8bd12e92b4'
