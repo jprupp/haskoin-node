@@ -477,16 +477,16 @@ purgeChainDB = do
     R.iterSeek it $ B.singleton 0x90
     recurse_delete it db mcf
   where
-    f db Nothing = R.withIter db
-    f db (Just cf) = R.withIterCF db cf
+    f db Nothing = liftIO . R.withIter db
+    f db (Just cf) = liftIO . R.withIterCF db cf
     recurse_delete it db mcf =
-      R.iterKey it >>= \case
+      liftIO (R.iterKey it) >>= \case
         Just k
           | B.head k == 0x90 || B.head k == 0x91 -> do
               case mcf of
-                Nothing -> R.delete db k
-                Just cf -> R.deleteCF db cf k
-              R.iterNext it
+                Nothing -> liftIO $ R.delete db k
+                Just cf -> liftIO $ R.deleteCF db cf k
+              liftIO $ R.iterNext it
               (R.Del k :) <$> recurse_delete it db mcf
         _ -> return []
 

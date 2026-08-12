@@ -5,16 +5,41 @@
 
 packages:
 - completed:
+    hackage: secp256k1-haskell-1.5.0@sha256:009a0d57651a0f4eeeafd2b480a45fbc049015252fe92388ae4bb2115f765430,2077
+    pantry-tree:
+      sha256: 3c3cbc95e94347d2d37c3a74e3703fd0b65161bfe353e37caa3cf8ddf2018463
+      size: 881
+  original:
+    hackage: secp256k1-haskell-1.5.0@sha256:009a0d57651a0f4eeeafd2b480a45fbc049015252fe92388ae4bb2115f765430,2077
+- completed:
+    hackage: rocksdb-haskell-jprupp-2.2.0@sha256:688be97f64b5553561a238d3336c07fcfe9d454562ba6eee8e03d332c0ba3544,1623
+    pantry-tree:
+      sha256: ef1103832ce6fcfb4e422fff587c90d8ce6dc98d5b21e43dcf0a98bf6e22dab1
+      size: 711
+  original:
+    hackage: rocksdb-haskell-jprupp-2.2.0@sha256:688be97f64b5553561a238d3336c07fcfe9d454562ba6eee8e03d332c0ba3544,1623
+- completed:
     name: haskoin-core
     pantry-tree:
-      sha256: 82314f62507dc363ac330f1f11b0cb43daadca5117bcef806c5b74da29e251b8
-      size: 7356
-    sha256: 8d7fb929eaa4bc0428dfdf08b8669c30e32cca79db24fe6ce43937c71a501d8d
-    size: 478976
-    url: https://github.com/jprupp/haskoin-core/archive/512919eb0eea61f8e43dce58c97e7e8bd12e92b4.tar.gz
+      sha256: 09017737e90ba78074b1b0ce66415ebaf9844cca0c5022fddfcbd884349af470
+      size: 7357
+    sha256: 01af251deb57eb679b895db9848eaf515a863d32ab3fe249b21d723d04a41055
+    size: 480658
+    url: https://github.com/jprupp/haskoin-core/archive/74911f3c4a86ec084b0198626f209a9d2c95efe7.tar.gz
     version: 1.3.0
   original:
-    url: https://github.com/jprupp/haskoin-core/archive/512919eb0eea61f8e43dce58c97e7e8bd12e92b4.tar.gz
+    url: https://github.com/jprupp/haskoin-core/archive/74911f3c4a86ec084b0198626f209a9d2c95efe7.tar.gz
+- completed:
+    name: rocksdb-query
+    pantry-tree:
+      sha256: a8f643f1585d3a3f099b34c864b2dfd3c518000130598f5bc9bd3d507c636880
+      size: 587
+    sha256: fbcf004090dc47bc1291393369e1d9b479ae606c8cd467903cc033122fbc03f1
+    size: 5779
+    url: https://github.com/jprupp/rocksdb-query/archive/cc1bb133c38a5ea65db237b9e235de2fa25b25c0.tar.gz
+    version: 0.5.0
+  original:
+    url: https://github.com/jprupp/rocksdb-query/archive/cc1bb133c38a5ea65db237b9e235de2fa25b25c0.tar.gz
 snapshots:
 - completed:
     sha256: f0a8c26c47051319c3acc86a8c1020c7ca995a2d454261696777ced26f74b744

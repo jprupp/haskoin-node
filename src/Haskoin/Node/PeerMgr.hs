@@ -387,7 +387,7 @@ dispatch (CheckPeer p) = do
     "Housekeeping for peer " <> p.label
   checkPeer p
 
-ticklePeer :: ( MonadLoggerIO m) => PeerMgr -> Peer -> m ()
+ticklePeer :: (MonadLoggerIO m) => PeerMgr -> Peer -> m ()
 ticklePeer m p = do
   $(logDebugS) "PeerMgr" $ "Tickle peer " <> p.label
   t <- liftIO getCurrentTime
