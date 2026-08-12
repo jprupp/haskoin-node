@@ -4,6 +4,7 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedRecordDot #-}
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE NoFieldSelectors #-}
 
@@ -19,56 +20,24 @@ module Haskoin.Node
   )
 where
 
+import Control.Concurrent
+import Control.Concurrent.Async
+import Control.Exception
+import Control.Logging
 import Control.Monad (forever)
 import Control.Monad.Cont (ContT (..), MonadCont (callCC), cont, runCont, runContT)
-import Control.Monad.Logger (MonadLoggerIO)
 import Control.Monad.Trans (lift)
 import Data.Conduit.Network
-  ( ClientSettings,
-    appSink,
-    appSource,
-    clientSettings,
-    runTCPClient,
-  )
 import Data.String.Conversions (cs)
 import Data.Time.Clock (NominalDiffTime)
 import Database.RocksDB (ColumnFamily, DB)
 import Haskoin
-  ( Addr (..),
-    BlockNode (..),
-    Headers (..),
-    Message (..),
-    Network,
-    NetworkAddress,
-    Ping (..),
-    Pong (..),
-  )
 import Haskoin.Node.Chain
 import Haskoin.Node.Peer
 import Haskoin.Node.PeerMgr
 import NQE
-  ( Inbox,
-    Publisher,
-    publish,
-    receive,
-    withPublisher,
-    withSubscription,
-  )
 import Network.Socket
-  ( NameInfoFlag (..),
-    SockAddr,
-    getNameInfo,
-  )
 import Text.Read (readMaybe)
-import UnliftIO
-  ( MonadUnliftIO,
-    SomeException,
-    catch,
-    liftIO,
-    link,
-    throwIO,
-    withAsync,
-  )
 
 -- | General node configuration.
 data NodeConfig = NodeConfig
@@ -108,17 +77,16 @@ data NodeEvent
 withConnection :: SockAddr -> WithConnection
 withConnection na f =
   fromSockAddr na >>= \case
-    Nothing -> throwIO PeerAddressInvalid
+    Nothing -> errorSL "Node" ("Peer address invalid: " <> cs (show na))
     Just cset ->
       runTCPClient cset $ \ad ->
         f (Conduits (appSource ad) (appSink ad))
 
-fromSockAddr ::
-  (MonadUnliftIO m) => SockAddr -> m (Maybe ClientSettings)
+fromSockAddr :: SockAddr -> IO (Maybe ClientSettings)
 fromSockAddr sa = go `catch` e
   where
     go = do
-      (maybe_host, maybe_port) <- liftIO (getNameInfo flags True True sa)
+      (maybe_host, maybe_port) <- getNameInfo flags True True sa
       return $
         clientSettings
           <$> (readMaybe =<< maybe_port)
@@ -127,58 +95,43 @@ fromSockAddr sa = go `catch` e
     e :: (Monad m) => SomeException -> m (Maybe a)
     e _ = return Nothing
 
-chainEvents ::
-  (MonadUnliftIO m, MonadLoggerIO m) =>
-  PeerMgr ->
-  Inbox ChainEvent ->
-  Publisher NodeEvent ->
-  m ()
+chainEvents :: PeerMgr -> Inbox ChainEvent -> Publisher NodeEvent -> IO ()
 chainEvents mgr input output = forever $ do
   event <- receive input
   case event of
-    ChainBestBlock bb ->
-      peerMgrBest bb.height mgr
+    ChainBestBlock bb -> peerMgrBest mgr bb.height
     _ -> return ()
   publish (ChainEvent event) output
 
 peerEvents ::
-  (MonadUnliftIO m, MonadLoggerIO m) =>
-  Chain ->
-  PeerMgr ->
-  Inbox PeerEvent ->
-  Publisher NodeEvent ->
-  m ()
+  Chain -> PeerMgr -> Inbox PeerEvent -> Publisher NodeEvent -> IO ()
 peerEvents ch mgr input output = forever $ do
   event <- receive input
   case event of
     PeerConnected p ->
-      chainPeerConnected p ch
+      chainPeerConnected ch p
     PeerDisconnected p ->
-      chainPeerDisconnected p ch
+      chainPeerDisconnected ch p
     PeerMessage p msg -> do
       case msg of
         MVersion v ->
-          peerMgrVersion p v mgr
+          peerMgrVersion mgr p v
         MVerAck ->
-          peerMgrVerAck p mgr
+          peerMgrVerAck mgr p
         MPing (Ping n) ->
-          peerMgrPing p n mgr
+          peerMgrPing mgr p n
         MPong (Pong n) ->
-          peerMgrPong p n mgr
+          peerMgrPong mgr p n
         MAddr (Addr ns) ->
-          peerMgrAddrs p (map snd ns) mgr
+          peerMgrAddrs mgr p (map snd ns)
         MHeaders (Headers hs) ->
-          chainHeaders p (map fst hs) ch
+          chainHeaders ch p (map fst hs)
         _ -> return ()
       ticklePeer mgr p
   publish (PeerEvent event) output
 
 -- | Launch node process in the foreground.
-withNode ::
-  (MonadLoggerIO m, MonadUnliftIO m) =>
-  NodeConfig ->
-  (Node -> m a) ->
-  m a
+withNode :: NodeConfig -> (Node -> IO a) -> IO a
 withNode NodeConfig {..} action = flip runContT return $ do
   peerPub <- ContT withPublisher
   peerSub <- ContT (withSubscription peerPub)

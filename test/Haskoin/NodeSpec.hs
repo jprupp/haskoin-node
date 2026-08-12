@@ -1,5 +1,6 @@
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedRecordDot #-}
@@ -10,21 +11,13 @@
 module Haskoin.NodeSpec (spec) where
 
 import Conduit
-  ( awaitForever,
-    concatMapC,
-    foldC,
-    mapMC,
-    runConduit,
-    takeCE,
-    yield,
-    (.|),
-  )
+import Control.Concurrent.Async
+import Control.Logging
 import Control.Monad (forM_, forever, replicateM)
 import Control.Monad.Cont
-import Control.Monad.Logger (runNoLoggingT)
 import Control.Monad.Trans (lift)
 import Data.ByteString (ByteString)
-import qualified Data.ByteString as B
+import Data.ByteString qualified as B
 import Data.ByteString.Base64 (decodeBase64Lenient)
 import Data.Default (def)
 import Data.Either (fromRight)
@@ -32,58 +25,15 @@ import Data.List (find)
 import Data.Maybe (isJust, mapMaybe)
 import Data.Serialize (decode, get, runGet, runPut)
 import Data.Time.Clock.POSIX (getPOSIXTime)
-import qualified Database.RocksDB as R
+import Database.RocksDB qualified as R
 import Haskoin
-  ( Block (..),
-    BlockHash (..),
-    BlockHeader (..),
-    BlockNode (..),
-    GetData (..),
-    GetHeaders (..),
-    Headers (..),
-    InvType (..),
-    InvVector (..),
-    Message (..),
-    MessageHeader (..),
-    Network (..),
-    NetworkAddress (..),
-    Ping (..),
-    Pong (..),
-    VarInt (..),
-    Version (..),
-    bchRegTest,
-    buildMerkleRoot,
-    getMessage,
-    headerHash,
-    nodeNetwork,
-    putMessage,
-    sockToHostAddress,
-    txHash,
-  )
 import Haskoin.Node
 import NQE
-  ( Inbox,
-    Mailbox,
-    inboxToMailbox,
-    newInbox,
-    receive,
-    receiveMatch,
-    send,
-    withPublisher,
-    withSubscription,
-  )
 import Network.Socket (AddrInfo (addrAddress), SockAddr (..))
+import System.IO.Temp
 import System.Random (randomIO)
 import Test.Hspec
 import Test.Hspec.QuickCheck
-import UnliftIO
-  ( MonadIO,
-    MonadUnliftIO,
-    liftIO,
-    throwString,
-    withAsync,
-    withSystemTempDirectory,
-  )
 
 data TestNode = TestNode
   { testMgr :: PeerMgr,
@@ -108,7 +58,7 @@ dummyPeerConnect net ad sa f = do
     go :: Inbox ByteString -> Mailbox ByteString -> IO ()
     go r s = do
       nonce <- randomIO
-      now <- round <$> liftIO getPOSIXTime
+      now <- round <$> getPOSIXTime
       let rmt = NetworkAddress 0 (sockToHostAddress sa)
           ver = buildVersion net nonce 0 ad rmt now
       runPut (putMessage net (MVersion ver)) `send` s
@@ -173,7 +123,7 @@ spec = do
       withTestNode net "connect-one-peer" $ \TestNode {..} -> do
         p <- waitForPeer nodeEvents
         Just OnlinePeer {version = Just Version {version = ver}} <-
-          getOnlinePeer p testMgr
+          getOnlinePeer testMgr p
         ver `shouldSatisfy` (>= 70002)
     it "downloads some blocks" $
       withTestNode net "get-blocks" $ \TestNode {..} -> do
@@ -206,8 +156,8 @@ spec = do
         bb <- chainGetBest testChain
         bb.height `shouldSatisfy` (== 15)
         an <-
-          maybe (throwString "No ancestor found") return
-            =<< chainGetAncestor 10 bn testChain
+          maybe (error "No ancestor found") return
+            =<< chainGetAncestor testChain 10 bn
         headerHash bn.header `shouldBe` bh
         headerHash an.header `shouldBe` ah
     it "downloads some block parents" $
@@ -223,7 +173,7 @@ spec = do
               ChainEvent (ChainBestBlock bn) -> Just bn
               _ -> Nothing
         bn.height `shouldBe` 15
-        ps <- chainGetParents 12 bn testChain
+        ps <- chainGetParents testChain 12 bn
         length ps `shouldBe` 3
         forM_ (zip ps hs) $ \(p, h) ->
           headerHash p.header `shouldBe` h
@@ -234,13 +184,9 @@ waitForPeer inbox =
     PeerEvent (PeerConnected p) -> Just p
     _ -> Nothing
 
-withTestNode ::
-  (MonadUnliftIO m) =>
-  Network ->
-  String ->
-  (TestNode -> m a) ->
-  m a
-withTestNode net str f = runNoLoggingT $ flip runContT return $ do
+withTestNode :: Network -> String -> (TestNode -> IO a) -> IO a
+withTestNode net str f = withStderrLogging $ flip runContT return $ do
+  lift $ setLogLevel LevelError
   w <- ContT $ withSystemTempDirectory ("haskoin-node-test-" <> str <> "-")
   pub <- ContT withPublisher
   sub <- ContT $ withSubscription pub
@@ -268,7 +214,7 @@ withTestNode net str f = runNoLoggingT $ flip runContT return $ do
             connect = dummyPeerConnect net ad
           }
   Node mgr ch <- ContT $ withNode cfg'
-  lift . lift $
+  lift $
     f
       TestNode
         { testMgr = mgr,

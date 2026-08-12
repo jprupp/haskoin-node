@@ -34,20 +34,12 @@ module Haskoin.Node.Peer
 where
 
 import Conduit
-  ( ConduitT,
-    Void,
-    awaitForever,
-    foldC,
-    mapM_C,
-    runConduit,
-    takeCE,
-    transPipe,
-    yield,
-    (.|),
-  )
-import Control.Monad (forever, join, unless, when)
-import Control.Monad.Logger (MonadLoggerIO, logDebugS, logErrorS, logInfoS)
-import Control.Monad.Trans.Maybe (MaybeT (MaybeT), runMaybeT)
+import Control.Concurrent.Async
+import Control.Concurrent.STM
+import Control.Exception
+import Control.Logging
+import Control.Monad
+import Control.Monad.Trans.Maybe
 import Data.Bool (bool)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
@@ -59,55 +51,9 @@ import Data.String.Conversions (cs)
 import Data.Text (Text)
 import Data.Word (Word32)
 import Haskoin
-  ( Block (..),
-    BlockHash (..),
-    GetData (..),
-    InvType (..),
-    InvVector (..),
-    Message (..),
-    MessageCommand (..),
-    MessageHeader (..),
-    Network (..),
-    NotFound (..),
-    Ping (..),
-    Pong (..),
-    Tx,
-    TxHash (..),
-    commandToString,
-    encodeHex,
-    getMessage,
-    headerHash,
-    putMessage,
-    txHash,
-  )
 import NQE
-  ( Inbox,
-    Mailbox,
-    Publisher,
-    inboxToMailbox,
-    publish,
-    receive,
-    receiveMatchS,
-    send,
-    withSubscription,
-  )
 import System.Random (randomIO)
-import UnliftIO
-  ( Exception,
-    MonadIO,
-    MonadUnliftIO,
-    TVar,
-    atomically,
-    liftIO,
-    link,
-    readTVar,
-    readTVarIO,
-    throwIO,
-    timeout,
-    withAsync,
-    withRunInIO,
-    writeTVar,
-  )
+import System.Timeout
 
 data Conduits = Conduits
   { inboundConduit :: ConduitT () ByteString IO (),
@@ -146,26 +92,6 @@ data PeerException
   | EmptyHeader
   deriving (Eq)
 
-instance Show PeerException where
-  show (PeerMisbehaving s) = "Peer misbehaving: " <> s
-  show DuplicateVersion = "Duplicate version"
-  show DecodeHeaderError = "Error decoding header"
-  show (CannotDecodePayload c) =
-    "Cannot decode payload: "
-      <> cs (commandToString c)
-  show PeerIsMyself = "Peer is myself"
-  show (PayloadTooLarge s) = "Payload too large: " <> show s
-  show PeerAddressInvalid = "Peer address invalid"
-  show PeerSentBadHeaders = "Peer sent bad headers"
-  show NotNetworkPeer = "Not network peer"
-  show PeerNoSegWit = "Segwit not supported by peer"
-  show PeerTimeout = "Peer timed out"
-  show UnknownPeer = "Unknown peer"
-  show PeerTooOld = "Peer too old"
-  show EmptyHeader = "Empty header"
-
-instance Exception PeerException
-
 -- | Mailbox for a peer.
 data Peer = Peer
   { mailbox :: !(Mailbox PeerMessage),
@@ -182,15 +108,14 @@ instance Show Peer where
 
 -- | Incoming messages that a peer accepts.
 data PeerMessage
-  = KillPeer !PeerException
+  = KillPeer
   | SendMessage !Message
 
 wrapPeer ::
-  (MonadIO m) =>
   PeerConfig ->
   TVar Bool ->
   Mailbox PeerMessage ->
-  m Peer
+  IO Peer
 wrapPeer cfg busy mbox =
   return
     Peer
@@ -202,23 +127,21 @@ wrapPeer cfg busy mbox =
 
 -- | Run peer process in current thread.
 peer ::
-  (MonadUnliftIO m, MonadLoggerIO m) =>
   PeerConfig ->
   TVar Bool ->
   Inbox PeerMessage ->
-  m ()
+  IO ()
 peer cfg@PeerConfig {..} busy inbox = do
   p <- wrapPeer cfg busy (inboxToMailbox inbox)
-  withRunInIO $ \restore -> do
-    connect (restore . peer_session p)
+  connect $ peer_session p
   where
     go = forever $ do
-      $(logDebugS) "Peer" $ label <> " awaiting event..."
+      lift $ debugS "Peer" $ label <> " awaiting event..."
       msg <- receive inbox
       dispatchMessage cfg msg
     peer_session p ad = do
-      let ins = transPipe liftIO ad.inboundConduit
-          ons = transPipe liftIO ad.outboundConduit
+      let ins = ad.inboundConduit
+          ons = ad.outboundConduit
           src =
             runConduit $
               ins
@@ -232,50 +155,44 @@ peer cfg@PeerConfig {..} busy inbox = do
 
 -- | Internal function to dispatch peer messages.
 dispatchMessage ::
-  (MonadLoggerIO m) =>
   PeerConfig ->
   PeerMessage ->
-  ConduitT i Message m ()
+  ConduitT i Message IO ()
 dispatchMessage PeerConfig {label} (SendMessage msg) = do
-  $(logDebugS) "Peer" $ label <> " sending: " <> cs (show msg)
+  lift $ debugS "Peer" $ label <> " sending: " <> cs (show msg)
   yield msg
-dispatchMessage PeerConfig {label} (KillPeer e) = do
-  $(logInfoS) "Peer" $ label <> " killing with error: " <> cs (show e)
-  throwIO e
+dispatchMessage PeerConfig {label} KillPeer = do
+  lift $ errorSL "Peer" $ label <> " disconnecting"
 
 -- | Internal conduit to parse messages coming from peer.
 inPeerConduit ::
-  (MonadLoggerIO m) =>
   Network ->
   PeerConfig ->
   Text ->
-  ConduitT ByteString Message m ()
+  ConduitT ByteString Message IO ()
 inPeerConduit net PeerConfig {label} a =
   forever $ do
-    $(logDebugS) "Peer" $ label <> " awaiting network message..."
+    lift $ debugS "Peer" $ label <> " awaiting network message..."
     x <- takeCE 24 .| foldC
     when (B.null x) $ do
-      $(logErrorS) "Peer" $ label <> " empty header"
-      throwIO EmptyHeader
+      lift $ errorSL "Peer" $ label <> " empty header"
     case decode x of
       Left e -> do
-        $(logErrorS) "Peer" $ label <> " error decoding header"
-        throwIO DecodeHeaderError
+        lift $ errorSL "Peer" $ label <> " error decoding header"
       Right (MessageHeader _ cmd len _) -> do
-        $(logDebugS) "Peer" $ label <> " received: " <> cs (show cmd)
-        when (len > 32 * 2 ^ (20 :: Int)) $ do
-          $(logErrorS) "Peer" $ label <> " payload too large: " <> cs (show len)
-          throwIO $ PayloadTooLarge len
+        lift $ debugS "Peer" $ label <> " received: " <> cs (show cmd)
+        when (len > 32 * 2 ^ (20 :: Int)) . lift . errorSL "Peer" $
+          label <> " payload too large: " <> cs (show len)
         y <- takeCE (fromIntegral len) .| foldC
         case runGet (getMessage net) $ x `B.append` y of
           Left e -> do
-            $(logErrorS) "Peer" $
-              label
-                <> " could not decode payload for cmd: "
-                <> cs (show cmd)
-            throwIO (CannotDecodePayload cmd)
+            lift $
+              errorSL "Peer" $
+                label
+                  <> " could not decode payload for cmd: "
+                  <> cs (show cmd)
           Right msg -> do
-            $(logDebugS) "Peer" $ label <> " forwarding: " <> cs (show msg)
+            lift $ debugS "Peer" $ label <> " forwarding: " <> cs (show msg)
             yield msg
 
 -- | Outgoing peer conduit to serialize and send messages.
@@ -283,36 +200,35 @@ outPeerConduit :: (Monad m) => Network -> ConduitT Message ByteString m ()
 outPeerConduit net = awaitForever $ yield . runPut . putMessage net
 
 -- | Kill a peer with the provided exception.
-killPeer :: (MonadIO m) => PeerException -> Peer -> m ()
-killPeer e p = KillPeer e `send` p.mailbox
+killPeer :: Peer -> IO ()
+killPeer p = KillPeer `send` p.mailbox
 
 -- | Send a network message to peer.
-sendMessage :: (MonadIO m) => Message -> Peer -> m ()
+sendMessage :: Message -> Peer -> IO ()
 sendMessage msg p = SendMessage msg `send` p.mailbox
 
-getBusy :: (MonadIO m) => Peer -> m Bool
+getBusy :: Peer -> IO Bool
 getBusy p = readTVarIO p.busy
 
-setBusy :: (MonadIO m) => Peer -> m Bool
+setBusy :: Peer -> IO Bool
 setBusy p =
   atomically $ do
     b <- readTVar p.busy
     unless b $ writeTVar p.busy True
     return $ not b
 
-setFree :: (MonadIO m) => Peer -> m ()
+setFree :: Peer -> IO ()
 setFree p = atomically $ writeTVar p.busy False
 
 -- | Request full blocks from peer. Will return 'Nothing' if the list of blocks
 -- returned by the peer is incomplete, comes out of order, or a timeout is
 -- reached.
 getBlocks ::
-  (MonadUnliftIO m) =>
   Network ->
   Int ->
   Peer ->
   [BlockHash] ->
-  m (Maybe [Block])
+  IO (Maybe [Block])
 getBlocks net time p bhs =
   runMaybeT $ mapM f =<< MaybeT (getData time p (GetData ivs))
   where
@@ -327,12 +243,11 @@ getBlocks net time p bhs =
 -- transactions returned by the peer is incomplete, comes out of order, or a
 -- timeout is reached.
 getTxs ::
-  (MonadUnliftIO m) =>
   Network ->
   Int ->
   Peer ->
   [TxHash] ->
-  m (Maybe [Tx])
+  IO (Maybe [Tx])
 getTxs net time p ths =
   runMaybeT $ mapM f =<< MaybeT (getData time p (GetData ivs))
   where
@@ -347,7 +262,7 @@ getTxs net time p ths =
 -- single inventory fails to be retrieved, if they come out of order, or if
 -- timeout is reached.
 getData ::
-  (MonadUnliftIO m) => Int -> Peer -> GetData -> m (Maybe [Either Tx Block])
+  Int -> Peer -> GetData -> IO (Maybe [Either Tx Block])
 getData seconds p gd@(GetData ivs) =
   withSubscription p.pub $ \inb -> do
     r <- liftIO randomIO
@@ -361,7 +276,7 @@ getData seconds p gd@(GetData ivs) =
     get_thing _inb _r acc [] =
       return $ reverse acc
     get_thing inb r acc hss@(InvVector t h : hs) =
-      filterReceive p inb >>= \case
+      lift (filterReceive p inb) >>= \case
         MTx tx
           | is_tx t && (txHash tx).get == h ->
               get_thing inb r (Left tx : acc) hs
@@ -388,7 +303,7 @@ getData seconds p gd@(GetData ivs) =
 
 -- | Ping a peer and await response. Return 'False' if response not received
 -- before timeout.
-pingPeer :: (MonadUnliftIO m) => Int -> Peer -> m Bool
+pingPeer :: Int -> Peer -> IO Bool
 pingPeer time p =
   fmap isJust . withSubscription p.pub $ \sub -> do
     r <- liftIO randomIO
@@ -398,7 +313,7 @@ pingPeer time p =
         | p == p' && r == r' -> Just ()
       _ -> Nothing
 
-filterReceive :: (MonadIO m) => Peer -> Inbox PeerEvent -> m Message
+filterReceive :: Peer -> Inbox PeerEvent -> IO Message
 filterReceive p inb =
   receive inb >>= \case
     PeerMessage p' msg | p == p' -> return msg

@@ -3,8 +3,11 @@
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE MultiWayIf #-}
+{-# LANGUAGE NamedFieldPuns #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
@@ -31,108 +34,29 @@ module Haskoin.Node.Chain
   )
 where
 
+import Control.Concurrent
+import Control.Concurrent.Async
+import Control.Concurrent.STM
+import Control.Logging
 import Control.Monad (forM_, forever, guard, when)
-import Control.Monad.Except (runExceptT, throwError)
-import Control.Monad.Logger
-  ( MonadLoggerIO,
-    logDebugS,
-    logErrorS,
-    logInfoS,
-  )
-import Control.Monad.Reader
-  ( MonadReader,
-    ReaderT (..),
-    asks,
-    runReaderT,
-  )
-import Control.Monad.Trans (lift)
-import Control.Monad.Trans.Maybe (MaybeT (..), runMaybeT)
-import qualified Data.ByteString as B
+import Control.Monad.Trans.Reader
+import Data.ByteString qualified as B
 import Data.Function (on)
 import Data.List (delete, nub)
 import Data.Maybe (isJust, isNothing)
 import Data.Serialize
-  ( Serialize,
-    get,
-    getWord8,
-    put,
-    putWord8,
-  )
 import Data.String.Conversions (cs)
 import Data.Time.Clock
-  ( NominalDiffTime,
-    UTCTime,
-    diffUTCTime,
-    getCurrentTime,
-  )
 import Data.Time.Clock.POSIX
-  ( posixSecondsToUTCTime,
-    utcTimeToPOSIXSeconds,
-  )
 import Data.Word (Word32)
 import Database.RocksDB (ColumnFamily, DB)
-import qualified Database.RocksDB as R
+import Database.RocksDB qualified as R
 import Database.RocksDB.Query
-  ( Key,
-    KeyValue,
-    insert,
-    insertCF,
-    insertOp,
-    insertOpCF,
-    retrieveCommon,
-    writeBatch,
-  )
-import Haskoin
-  ( BlockHash,
-    BlockHeader (..),
-    BlockHeaders (..),
-    BlockHeight,
-    BlockNode (..),
-    GetHeaders (..),
-    Message (..),
-    Network,
-    blockLocator,
-    connectBlocks,
-    genesisNode,
-    getAncestor,
-    headerHash,
-    splitPoint,
-  )
+import Haskoin hiding (Key)
 import Haskoin.Node.Peer
 import Haskoin.Node.PeerMgr (myVersion)
 import NQE
-  ( Mailbox,
-    Publisher,
-    newMailbox,
-    publish,
-    receive,
-    send,
-  )
 import System.Random (randomRIO)
-import UnliftIO
-  ( MonadIO,
-    MonadUnliftIO,
-    TVar,
-    atomically,
-    liftIO,
-    link,
-    modifyTVar,
-    newTVarIO,
-    readTVar,
-    readTVarIO,
-    withAsync,
-    writeTVar,
-  )
-import UnliftIO.Concurrent (threadDelay)
-
--- | Mailbox for chain header syncing process.
-data Chain = Chain
-  { mailbox :: !(Mailbox ChainMessage),
-    reader :: !ChainReader
-  }
-
-instance Eq Chain where
-  (==) = (==) `on` (.mailbox)
 
 -- | Configuration for chain syncing process.
 data ChainConfig = ChainConfig
@@ -162,19 +86,15 @@ data ChainEvent
     ChainSynced !BlockNode
   deriving (Eq, Show)
 
-type MonadChain m =
-  ( MonadLoggerIO m,
-    MonadUnliftIO m,
-    MonadReader ChainReader m
-  )
-
 -- | State and configuration.
-data ChainReader = ChainReader
-  { -- | placeholder for upstream data
-    config :: !ChainConfig,
-    -- | mutable state for header synchronization
+data Chain = Chain
+  { config :: !ChainConfig,
+    mailbox :: !(Mailbox ChainMessage),
     state :: !(TVar ChainState)
   }
+
+instance Eq Chain where
+  (==) = (==) `on` (.mailbox)
 
 -- | Database key for version.
 data ChainDataVersionKey = ChainDataVersionKey
@@ -230,58 +150,40 @@ instance Serialize BestBlockKey where
     return BestBlockKey
   put BestBlockKey = putWord8 0x91
 
-instance (MonadIO m) => BlockHeaders (ReaderT ChainConfig m) where
-  addBlockHeader bn = do
-    db <- asks (.db)
-    asks (.cf) >>= \case
+type ChainM = ReaderT ChainConfig IO
+
+chainM :: ChainConfig -> ChainM a -> IO a
+chainM cfg m = runReaderT m cfg
+
+instance BlockHeaders ChainM where
+  addBlockHeader bn = ReaderT $ \ChainConfig {db, cf} -> do
+    case cf of
       Nothing -> insert db (BlockHeaderKey h) bn
-      Just cf -> insertCF db cf (BlockHeaderKey h) bn
+      Just cf' -> insertCF db cf' (BlockHeaderKey h) bn
     where
       h = headerHash bn.header
-  getBlockHeader bh = do
-    db <- asks (.db)
-    mcf <- asks (.cf)
-    retrieveCommon db mcf (BlockHeaderKey bh)
-  getBestBlockHeader = do
-    db <- asks (.db)
-    mcf <- asks (.cf)
-    retrieveCommon db mcf BestBlockKey >>= \case
+  getBlockHeader bh = ReaderT $ \ChainConfig {db, cf} -> do
+    retrieveCommon db cf (BlockHeaderKey bh)
+  getBestBlockHeader = ReaderT $ \ChainConfig {db, cf} -> do
+    retrieveCommon db cf BestBlockKey >>= \case
       Nothing -> error "Could not get best block from database"
       Just b -> return b
-  setBestBlockHeader bn = do
-    db <- asks (.db)
-    asks (.cf) >>= \case
+  setBestBlockHeader bn = ReaderT $ \ChainConfig {db, cf} -> do
+    case cf of
       Nothing -> insert db BestBlockKey bn
-      Just cf -> insertCF db cf BestBlockKey bn
-  addBlockHeaders bns = do
-    db <- asks (.db)
-    mcf <- asks (.cf)
-    writeBatch db (map (f mcf) bns)
+      Just cf' -> insertCF db cf' BestBlockKey bn
+  addBlockHeaders bns = ReaderT $ \ChainConfig {db, cf} -> do
+    writeBatch db (map (f cf) bns)
     where
       h bn = headerHash bn.header
-      f Nothing bn = insertOp (BlockHeaderKey (h bn)) bn
-      f (Just cf) bn = insertOpCF cf (BlockHeaderKey (h bn)) bn
+      f cf bn = case cf of
+        Nothing -> insertOp (BlockHeaderKey (h bn)) bn
+        Just cf' -> insertOpCF cf' (BlockHeaderKey (h bn)) bn
 
-instance (MonadIO m) => BlockHeaders (ReaderT Chain m) where
-  getBlockHeader bh = ReaderT $ chainGetBlock bh
-  getBestBlockHeader = ReaderT chainGetBest
-  addBlockHeader _ = undefined
-  setBestBlockHeader _ = undefined
-  addBlockHeaders _ = undefined
-
-withBlockHeaders :: (MonadChain m) => ReaderT ChainConfig m a -> m a
-withBlockHeaders f = do
-  cfg <- asks (.config)
-  runReaderT f cfg
-
-withChain ::
-  (MonadUnliftIO m, MonadLoggerIO m) =>
-  ChainConfig ->
-  (Chain -> m a) ->
-  m a
+withChain :: ChainConfig -> (Chain -> IO a) -> IO a
 withChain cfg action = do
   (inbox, mailbox) <- newMailbox
-  $(logDebugS) "Chain" "Starting chain actor"
+  debugS "Chain" "Starting chain actor"
   st <-
     newTVarIO
       ChainState
@@ -289,161 +191,137 @@ withChain cfg action = do
           beenInSync = False,
           peers = []
         }
-  let rd = ChainReader {config = cfg, state = st}
-      ch = Chain {reader = rd, mailbox = mailbox}
-  runReaderT initChainDB rd
-  withAsync (main_loop ch rd inbox) $ \a ->
+  let ch = Chain {config = cfg, mailbox = mailbox, state = st}
+  initChainDB cfg
+  withAsync (main_loop ch inbox) $ \a ->
     link a >> action ch
   where
-    main_loop ch rd inbox =
-      withSyncLoop ch $
-        runReaderT (run inbox) rd
-    run inbox = do
-      withBlockHeaders getBestBlockHeader
-        >>= chainEvent . ChainBestBlock
+    main_loop ch inbox =
+      withSyncLoop ch.mailbox (run ch inbox)
+    run ch inbox = do
+      chainM cfg getBestBlockHeader
+        >>= chainEvent cfg.pub . ChainBestBlock
       forever $ do
-        $(logDebugS) "Chain" "Awaiting event..."
+        debugS "Chain" "Awaiting event..."
         msg <- receive inbox
-        chainMessage msg
+        chainMessage ch msg
 
-chainEvent :: (MonadChain m) => ChainEvent -> m ()
-chainEvent e = do
-  pub <- asks (.config.pub)
+chainEvent :: Publisher ChainEvent -> ChainEvent -> IO ()
+chainEvent pub e = do
   case e of
     ChainBestBlock b ->
-      $(logInfoS) "Chain" $
-        "Best block header at height: "
-          <> cs (show b.height)
+      logS "Chain" ("Best block header at height: " <> cs (show b.height))
     ChainSynced b ->
-      $(logInfoS) "Chain" $
-        "Headers in sync at height: "
-          <> cs (show b.height)
+      logS "Chain" ("Headers in sync at height: " <> cs (show b.height))
   publish e pub
 
-processHeaders :: (MonadChain m) => Peer -> [BlockHeader] -> m ()
-processHeaders p hs = do
-  $(logDebugS) "Chain" $
-    "Processing "
-      <> cs (show (length hs))
-      <> " headers from peer: "
-      <> p.label
-  net <- asks (.config.net)
-  now <- liftIO getCurrentTime
-  pbest <- withBlockHeaders getBestBlockHeader
-  importHeaders net now hs >>= \case
-    Left e -> do
-      $(logErrorS) "Chain" $
-        "Could not connect headers from peer: "
-          <> p.label
-      e `killPeer` p
-    Right done -> do
-      setLastReceived
-      best <- withBlockHeaders getBestBlockHeader
+processHeaders :: Chain -> Peer -> [BlockHeader] -> IO ()
+processHeaders ch p hs = do
+  let len = length hs
+  debugS
+    "Chain"
+    ("Processing " <> cs (show len) <> " headers from peer: " <> p.label)
+  let net = ch.config.net
+  now <- getCurrentTime
+  pbest <- chainM ch.config getBestBlockHeader
+  importHeaders ch now hs >>= \case
+    Nothing -> do
+      warnS "Chain" ("Could not connect headers from peer: " <> p.label)
+      killPeer p
+    Just done -> do
+      setLastReceived ch.state
+      best <- chainM ch.config getBestBlockHeader
       when (pbest.header /= best.header) $
-        chainEvent (ChainBestBlock best)
+        chainEvent ch.config.pub (ChainBestBlock best)
       if done
         then do
           MSendHeaders `sendMessage` p
-          finishPeer p
-          syncNewPeer
-          syncNotif
-        else syncPeer p
+          finishPeer ch.state p
+          syncNewPeer ch
+          syncNotif ch
+        else syncPeer ch p
 
-syncNewPeer :: (MonadChain m) => m ()
-syncNewPeer =
-  getSyncingPeer >>= \case
+syncNewPeer :: Chain -> IO ()
+syncNewPeer ch =
+  getSyncingPeer ch.state >>= \case
     Just _ -> return ()
     Nothing ->
-      nextPeer >>= \case
+      nextPeer ch.state >>= \case
         Nothing -> return ()
         Just p -> do
-          $(logDebugS) "Chain" $
-            "Syncing against peer: " <> p.label
-          syncPeer p
+          debugS "Chain" ("Syncing against peer: " <> p.label)
+          syncPeer ch p
 
-syncNotif :: (MonadChain m) => m ()
-syncNotif =
-  notifySynced >>= \case
+syncNotif :: Chain -> IO ()
+syncNotif ch =
+  notifySynced ch >>= \case
     False -> return ()
     True ->
-      withBlockHeaders getBestBlockHeader
-        >>= chainEvent . ChainSynced
+      chainM ch.config getBestBlockHeader
+        >>= chainEvent ch.config.pub . ChainSynced
 
-syncPeer :: (MonadChain m) => Peer -> m ()
-syncPeer p = do
-  t <- liftIO getCurrentTime
+syncPeer :: Chain -> Peer -> IO ()
+syncPeer ch p = do
+  t <- getCurrentTime
   m <-
-    chainSyncingPeer >>= \case
-      Just
-        ChainSync
-          { peer = s,
-            best = m
-          }
-          | p == s -> syncing_me t m
-          | otherwise -> return Nothing
+    chainSyncingPeer ch.state >>= \case
+      Just ChainSync {peer = s, best = m}
+        | p == s -> syncing_me t m
+        | otherwise -> return Nothing
       Nothing -> syncing_new t
   forM_ m $ \g -> do
-    $(logDebugS) "Chain" $
-      "Requesting headers from peer: "
-        <> p.label
+    debugS
+      "Chain"
+      ("Requesting headers from peer: " <> p.label)
     MGetHeaders g `sendMessage` p
   where
     syncing_new t =
-      setSyncingPeer p >>= \case
+      setSyncingPeer ch.state p >>= \case
         False -> return Nothing
         True -> do
-          $(logDebugS) "Chain" $
-            "Locked peer: " <> p.label
-          h <- withBlockHeaders getBestBlockHeader
-          Just <$> syncHeaders t h p
+          debugS "Chain" ("Locked peer: " <> p.label)
+          h <- chainM ch.config getBestBlockHeader
+          Just <$> syncHeaders ch t h p
     syncing_me t m = do
       h <- case m of
-        Nothing -> withBlockHeaders getBestBlockHeader
+        Nothing -> chainM ch.config getBestBlockHeader
         Just h -> return h
-      Just <$> syncHeaders t h p
+      Just <$> syncHeaders ch t h p
 
-chainMessage :: (MonadChain m) => ChainMessage -> m ()
-chainMessage (ChainHeaders p hs) =
-  processHeaders p hs
-chainMessage (ChainPeerConnected p) = do
-  $(logDebugS) "Chain" $ "Peer connected: " <> p.label
-  addPeer p
-  syncNewPeer
-chainMessage (ChainPeerDisconnected p) = do
-  $(logDebugS) "Chain" $ "Peer disconnected: " <> p.label
-  finishPeer p
-  syncNewPeer
-chainMessage ChainPing = do
-  $(logDebugS) "Chain" "Internal clock event"
-  to <- asks (.config.timeout)
-  now <- liftIO getCurrentTime
-  chainSyncingPeer >>= \case
+chainMessage :: Chain -> ChainMessage -> IO ()
+chainMessage ch (ChainHeaders p hs) =
+  processHeaders ch p hs
+chainMessage ch (ChainPeerConnected p) = do
+  debugS "Chain" ("Peer connected: " <> p.label)
+  addPeer ch.state p
+  syncNewPeer ch
+chainMessage ch (ChainPeerDisconnected p) = do
+  debugS "Chain" ("Peer disconnected: " <> p.label)
+  finishPeer ch.state p
+  syncNewPeer ch
+chainMessage ch ChainPing = do
+  debugS "Chain" "Internal clock event"
+  let to = ch.config.timeout
+  now <- getCurrentTime
+  chainSyncingPeer ch.state >>= \case
     Just ChainSync {peer = p, timestamp = t}
       | now `diffUTCTime` t > to -> do
-          $(logErrorS) "Chain" $
-            "Syncing peer timed out: " <> p.label
-          PeerTimeout `killPeer` p
+          warnS
+            "Chain"
+            ("Syncing peer timed out: " <> p.label)
+          killPeer p
       | otherwise -> return ()
-    Nothing -> syncNewPeer
+    Nothing -> syncNewPeer ch
 
-withSyncLoop ::
-  (MonadUnliftIO m, MonadLoggerIO m) =>
-  Chain ->
-  m a ->
-  m a
-withSyncLoop ch f =
+withSyncLoop :: Mailbox ChainMessage -> IO a -> IO a
+withSyncLoop mbox mf =
   withAsync go $ \a ->
-    link a >> f
+    link a >> mf
   where
     go = forever $ do
-      delay <-
-        liftIO $
-          randomRIO
-            ( 2 * 1000 * 1000,
-              20 * 1000 * 1000
-            )
+      delay <- randomRIO (2 * 10 ^ 6, 2 * 10 ^ 7)
       threadDelay delay
-      ChainPing `send` ch.mailbox
+      ChainPing `send` mbox
 
 -- | Version of the database.
 dataVersion :: Word32
@@ -451,73 +329,59 @@ dataVersion = 1
 
 -- | Initialize header database. If version is different from current, the
 -- database is purged of conflicting elements first.
-initChainDB :: (MonadChain m) => m ()
-initChainDB = do
-  db <- asks (.config.db)
-  mcf <- asks (.config.cf)
-  net <- asks (.config.net)
-  ver <- retrieveCommon db mcf ChainDataVersionKey
-  when (ver /= Just dataVersion) $ purgeChainDB >>= writeBatch db
-  case mcf of
+initChainDB :: ChainConfig -> IO ()
+initChainDB cfg@ChainConfig {db, cf, net} = do
+  ver <- retrieveCommon db cf ChainDataVersionKey
+  when (ver /= Just dataVersion) $ purgeChainDB cfg >>= writeBatch db
+  case cf of
     Nothing -> insert db ChainDataVersionKey dataVersion
-    Just cf -> insertCF db cf ChainDataVersionKey dataVersion
-  retrieveCommon db mcf BestBlockKey >>= \b ->
-    when (isNothing (b :: Maybe BlockNode)) $
-      withBlockHeaders $ do
-        addBlockHeader (genesisNode net)
-        setBestBlockHeader (genesisNode net)
+    Just cf' -> insertCF db cf' ChainDataVersionKey dataVersion
+  retrieveCommon db cf BestBlockKey >>= \b ->
+    when (isNothing (b :: Maybe BlockNode)) . chainM cfg $ do
+      addBlockHeader (genesisNode net)
+      setBestBlockHeader (genesisNode net)
 
 -- | Purge database of elements having keys that may conflict with those used in
 -- this module.
-purgeChainDB :: (MonadChain m) => m [R.BatchOp]
-purgeChainDB = do
-  db <- asks (.config.db)
-  mcf <- asks (.config.cf)
-  f db mcf $ \it -> do
-    R.iterSeek it $ B.singleton 0x90
-    recurse_delete it db mcf
+purgeChainDB :: ChainConfig -> IO [R.BatchOp]
+purgeChainDB ChainConfig {db, cf} = do
+  with_iter $ \it -> do
+    R.iterSeek it (B.singleton 0x90)
+    recurse_delete it
   where
-    f db Nothing = liftIO . R.withIter db
-    f db (Just cf) = liftIO . R.withIterCF db cf
-    recurse_delete it db mcf =
-      liftIO (R.iterKey it) >>= \case
+    with_iter = case cf of
+      Nothing -> R.withIter db
+      Just cf' -> R.withIterCF db cf'
+    recurse_delete it =
+      R.iterKey it >>= \case
         Just k
           | B.head k == 0x90 || B.head k == 0x91 -> do
-              case mcf of
-                Nothing -> liftIO $ R.delete db k
-                Just cf -> liftIO $ R.deleteCF db cf k
-              liftIO $ R.iterNext it
-              (R.Del k :) <$> recurse_delete it db mcf
+              case cf of
+                Nothing -> R.delete db k
+                Just cf' -> R.deleteCF db cf' k
+              R.iterNext it
+              (R.Del k :) <$> recurse_delete it
         _ -> return []
 
 -- | Import a bunch of continuous headers. Returns 'True' if the number of
 -- headers is 2000, which means that there are possibly more headers to sync
 -- from whatever peer delivered these.
-importHeaders ::
-  (MonadChain m) =>
-  Network ->
-  UTCTime ->
-  [BlockHeader] ->
-  m (Either PeerException Bool)
-importHeaders net now hs =
-  runExceptT $
-    lift connect >>= \case
-      Right _ -> do
-        case hs of
-          [] -> return ()
-          _ -> do
-            bb <- lift get_last
-            box <- asks (.state)
-            atomically . modifyTVar box $ \s ->
-              s {syncing = (\x -> x {best = bb}) <$> s.syncing}
-        case length hs of
-          2000 -> return False
-          _ -> return True
-      Left _ -> throwError PeerSentBadHeaders
+importHeaders :: Chain -> UTCTime -> [BlockHeader] -> IO (Maybe Bool)
+importHeaders ch now hs =
+  connect >>= \case
+    Left _ -> return Nothing
+    Right _
+      | null hs -> return (Just False)
+      | otherwise -> do
+          bb <- get_last
+          atomically . modifyTVar ch.state $ \s ->
+            s {syncing = set_best bb <$> s.syncing}
+          return (Just (length hs == 2000))
   where
+    set_best bb ChainSync {..} = ChainSync {best = bb, ..}
     timestamp = floor (utcTimeToPOSIXSeconds now)
-    connect = withBlockHeaders $ connectBlocks net timestamp hs
-    get_last = withBlockHeaders . getBlockHeader . headerHash $ last hs
+    connect = chainM ch.config (connectBlocks ch.config.net timestamp hs)
+    get_last = chainM ch.config $ getBlockHeader (headerHash (last hs))
 
 -- | Check if best block header is in sync with the rest of the block chain by
 -- comparing the best block with the current time, verifying that there are no
@@ -526,49 +390,40 @@ importHeaders net now hs =
 -- whether to notify other processes that the header chain has been synced. The
 -- state of the chain will be flipped to synced when this function returns
 -- 'True'.
-notifySynced :: (MonadChain m) => m Bool
-notifySynced =
-  fmap isJust $
-    runMaybeT $ do
-      bb <- lift $ withBlockHeaders getBestBlockHeader
-      now <- liftIO getCurrentTime
-      guard $ now `diffUTCTime` block_time bb > 7200
-      st <- asks (.state)
-      MaybeT . atomically . runMaybeT $ do
-        s <- lift $ readTVar st
-        guard $ isNothing s.syncing
-        guard $ null s.peers
-        guard $ not s.beenInSync
-        lift $ writeTVar st s {beenInSync = True}
-        return ()
+notifySynced :: Chain -> IO Bool
+notifySynced ch = do
+  bb <- chainM ch.config getBestBlockHeader
+  df <- (`diffUTCTime` block_time bb) <$> getCurrentTime
+  atomically $ do
+    s <- readTVar ch.state
+    if
+      | df > 7200 -> return False
+      | isJust s.syncing -> return False
+      | not (null s.peers) -> return False
+      | s.beenInSync -> return False
+      | otherwise -> do
+          writeTVar ch.state s {beenInSync = True}
+          return True
   where
     block_time =
       posixSecondsToUTCTime . fromIntegral . (.header.timestamp)
 
 -- | Get next peer to sync against from the queue.
-nextPeer :: (MonadChain m) => m (Maybe Peer)
-nextPeer = do
-  ps <- (.peers) <$> (readTVarIO =<< asks (.state))
-  go ps
+nextPeer :: TVar ChainState -> IO (Maybe Peer)
+nextPeer st = fmap (.peers) (readTVarIO st) >>= go
   where
     go [] = return Nothing
     go (p : ps) =
-      setSyncingPeer p >>= \case
+      setSyncingPeer st p >>= \case
         True -> return (Just p)
         False -> go ps
 
 -- | Set a syncing peer and generate a 'GetHeaders' data structure with a block
 -- locator to send to that peer for syncing.
-syncHeaders ::
-  (MonadChain m) =>
-  UTCTime ->
-  BlockNode ->
-  Peer ->
-  m GetHeaders
-syncHeaders now bb p = do
-  st <- asks (.state)
+syncHeaders :: Chain -> UTCTime -> BlockNode -> Peer -> IO GetHeaders
+syncHeaders ch now bb p = do
   atomically $
-    modifyTVar st $ \s ->
+    modifyTVar ch.state $ \s ->
       s
         { syncing =
             Just
@@ -579,7 +434,7 @@ syncHeaders now bb p = do
                 },
           peers = delete p s.peers
         }
-  loc <- withBlockHeaders $ blockLocator bb
+  loc <- chainM ch.config (blockLocator bb)
   return
     GetHeaders
       { version = myVersion,
@@ -590,43 +445,41 @@ syncHeaders now bb p = do
     z = "0000000000000000000000000000000000000000000000000000000000000000"
 
 -- | Set the time of last received data to now if a syncing peer is active.
-setLastReceived :: (MonadChain m) => m ()
-setLastReceived = do
-  now <- liftIO getCurrentTime
-  st <- asks (.state)
+setLastReceived :: TVar ChainState -> IO ()
+setLastReceived st = do
+  now <- getCurrentTime
   let f ChainSync {..} = ChainSync {timestamp = now, ..}
-  atomically . modifyTVar st $ \s ->
-    s {syncing = f <$> s.syncing}
+  atomically (modifyTVar st (\s -> s {syncing = f <$> s.syncing}))
 
 -- | Add a new peer to the queue of peers to sync against.
-addPeer :: (MonadChain m) => Peer -> m ()
-addPeer p = do
-  st <- asks (.state)
-  atomically . modifyTVar st $ \s -> s {peers = nub (p : s.peers)}
+addPeer :: TVar ChainState -> Peer -> IO ()
+addPeer st p = do
+  atomically (modifyTVar st (\s -> s {peers = nub (p : s.peers)}))
 
 -- | Get syncing peer if there is one.
-getSyncingPeer :: (MonadChain m) => m (Maybe Peer)
-getSyncingPeer =
-  fmap (.peer) . (.syncing)
-    <$> (readTVarIO =<< asks (.state))
+getSyncingPeer :: TVar ChainState -> IO (Maybe Peer)
+getSyncingPeer st =
+  readTVarIO st >>= \case
+    ChainState {syncing = Just ChainSync {peer}} -> return (Just peer)
+    _ -> return Nothing
 
-setSyncingPeer :: (MonadChain m) => Peer -> m Bool
-setSyncingPeer p =
+setSyncingPeer :: TVar ChainState -> Peer -> IO Bool
+setSyncingPeer st p =
   setBusy p >>= \case
     False -> do
-      $(logDebugS) "Chain" $
-        "Could not lock peer: " <> p.label
+      debugS
+        "Chain"
+        ("Could not lock peer: " <> p.label)
       return False
     True -> do
-      $(logDebugS) "Chain" $
-        "Locked peer: " <> p.label
+      debugS "Chain" $
+        ("Locked peer: " <> p.label)
       set_it
       return True
   where
     set_it = do
-      now <- liftIO getCurrentTime
-      box <- asks (.state)
-      atomically $ modifyTVar box $ \s ->
+      now <- getCurrentTime
+      atomically $ modifyTVar st $ \s ->
         s
           { syncing =
               Just
@@ -639,134 +492,95 @@ setSyncingPeer p =
 
 -- | Remove a peer from the queue of peers to sync and unset the syncing peer if
 -- it is set to the provided peer.
-finishPeer :: (MonadChain m) => Peer -> m ()
-finishPeer p =
-  asks (.state) >>= remove_peer >>= \case
+finishPeer :: TVar ChainState -> Peer -> IO ()
+finishPeer st p =
+  remove_peer >>= \case
     False ->
-      $(logDebugS) "Chain" $
-        "Removed peer from queue: " <> p.label
+      debugS
+        "Chain"
+        ("Removed peer from queue: " <> p.label)
     True -> do
-      $(logDebugS) "Chain" $
-        "Releasing syncing peer: " <> p.label
+      debugS
+        "Chain"
+        ("Releasing syncing peer: " <> p.label)
       setFree p
   where
-    remove_peer st =
+    remove_peer =
       atomically $
         readTVar st >>= \s -> case s.syncing of
           Just ChainSync {peer = p'}
             | p == p' -> do
-                unset_syncing st
+                unset_syncing
                 return True
           _ -> do
-            remove_from_queue st
+            remove_from_queue
             return False
-    unset_syncing st =
+    unset_syncing =
       modifyTVar st $ \x ->
         x {syncing = Nothing}
-    remove_from_queue st =
+    remove_from_queue =
       modifyTVar st $ \x ->
         x {peers = delete p x.peers}
 
 -- | Return syncing peer data.
-chainSyncingPeer :: (MonadChain m) => m (Maybe ChainSync)
-chainSyncingPeer =
-  (.syncing) <$> (readTVarIO =<< asks (.state))
+chainSyncingPeer :: TVar ChainState -> IO (Maybe ChainSync)
+chainSyncingPeer st = (.syncing) <$> readTVarIO st
 
--- | Get a block header from 'Chain' process.
-chainGetBlock ::
-  (MonadIO m) =>
-  BlockHash ->
-  Chain ->
-  m (Maybe BlockNode)
-chainGetBlock bh ch =
-  runReaderT (getBlockHeader bh) (ch.reader.config)
+-- | Get a block header from the block chain.
+chainGetBlock :: Chain -> BlockHash -> IO (Maybe BlockNode)
+chainGetBlock ch bh = chainM ch.config (getBlockHeader bh)
 
 -- | Get best block header from chain process.
-chainGetBest :: (MonadIO m) => Chain -> m BlockNode
-chainGetBest ch =
-  runReaderT getBestBlockHeader ch.reader.config
+chainGetBest :: Chain -> IO BlockNode
+chainGetBest ch = chainM ch.config getBestBlockHeader
 
 -- | Get ancestor of 'BlockNode' at 'BlockHeight' from chain process.
-chainGetAncestor ::
-  (MonadIO m) =>
-  BlockHeight ->
-  BlockNode ->
-  Chain ->
-  m (Maybe BlockNode)
-chainGetAncestor h bn ch =
-  runReaderT (getAncestor h bn) ch.reader.config
+chainGetAncestor :: Chain -> BlockHeight -> BlockNode -> IO (Maybe BlockNode)
+chainGetAncestor ch h bn = chainM ch.config (getAncestor h bn)
 
 -- | Get parents of 'BlockNode' starting at 'BlockHeight' from chain process.
-chainGetParents ::
-  (MonadIO m) =>
-  BlockHeight ->
-  BlockNode ->
-  Chain ->
-  m [BlockNode]
-chainGetParents height top ch =
+chainGetParents :: Chain -> BlockHeight -> BlockNode -> IO [BlockNode]
+chainGetParents ch height top =
   go [] top
   where
     go acc b
       | height >= b.height = return acc
       | otherwise = do
-          m <- chainGetBlock b.header.prev ch
+          m <- chainGetBlock ch b.header.prev
           case m of
             Nothing -> return acc
             Just p -> go (p : acc) p
 
 -- | Get last common block from chain process.
-chainGetSplitBlock ::
-  (MonadIO m) =>
-  BlockNode ->
-  BlockNode ->
-  Chain ->
-  m BlockNode
-chainGetSplitBlock l r ch =
-  runReaderT (splitPoint l r) ch.reader.config
+chainGetSplitBlock :: Chain -> BlockNode -> BlockNode -> IO BlockNode
+chainGetSplitBlock ch l r = chainM ch.config (splitPoint l r)
 
 -- | Notify chain that a new peer is connected.
-chainPeerConnected ::
-  (MonadIO m) =>
-  Peer ->
-  Chain ->
-  m ()
-chainPeerConnected p ch =
+chainPeerConnected :: Chain -> Peer -> IO ()
+chainPeerConnected ch p =
   ChainPeerConnected p `send` ch.mailbox
 
 -- | Notify chain that a peer has disconnected.
-chainPeerDisconnected ::
-  (MonadIO m) =>
-  Peer ->
-  Chain ->
-  m ()
-chainPeerDisconnected p ch =
+chainPeerDisconnected :: Chain -> Peer -> IO ()
+chainPeerDisconnected ch p =
   ChainPeerDisconnected p `send` ch.mailbox
 
 -- | Is given 'BlockHash' in the main chain?
-chainBlockMain ::
-  (MonadIO m) =>
-  BlockHash ->
-  Chain ->
-  m Bool
-chainBlockMain bh ch =
+chainBlockMain :: Chain -> BlockHash -> IO Bool
+chainBlockMain ch bh =
   chainGetBest ch >>= \bb ->
-    chainGetBlock bh ch >>= \case
+    chainGetBlock ch bh >>= \case
       Nothing ->
         return False
       bm@(Just bn) ->
-        (== bm) <$> chainGetAncestor bn.height bb ch
+        (== bm) <$> chainGetAncestor ch bn.height bb
 
 -- | Is chain in sync with network?
-chainIsSynced :: (MonadIO m) => Chain -> m Bool
+chainIsSynced :: Chain -> IO Bool
 chainIsSynced ch =
-  (.beenInSync) <$> readTVarIO (ch.reader.state)
+  (.beenInSync) <$> readTVarIO (ch.state)
 
 -- | Peer sends a bunch of headers to the chain process.
-chainHeaders ::
-  (MonadIO m) =>
-  Peer ->
-  [BlockHeader] ->
-  Chain ->
-  m ()
-chainHeaders p hs ch =
+chainHeaders :: Chain -> Peer -> [BlockHeader] -> IO ()
+chainHeaders ch p hs =
   ChainHeaders p hs `send` ch.mailbox

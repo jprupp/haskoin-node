@@ -2,6 +2,7 @@
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE ImportQualifiedPost #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE MultiWayIf #-}
@@ -35,117 +36,28 @@ where
 
 import Control.Applicative ((<|>))
 import Control.Arrow
+import Control.Concurrent
+import Control.Concurrent.Async
+import Control.Concurrent.STM
+import Control.Exception
+import Control.Logging
 import Control.Monad
-  ( forM_,
-    forever,
-    guard,
-    unless,
-    void,
-    when,
-    (<=<),
-  )
 import Control.Monad.Except
-  ( ExceptT (..),
-    runExceptT,
-    throwError,
-  )
-import Control.Monad.Logger
-  ( MonadLogger,
-    MonadLoggerIO,
-    logDebugS,
-    logErrorS,
-    logInfoS,
-    logWarnS,
-  )
-import Control.Monad.Reader
-  ( MonadReader,
-    ReaderT (ReaderT),
-    ask,
-    asks,
-    runReaderT,
-  )
-import Control.Monad.Trans (lift)
-import Control.Monad.Trans.Maybe (MaybeT (..), runMaybeT)
 import Data.Bits ((.&.))
 import Data.Function (on)
 import Data.List (dropWhileEnd, elemIndex, find, nub, sort)
-import Data.Maybe (fromMaybe, isJust, isNothing)
+import Data.Maybe
 import Data.Set (Set)
-import qualified Data.Set as Set
+import Data.Set qualified as Set
 import Data.String.Conversions (cs)
 import Data.Time.Clock
-  ( NominalDiffTime,
-    UTCTime,
-    addUTCTime,
-    diffUTCTime,
-    getCurrentTime,
-  )
 import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
 import Data.Word (Word32, Word64)
 import Haskoin
-  ( BlockHeight,
-    Message (..),
-    Network (..),
-    NetworkAddress (..),
-    Ping (..),
-    Pong (..),
-    VarString (..),
-    Version (..),
-    hostToSockAddr,
-    nodeNetwork,
-    sockToHostAddress,
-  )
 import Haskoin.Node.Peer
 import NQE
-  ( Child,
-    Inbox,
-    Mailbox,
-    Publisher,
-    Strategy (..),
-    Supervisor,
-    addChild,
-    inboxToMailbox,
-    newInbox,
-    newMailbox,
-    publish,
-    receive,
-    receiveMatch,
-    send,
-    sendSTM,
-    withSupervisor,
-  )
 import Network.Socket
-  ( AddrInfo (..),
-    AddrInfoFlag (..),
-    Family (..),
-    SockAddr (..),
-    SocketType (..),
-    defaultHints,
-    getAddrInfo,
-  )
 import System.Random (randomIO, randomRIO)
-import UnliftIO
-  ( Async,
-    MonadIO,
-    MonadUnliftIO,
-    STM,
-    SomeException,
-    TVar,
-    atomically,
-    catch,
-    liftIO,
-    link,
-    modifyTVar,
-    newTVarIO,
-    readTVar,
-    readTVarIO,
-    withAsync,
-    withRunInIO,
-    writeTVar,
-  )
-import UnliftIO.Concurrent (threadDelay)
-
-type MonadManager m = (MonadIO m, MonadReader PeerMgr m)
 
 data PeerMgrConfig = PeerMgrConfig
   { maxPeers :: !Int,
@@ -171,7 +83,7 @@ data PeerMgr = PeerMgr
 data PeerMgrMessage
   = Connect !SockAddr
   | CheckPeer !Peer
-  | PeerDied !Child !(Maybe SomeException)
+  | PeerDied !Child
   | ManagerBest !BlockHeight
   | PeerVerAck !Peer
   | PeerVersion !Peer !Version
@@ -205,364 +117,250 @@ instance Ord OnlinePeer where
       f OnlinePeer {pings = pings} = fromMaybe 60 (median pings)
 
 withPeerMgr ::
-  (MonadUnliftIO m, MonadLoggerIO m) =>
   PeerMgrConfig ->
-  (PeerMgr -> m a) ->
-  m a
+  (PeerMgr -> IO a) ->
+  IO a
 withPeerMgr cfg action = do
-  inbox <- newInbox
-  let mgr = inboxToMailbox inbox
-  withSupervisor (Notify (death mgr)) $ \sup -> do
+  ibx <- newInbox
+  withSupervisor (Notify (death ibx)) $ \sup -> do
     bb <- newTVarIO 0
     kp <- newTVarIO Set.empty
     ob <- newTVarIO []
-    runReaderT
-      (go inbox)
-      PeerMgr
-        { config = cfg,
-          supervisor = sup,
-          mailbox = mgr,
-          best = bb,
-          addresses = kp,
-          peers = ob
-        }
+    let mgr =
+          PeerMgr
+            { config = cfg,
+              supervisor = sup,
+              mailbox = inboxToMailbox ibx,
+              best = bb,
+              addresses = kp,
+              peers = ob
+            }
+    go mgr ibx
   where
-    death mgr (a, ex) = PeerDied a ex `sendSTM` mgr
-    go inbox =
-      withAsync (peerManager inbox) $ \a ->
-        withConnectLoop $
-          link a >> ReaderT action
+    death ibx (a, _e) = PeerDied a `sendSTM` ibx
+    go mgr ibx = withAsync (peerManager mgr ibx) $ \a ->
+      withConnectLoop mgr (link a >> action mgr)
 
-peerManager ::
-  ( MonadUnliftIO m,
-    MonadManager m,
-    MonadLoggerIO m
-  ) =>
-  Inbox PeerMgrMessage ->
-  m ()
-peerManager inb = do
-  $(logDebugS) "PeerMgr" "Awaiting best block"
-  putBestBlock <=< receiveMatch inb $ \case
+peerManager :: PeerMgr -> Inbox PeerMgrMessage -> IO ()
+peerManager mgr ibx = do
+  debugS "PeerMgr" "Getting best block"
+  putBestBlock mgr <=< receiveMatch ibx $ \case
     ManagerBest b -> Just b
     _ -> Nothing
-  $(logDebugS) "PeerMgr" "Starting peer manager actor"
+  debugS "PeerMgr" "Starting peer manager actor"
   forever $ do
-    $(logDebugS) "PeerMgr" "Awaiting event..."
-    dispatch =<< receive inb
+    debugS "PeerMgr" "Awaiting event..."
+    dispatch mgr =<< receive ibx
 
-putBestBlock :: (MonadManager m) => BlockHeight -> m ()
-putBestBlock bb = do
-  b <- asks (.best)
-  atomically $ writeTVar b bb
+putBestBlock :: PeerMgr -> BlockHeight -> IO ()
+putBestBlock mgr bb = atomically $ writeTVar mgr.best bb
 
-getBestBlock :: (MonadManager m) => m BlockHeight
-getBestBlock =
-  asks (.best) >>= readTVarIO
+getBestBlock :: PeerMgr -> IO BlockHeight
+getBestBlock mgr = readTVarIO mgr.best
 
-getNetwork :: (MonadManager m) => m Network
-getNetwork =
-  asks (.config.net)
+getNetwork :: PeerMgr -> Network
+getNetwork mgr = mgr.config.net
 
-loadPeers :: (MonadUnliftIO m, MonadManager m) => m ()
-loadPeers = do
-  loadStaticPeers
-  loadNetSeeds
+loadPeers :: PeerMgr -> IO ()
+loadPeers mgr = do
+  loadStaticPeers mgr
+  loadNetSeeds mgr
 
-loadStaticPeers :: (MonadUnliftIO m, MonadManager m) => m ()
-loadStaticPeers = do
-  net <- asks (.config.net)
-  xs <- asks (.config.peers)
-  mapM_ newPeer . concat =<< mapM (toSockAddr net) xs
+loadStaticPeers :: PeerMgr -> IO ()
+loadStaticPeers mgr =
+  mapM_ (newPeer mgr) . concat
+    =<< mapM (toSockAddr mgr.config.net) mgr.config.peers
 
-loadNetSeeds :: (MonadUnliftIO m, MonadManager m) => m ()
-loadNetSeeds =
-  asks (.config.discover) >>= \discover ->
-    when discover $ do
-      net <- getNetwork
-      ss <- concat <$> mapM (toSockAddr net) net.seeds
-      mapM_ newPeer ss
+loadNetSeeds :: PeerMgr -> IO ()
+loadNetSeeds mgr =
+  when mgr.config.discover $ do
+    ss <- concat <$> mapM (toSockAddr mgr.config.net) mgr.config.net.seeds
+    mapM_ (newPeer mgr) ss
 
-logConnectedPeers :: (MonadManager m, MonadLoggerIO m) => m ()
-logConnectedPeers = do
-  m <- asks (.config.maxPeers)
-  l <- length <$> getConnectedPeers
-  $(logInfoS) "PeerMgr" $
-    "Peers connected: " <> cs (show l) <> "/" <> cs (show m)
+logConnectedPeers :: PeerMgr -> IO ()
+logConnectedPeers mgr = do
+  let m = mgr.config.maxPeers
+  l <- length <$> getConnectedPeers mgr
+  logS "PeerMgr" $ "Peers connected: " <> cs (show l) <> "/" <> cs (show m)
 
-getOnlinePeers :: (MonadManager m) => m [OnlinePeer]
-getOnlinePeers =
-  asks (.peers) >>= readTVarIO
+getOnlinePeers :: PeerMgr -> IO [OnlinePeer]
+getOnlinePeers mgr = readTVarIO mgr.peers
 
-getConnectedPeers :: (MonadManager m) => m [OnlinePeer]
-getConnectedPeers =
-  filter (.online) <$> getOnlinePeers
+getConnectedPeers :: PeerMgr -> IO [OnlinePeer]
+getConnectedPeers mgr = filter (.online) <$> getOnlinePeers mgr
 
-managerEvent :: (MonadManager m) => PeerEvent -> m ()
-managerEvent e =
-  publish e =<< asks (.config.pub)
+managerEvent :: PeerMgr -> PeerEvent -> IO ()
+managerEvent mgr e = publish e mgr.config.pub
 
-dispatch ::
-  ( MonadUnliftIO m,
-    MonadManager m,
-    MonadLoggerIO m
-  ) =>
-  PeerMgrMessage ->
-  m ()
-dispatch (PeerVersion p v) = do
-  $(logDebugS) "PeerMgr" $
-    "Received peer " <> p.label <> " version: " <> cs (show v)
-  b <- asks (.peers)
-  e <- runExceptT $ do
-    o <- ExceptT . atomically $ setPeerVersion b p v
-    when o.online $ announcePeer p
-  case e of
-    Right () -> do
-      $(logDebugS) "PeerMgr" $
-        "Sending version ack to peer: " <> p.label
+dispatch :: PeerMgr -> PeerMgrMessage -> IO ()
+dispatch mgr (PeerVersion p v) = do
+  debugS
+    "PeerMgr"
+    ("Received peer " <> p.label <> " version: " <> cs (show v))
+  let b = mgr.peers
+  atomically (setPeerVersion b p v) >>= \case
+    Just o -> do
+      when o.online (announcePeer mgr p)
+      debugS
+        "PeerMgr"
+        ("Sending version ack to peer: " <> p.label)
       MVerAck `sendMessage` p
-    Left x -> do
-      $(logErrorS) "PeerMgr" $
-        "Version rejected for peer "
-          <> p.label
-          <> ": "
-          <> cs (show x)
-      killPeer x p
-dispatch (PeerVerAck p) = do
-  b <- asks (.peers)
-  atomically (setPeerVerAck b p) >>= \case
-    Just o -> do
-      $(logDebugS) "PeerMgr" $
-        "Received version ack from peer: "
-          <> p.label
-      when o.online $
-        announcePeer p
     Nothing -> do
-      $(logErrorS) "PeerMgr" $
-        "Received verack from unknown peer: "
-          <> p.label
-      killPeer UnknownPeer p
-dispatch (PeerAddrs p nas) = do
-  $(logDebugS) "PeerMgr" $
-    "Received addresses from peer " <> p.label
-  discover <- asks (.config.discover)
-  when discover $ do
-    let sas = map (hostToSockAddr . (.address)) nas
-    forM_ (zip [(1 :: Int) ..] sas) $ \(i, a) -> do
-      $(logDebugS) "PeerMgr" $
-        "Got peer address "
-          <> cs (show i)
-          <> "/"
-          <> cs (show (length sas))
-          <> ": "
-          <> cs (show a)
-          <> " from peer "
-          <> p.label
-      newPeer a
-dispatch (PeerPong p n) = do
-  b <- asks (.peers)
-  $(logDebugS) "PeerMgr" $
-    "Received pong "
-      <> cs (show n)
-      <> " from: "
-      <> p.label
-  now <- liftIO getCurrentTime
-  atomically (gotPong b n now p)
-dispatch (PeerPing p n) = do
-  $(logDebugS) "PeerMgr" $
-    "Responding to ping "
-      <> cs (show n)
-      <> " from: "
-      <> p.label
-  MPong (Pong n) `sendMessage` p
-dispatch (ManagerBest h) = do
-  $(logDebugS) "PeerMgr" $
-    "Setting best block to " <> cs (show h)
-  putBestBlock h
-dispatch (Connect sa) = do
-  connectPeer sa
-dispatch (PeerDied a e) = do
-  processPeerOffline a e
-dispatch (CheckPeer p) = do
-  $(logDebugS) "PeerMgr" $
-    "Housekeeping for peer " <> p.label
-  checkPeer p
-
-ticklePeer :: (MonadLoggerIO m) => PeerMgr -> Peer -> m ()
-ticklePeer m p = do
-  $(logDebugS) "PeerMgr" $ "Tickle peer " <> p.label
-  t <- liftIO getCurrentTime
-  atomically $ modifyPeer m.peers p $ \o -> o {tickled = t}
-
-checkPeer :: (MonadManager m, MonadLoggerIO m) => Peer -> m ()
-checkPeer p = do
-  busy <- getBusy p
-  b <- asks (.peers)
-  mp <- asks (.peers) >>= atomically . flip findPeer p
-  case mp of
-    Nothing -> return ()
+      warnS
+        "PeerMgr"
+        ("Version rejected for peer " <> p.label <> ": " <> cs (show v))
+      killPeer p
+dispatch mgr (PeerVerAck p) = do
+  atomically (setPeerVerAck mgr.peers p) >>= \case
     Just o -> do
-      now <- liftIO getCurrentTime
-      maxLife <- asks (.config.maxPeerLife)
-      let expired = maxLife `addUTCTime` o.connected
-      timeout <- asks (.config.timeout)
-      let deadline = timeout `addUTCTime` o.tickled
+      debugS "PeerMgr" ("Received version ack from peer: " <> p.label)
+      when o.online (announcePeer mgr p)
+    Nothing -> do
+      warnS
+        "PeerMgr"
+        ("Received verack from unknown peer: " <> p.label)
+      killPeer p
+dispatch mgr (PeerAddrs p nas)
+  | mgr.config.discover = do
+      let sas = map (hostToSockAddr . (.address)) nas
+          len = length sas
+      debugS
+        "PeerMgr"
+        ("Received " <> cs (show len) <> " addresses from peer " <> p.label)
+      forM_ sas (newPeer mgr)
+  | otherwise = debugS "PeerMgr" ("Ignoring addresses from peer " <> p.label)
+dispatch mgr (PeerPong p n) = do
+  debugS
+    "PeerMgr"
+    ("Received pong " <> cs (show n) <> " from: " <> p.label)
+  now <- getCurrentTime
+  atomically (gotPong mgr.peers n now p)
+dispatch _mgr (PeerPing p n) = do
+  debugS
+    "PeerMgr"
+    ("Responding to ping " <> cs (show n) <> " from: " <> p.label)
+  MPong (Pong n) `sendMessage` p
+dispatch mgr (ManagerBest h) = do
+  debugS "PeerMgr" ("Setting best block to " <> cs (show h))
+  putBestBlock mgr h
+dispatch mgr (Connect sa) = do
+  connectPeer mgr sa
+dispatch mgr (PeerDied a) = do
+  processPeerOffline mgr a
+dispatch mgr (CheckPeer p) = do
+  debugS "PeerMgr" ("Housekeeping for peer: " <> p.label)
+  checkPeer mgr p
+
+ticklePeer :: PeerMgr -> Peer -> IO ()
+ticklePeer m p = do
+  debugS "PeerMgr" ("Tickle peer " <> p.label)
+  t <- getCurrentTime
+  atomically (modifyPeer m.peers p (\o -> o {tickled = t}))
+
+checkPeer :: PeerMgr -> Peer -> IO ()
+checkPeer mgr p =
+  atomically (mgr.peers `findPeer` p) >>= \case
+    Just o -> do
+      now <- getCurrentTime
+      let expired = mgr.config.maxPeerLife `addUTCTime` o.connected
+      let deadline = mgr.config.timeout `addUTCTime` o.tickled
       if
         | now > expired -> do
-            $(logErrorS) "PeerMgr" $
-              "Disconnecting old peer "
-                <> p.label
-                <> " online since "
-                <> cs (show o.connected)
-            killPeer PeerTooOld p
+            warnS "PeerMgr" ("Killing old peer: " <> p.label)
+            killPeer p
         | now > deadline -> do
-            $(logWarnS) "PeerMgr" $ "Peer timeout: " <> p.label
-            killPeer PeerTimeout p
-        | isNothing o.ping ->
-            sendPing p
+            warnS "PeerMgr" ("Peer timeout: " <> p.label)
+            killPeer p
+        | isNothing o.ping -> sendPing mgr p
         | otherwise -> return ()
+    _ -> return ()
 
-sendPing :: (MonadManager m, MonadLoggerIO m) => Peer -> m ()
-sendPing p = do
-  b <- asks (.peers)
-  atomically (findPeer b p) >>= \case
+sendPing :: PeerMgr -> Peer -> IO ()
+sendPing mgr p = do
+  atomically (mgr.peers `findPeer` p) >>= \case
     Nothing ->
-      $(logWarnS) "PeerMgr" $
-        "Will not ping unknown peer: " <> p.label
+      warnS "PeerMgr" ("Will not ping unknown peer: " <> p.label)
     Just o
       | o.online -> do
-          n <- liftIO randomIO
-          now <- liftIO getCurrentTime
-          atomically (setPeerPing b n now p)
-          $(logDebugS) "PeerMgr" $
-            "Sending ping "
-              <> cs (show n)
-              <> " to: "
-              <> p.label
+          n <- randomIO
+          now <- getCurrentTime
+          atomically (setPeerPing mgr.peers n now p)
+          debugS
+            "PeerMgr"
+            ("Sending ping " <> cs (show n) <> " to: " <> p.label)
           MPing (Ping n) `sendMessage` p
-      | otherwise -> return ()
+      | otherwise ->
+          debugS
+            "PeerMgr"
+            ("Will not ping offline peer: " <> p.label)
 
-processPeerOffline ::
-  (MonadManager m, MonadLoggerIO m) =>
-  Child ->
-  Maybe SomeException ->
-  m ()
-processPeerOffline a e = do
-  b <- asks (.peers)
-  atomically (findPeerAsync b a) >>= \case
-    Nothing -> log_unknown e
+processPeerOffline :: PeerMgr -> Child -> IO ()
+processPeerOffline mgr a = do
+  atomically (findPeerAsync mgr.peers a) >>= \case
+    Nothing -> warnS "PeerMgr" "Disconnected unknown peer"
     Just o -> do
-      let p = o.mailbox
       if o.online
         then do
-          log_disconnected p e
-          managerEvent $ PeerDisconnected p
-        else log_not_connect p e
-      atomically $ removePeer b p
-      logConnectedPeers
-  where
-    log_unknown Nothing =
-      $(logErrorS)
-        "PeerMgr"
-        "Disconnected unknown peer"
-    log_unknown (Just x) =
-      $(logErrorS) "PeerMgr" $
-        "Unknown peer died: " <> cs (show x)
-    log_disconnected p Nothing =
-      $(logWarnS) "PeerMgr" $
-        "Disconnected peer: " <> p.label
-    log_disconnected p (Just x) =
-      $(logErrorS) "PeerMgr" $
-        "Peer " <> p.label <> " died: " <> cs (show x)
-    log_not_connect p Nothing =
-      $(logWarnS) "PeerMgr" $
-        "Could not connect to peer " <> p.label
-    log_not_connect p (Just x) =
-      $(logErrorS) "PeerMgr" $
-        "Could not connect to peer "
-          <> p.label
-          <> ": "
-          <> cs (show x)
+          warnS "PeerMgr" ("Disconnected peer: " <> o.mailbox.label)
+          managerEvent mgr (PeerDisconnected o.mailbox)
+        else
+          warnS "PeerMgr" ("Could not connect to peer: " <> o.mailbox.label)
+      atomically (removePeer mgr.peers o.mailbox)
+      logConnectedPeers mgr
 
-announcePeer :: (MonadManager m, MonadLoggerIO m) => Peer -> m ()
-announcePeer p = do
-  b <- asks (.peers)
-  atomically (findPeer b p) >>= \case
+announcePeer :: PeerMgr -> Peer -> IO ()
+announcePeer mgr p = do
+  atomically (findPeer mgr.peers p) >>= \case
     Just OnlinePeer {online = True} -> do
-      $(logInfoS) "PeerMgr" $
-        "Connected to peer " <> p.label
-      managerEvent $ PeerConnected p
-      logConnectedPeers
+      logS
+        "PeerMgr"
+        ("Connected to peer " <> p.label)
+      managerEvent mgr (PeerConnected p)
+      logConnectedPeers mgr
     Just OnlinePeer {online = False} ->
       return ()
     Nothing ->
-      $(logErrorS) "PeerMgr" $
-        "Not announcing disconnected peer: "
-          <> p.label
+      warnS
+        "PeerMgr"
+        ("Not announcing disconnected peer: " <> p.label)
 
-getNewPeer :: (MonadUnliftIO m, MonadManager m) => m (Maybe SockAddr)
-getNewPeer =
-  runMaybeT $ lift loadPeers >> go
-  where
-    go = do
-      b <- asks (.addresses)
-      ks <- readTVarIO b
-      guard . not $ Set.null ks
-      let xs = Set.toList ks
-      a <- liftIO $ randomRIO (0, length xs - 1)
-      let p = xs !! a
-      o <- asks (.peers)
-      m <- atomically $ do
-        modifyTVar b $ Set.delete p
-        findPeerAddress o p
-      maybe (return p) (const go) m
+getNewPeer :: PeerMgr -> IO (Maybe SockAddr)
+getNewPeer mgr = do
+  loadPeers mgr
+  atomically . stateTVar mgr.addresses $
+    first (listToMaybe . Set.elems) . Set.splitAt 1
 
-connectPeer ::
-  ( MonadUnliftIO m,
-    MonadManager m,
-    MonadLoggerIO m
-  ) =>
-  SockAddr ->
-  m ()
-connectPeer sa = do
-  os <- asks (.peers)
-  atomically (findPeerAddress os sa) >>= \case
+connectPeer :: PeerMgr -> SockAddr -> IO ()
+connectPeer mgr sa = do
+  atomically (findPeerAddress mgr.peers sa) >>= \case
     Just _ ->
-      $(logErrorS) "PeerMgr" $
-        "Attempted to connect to peer twice: " <> cs (show sa)
+      warnS
+        "PeerMgr"
+        ("Attempted to connect to peer twice: " <> cs (show sa))
     Nothing -> do
-      $(logInfoS) "PeerMgr" $ "Connecting to " <> cs (show sa)
-      PeerMgrConfig
-        { address = ad,
-          net = net
-        } <-
-        asks (.config)
-      sup <- asks (.supervisor)
-      conn <- asks (.config.connect)
-      pub <- asks (.config.pub)
-      nonce <- liftIO randomIO
-      bb <- getBestBlock
-      now <- liftIO getCurrentTime
-      let rmt = NetworkAddress (srv net) (sockToHostAddress sa)
+      logS "PeerMgr" ("Connecting to " <> cs (show sa))
+      nonce <- randomIO
+      bb <- getBestBlock mgr
+      now <- getCurrentTime
+      let rmt = NetworkAddress (srv mgr.config.net) (sockToHostAddress sa)
           unix = floor (utcTimeToPOSIXSeconds now)
-          ver = buildVersion net nonce bb ad rmt unix
+          ver = buildVersion mgr.config.net nonce bb mgr.config.address rmt unix
           text = cs (show sa)
       (inbox, mailbox) <- newMailbox
       let pc =
             PeerConfig
-              { pub = pub,
-                net = net,
+              { pub = mgr.config.pub,
+                net = mgr.config.net,
                 label = text,
-                connect = conn sa
+                connect = mgr.config.connect sa
               }
       busy <- newTVarIO False
       p <- wrapPeer pc busy mailbox
-      a <- withRunInIO $ \io ->
-        sup `addChild` io (launch pc busy inbox p)
+      a <- mgr.supervisor `addChild` launch pc busy inbox p
       MVersion ver `sendMessage` p
-      b <- asks (.peers)
       atomically $
         insertPeer
-          b
+          mgr.peers
           OnlinePeer
             { address = sa,
               verack = False,
@@ -581,104 +379,75 @@ connectPeer sa = do
       | net.segWit = 8
       | otherwise = 0
     launch pc busy inbox p =
-      ask >>= \mgr ->
-        withPeerLoop p mgr $ \a ->
-          link a >> peer pc busy inbox
+      withPeerLoop mgr p (\a -> link a >> peer pc busy inbox)
 
 withPeerLoop ::
-  (MonadUnliftIO m, MonadLogger m) =>
-  Peer ->
   PeerMgr ->
-  (Async a -> m a) ->
-  m a
-withPeerLoop p mgr =
+  Peer ->
+  (Async a -> IO a) ->
+  IO a
+withPeerLoop mgr p =
   withAsync . forever $ do
     let timeout = mgr.config.timeout
         ms = floor (timeout * 1000 * 1000)
-    r <- liftIO $ randomRIO (ms `div` 4, ms `div` 2)
+    r <- randomRIO (ms `div` 4, ms `div` 2)
     threadDelay r
-    managerCheck p mgr
+    managerCheck mgr p
 
-withConnectLoop ::
-  (MonadUnliftIO m, MonadManager m) =>
-  m a ->
-  m a
-withConnectLoop act =
-  withAsync go $ \a ->
-    link a >> act
+withConnectLoop :: PeerMgr -> IO a -> IO a
+withConnectLoop mgr act =
+  withAsync go $ \a -> link a >> act
   where
     go = forever $ do
-      l <- length <$> getOnlinePeers
-      x <- asks (.config.maxPeers)
-      when (l < x) $
-        getNewPeer >>= mapM_ (\sa -> ask >>= managerConnect sa)
-      delay <-
-        liftIO $
-          randomRIO
-            ( 100 * 1000,
-              10 * 500 * 1000
-            )
-      threadDelay delay
+      l <- length <$> getOnlinePeers mgr
+      when
+        (l < mgr.config.maxPeers)
+        (getNewPeer mgr >>= mapM_ (managerConnect mgr))
+      threadDelay =<< randomRIO (10 ^ 5, 5 * 10 ^ 6)
 
-newPeer :: (MonadIO m, MonadManager m) => SockAddr -> m ()
-newPeer sa = do
-  b <- asks (.addresses)
-  o <- asks (.peers)
+newPeer :: PeerMgr -> SockAddr -> IO ()
+newPeer mgr sa =
   atomically $
-    findPeerAddress o sa >>= \case
+    findPeerAddress mgr.peers sa >>= \case
       Just _ -> return ()
-      Nothing -> modifyTVar b $ Set.insert sa
+      Nothing -> modifyTVar mgr.addresses $ Set.insert sa
 
 gotPong :: TVar [OnlinePeer] -> Word64 -> UTCTime -> Peer -> STM ()
-gotPong b nonce now p = void . runMaybeT $ do
-  o <- MaybeT (findPeer b p)
-  (time, old_nonce) <- MaybeT (return o.ping)
-  guard $ nonce == old_nonce
-  let diff = now `diffUTCTime` time
-  lift $
-    insertPeer
-      b
-      o
-        { ping = Nothing,
-          pings = sort $ take 11 $ diff : o.pings
-        }
+gotPong b nonce now p =
+  findPeer b p >>= \case
+    Just o@OnlinePeer {ping = Just (time, nonce')} | nonce' == nonce -> do
+      let d = now `diffUTCTime` time
+          o' = o {ping = Nothing, pings = sort (take 11 (d : o.pings))}
+      insertPeer b o'
+    _ -> return ()
 
 setPeerPing :: TVar [OnlinePeer] -> Word64 -> UTCTime -> Peer -> STM ()
 setPeerPing b nonce now p =
   modifyPeer b p $ \o -> o {ping = Just (now, nonce)}
 
-setPeerVersion ::
-  TVar [OnlinePeer] ->
-  Peer ->
-  Version ->
-  STM (Either PeerException OnlinePeer)
-setPeerVersion b p v = runExceptT $ do
-  when (v.services .&. nodeNetwork == 0) $
-    throwError NotNetworkPeer
-  ops <- lift $ readTVar b
-  when (any ((v.nonce ==) . (.nonce)) ops) $
-    throwError PeerIsMyself
-  lift (findPeer b p) >>= \case
-    Nothing -> throwError UnknownPeer
-    Just o -> do
-      let n =
-            o
-              { version = Just v,
-                online = o.verack
-              }
-      lift $ insertPeer b n
-      return n
+setPeerVersion :: TVar [OnlinePeer] -> Peer -> Version -> STM (Maybe OnlinePeer)
+setPeerVersion b p v
+  | v.services .&. nodeNetwork == 0 = return Nothing
+  | otherwise =
+      readTVar b >>= \ops ->
+        if any (\o -> v.nonce == o.nonce) ops
+          then return Nothing -- peer is myself
+          else
+            findPeer b p >>= \case
+              Nothing -> return Nothing -- peer not found
+              Just o -> do
+                let n = o {version = Just v, online = o.verack}
+                insertPeer b n
+                return (Just n)
 
 setPeerVerAck :: TVar [OnlinePeer] -> Peer -> STM (Maybe OnlinePeer)
-setPeerVerAck b p = runMaybeT $ do
-  o <- MaybeT $ findPeer b p
-  let n =
-        o
-          { verack = True,
-            online = isJust o.version
-          }
-  lift $ insertPeer b n
-  return n
+setPeerVerAck b p =
+  findPeer b p >>= \case
+    Just o -> do
+      let o' = o {verack = True, online = isJust o.version}
+      insertPeer b o'
+      return (Just o')
+    Nothing -> return Nothing
 
 findPeer :: TVar [OnlinePeer] -> Peer -> STM (Maybe OnlinePeer)
 findPeer b p =
@@ -689,99 +458,50 @@ insertPeer :: TVar [OnlinePeer] -> OnlinePeer -> STM ()
 insertPeer b o =
   modifyTVar b $ \x -> sort . nub $ o : x
 
-modifyPeer ::
-  TVar [OnlinePeer] ->
-  Peer ->
-  (OnlinePeer -> OnlinePeer) ->
-  STM ()
+modifyPeer :: TVar [OnlinePeer] -> Peer -> (OnlinePeer -> OnlinePeer) -> STM ()
 modifyPeer b p f =
   findPeer b p >>= \case
     Nothing -> return ()
     Just o -> insertPeer b $ f o
 
 removePeer :: TVar [OnlinePeer] -> Peer -> STM ()
-removePeer b p =
-  modifyTVar b $
-    filter ((/= p) . (.mailbox))
+removePeer b p = modifyTVar b (filter ((/= p) . (.mailbox)))
 
-findPeerAsync ::
-  TVar [OnlinePeer] ->
-  Async () ->
-  STM (Maybe OnlinePeer)
-findPeerAsync b a =
-  find ((== a) . (.async))
-    <$> readTVar b
+findPeerAsync :: TVar [OnlinePeer] -> Async () -> STM (Maybe OnlinePeer)
+findPeerAsync b a = find ((== a) . (.async)) <$> readTVar b
 
-findPeerAddress ::
-  TVar [OnlinePeer] ->
-  SockAddr ->
-  STM (Maybe OnlinePeer)
-findPeerAddress b a =
-  find ((== a) . (.address))
-    <$> readTVar b
+findPeerAddress :: TVar [OnlinePeer] -> SockAddr -> STM (Maybe OnlinePeer)
+findPeerAddress b a = find ((== a) . (.address)) <$> readTVar b
 
-getPeers :: (MonadIO m) => PeerMgr -> m [OnlinePeer]
-getPeers = runReaderT getConnectedPeers
+getPeers :: PeerMgr -> IO [OnlinePeer]
+getPeers = getConnectedPeers
 
-getOnlinePeer ::
-  (MonadIO m) =>
-  Peer ->
-  PeerMgr ->
-  m (Maybe OnlinePeer)
-getOnlinePeer p =
-  runReaderT $ asks (.peers) >>= atomically . (`findPeer` p)
+getOnlinePeer :: PeerMgr -> Peer -> IO (Maybe OnlinePeer)
+getOnlinePeer mgr p = atomically (mgr.peers `findPeer` p)
 
-managerCheck :: (MonadIO m) => Peer -> PeerMgr -> m ()
-managerCheck p mgr =
-  CheckPeer p `send` mgr.mailbox
+managerCheck :: PeerMgr -> Peer -> IO ()
+managerCheck mgr p = CheckPeer p `send` mgr.mailbox
 
-managerConnect :: (MonadIO m) => SockAddr -> PeerMgr -> m ()
-managerConnect sa mgr =
-  Connect sa `send` mgr.mailbox
+managerConnect :: PeerMgr -> SockAddr -> IO ()
+managerConnect mgr sa = Connect sa `send` mgr.mailbox
 
-peerMgrBest :: (MonadIO m) => BlockHeight -> PeerMgr -> m ()
-peerMgrBest bh mgr =
-  ManagerBest bh `send` mgr.mailbox
+peerMgrBest :: PeerMgr -> BlockHeight -> IO ()
+peerMgrBest mgr bh = ManagerBest bh `send` mgr.mailbox
 
-peerMgrVerAck :: (MonadIO m) => Peer -> PeerMgr -> m ()
-peerMgrVerAck p mgr =
-  PeerVerAck p `send` mgr.mailbox
+peerMgrVerAck :: PeerMgr -> Peer -> IO ()
+peerMgrVerAck mgr p = PeerVerAck p `send` mgr.mailbox
 
-peerMgrVersion ::
-  (MonadIO m) =>
-  Peer ->
-  Version ->
-  PeerMgr ->
-  m ()
-peerMgrVersion p ver mgr =
-  PeerVersion p ver `send` mgr.mailbox
+peerMgrVersion :: PeerMgr -> Peer -> Version -> IO ()
+peerMgrVersion mgr p ver = PeerVersion p ver `send` mgr.mailbox
 
-peerMgrPing ::
-  (MonadIO m) =>
-  Peer ->
-  Word64 ->
-  PeerMgr ->
-  m ()
-peerMgrPing p nonce mgr =
-  PeerPing p nonce `send` mgr.mailbox
+peerMgrPing :: PeerMgr -> Peer -> Word64 -> IO ()
+peerMgrPing mgr p nonce = PeerPing p nonce `send` mgr.mailbox
 
-peerMgrPong ::
-  (MonadIO m) =>
-  Peer ->
-  Word64 ->
-  PeerMgr ->
-  m ()
-peerMgrPong p nonce mgr =
-  PeerPong p nonce `send` mgr.mailbox
+peerMgrPong :: PeerMgr -> Peer -> Word64 -> IO ()
+peerMgrPong mgr p nonce = PeerPong p nonce `send` mgr.mailbox
 
-peerMgrAddrs ::
-  (MonadIO m) =>
-  Peer ->
-  [NetworkAddress] ->
-  PeerMgr ->
-  m ()
-peerMgrAddrs p addrs mgr =
-  PeerAddrs p addrs `send` mgr.mailbox
+peerMgrAddrs :: PeerMgr -> Peer -> [NetworkAddress] -> IO ()
+peerMgrAddrs mgr p addrs = PeerAddrs p addrs `send` mgr.mailbox
 
 toHostService :: String -> (Maybe String, Maybe String)
 toHostService str =
@@ -801,17 +521,17 @@ toHostService str =
         (x : xs)
           | x == '[' -> do
               i <- elemIndex ']' xs
-              return $ second tail $ splitAt i xs
+              return $ second (drop 1) $ splitAt i xs
           | x == ':' -> do
               return (str, "")
         _ -> Nothing
    in (host, srv)
 
-toSockAddr :: (MonadUnliftIO m) => Network -> String -> m [SockAddr]
+toSockAddr :: Network -> String -> IO [SockAddr]
 toSockAddr net str =
   go `catch` e
   where
-    go = fmap (map addrAddress) $ liftIO $ getAddrInfo Nothing host srv
+    go = fmap (map addrAddress) $ getAddrInfo Nothing host srv
     (host, srv) =
       second (<|> Just (show net.defaultPort)) $
         toHostService str
