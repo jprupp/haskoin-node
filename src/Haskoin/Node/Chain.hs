@@ -20,6 +20,8 @@ module Haskoin.Node.Chain
   ( ChainConfig (..),
     ChainEvent (..),
     Chain,
+    ChainT,
+    runChainT,
     withChain,
     chainGetBlock,
     chainGetBest,
@@ -39,6 +41,7 @@ import Control.Concurrent.Async
 import Control.Concurrent.STM
 import Control.Logging
 import Control.Monad (forM_, forever, guard, when)
+import Control.Monad.IO.Class (MonadIO, liftIO)
 import Control.Monad.Trans.Reader
 import Data.ByteString qualified as B
 import Data.Function (on)
@@ -150,35 +153,42 @@ instance Serialize BestBlockKey where
     return BestBlockKey
   put BestBlockKey = putWord8 0x91
 
-type ChainM = ReaderT ChainConfig IO
+type ChainT m = ReaderT Chain m
 
-chainM :: ChainConfig -> ChainM a -> IO a
-chainM cfg m = runReaderT m cfg
+runChainT :: ChainT m a -> Chain -> m a
+runChainT = runReaderT
 
-instance BlockHeaders ChainM where
-  addBlockHeader bn = ReaderT $ \ChainConfig {db, cf} -> do
+instance MonadIO m => BlockHeaders (ReaderT ChainConfig m) where
+  addBlockHeader bn = ReaderT $ \ChainConfig {db, cf} -> liftIO $ do
     case cf of
       Nothing -> insert db (BlockHeaderKey h) bn
       Just cf' -> insertCF db cf' (BlockHeaderKey h) bn
     where
       h = headerHash bn.header
-  getBlockHeader bh = ReaderT $ \ChainConfig {db, cf} -> do
+  getBlockHeader bh = ReaderT $ \ChainConfig {db, cf} -> liftIO $ do
     retrieveCommon db cf (BlockHeaderKey bh)
-  getBestBlockHeader = ReaderT $ \ChainConfig {db, cf} -> do
+  getBestBlockHeader = ReaderT $ \ChainConfig {db, cf} -> liftIO $ do
     retrieveCommon db cf BestBlockKey >>= \case
       Nothing -> error "Could not get best block from database"
       Just b -> return b
-  setBestBlockHeader bn = ReaderT $ \ChainConfig {db, cf} -> do
+  setBestBlockHeader bn = ReaderT $ \ChainConfig {db, cf} -> liftIO $ do
     case cf of
       Nothing -> insert db BestBlockKey bn
       Just cf' -> insertCF db cf' BestBlockKey bn
-  addBlockHeaders bns = ReaderT $ \ChainConfig {db, cf} -> do
+  addBlockHeaders bns = ReaderT $ \ChainConfig {db, cf} -> liftIO $ do
     writeBatch db (map (f cf) bns)
     where
       h bn = headerHash bn.header
       f cf bn = case cf of
         Nothing -> insertOp (BlockHeaderKey (h bn)) bn
         Just cf' -> insertOpCF cf' (BlockHeaderKey (h bn)) bn
+
+instance MonadIO m => BlockHeaders (ChainT m) where
+  addBlockHeader bn = withReaderT (.config) (addBlockHeader bn)
+  getBlockHeader bh = withReaderT (.config) (getBlockHeader bh)
+  getBestBlockHeader = withReaderT (.config) getBestBlockHeader
+  setBestBlockHeader bn = withReaderT (.config) (setBestBlockHeader bn)
+  addBlockHeaders bns = withReaderT (.config) (addBlockHeaders bns)
 
 withChain :: ChainConfig -> (Chain -> IO a) -> IO a
 withChain cfg action = do
@@ -199,12 +209,12 @@ withChain cfg action = do
     main_loop ch inbox =
       withSyncLoop ch.mailbox (run ch inbox)
     run ch inbox = do
-      chainM cfg getBestBlockHeader
+      runReaderT getBestBlockHeader cfg
         >>= chainEvent cfg.pub . ChainBestBlock
       forever $ do
         debugS "Chain" "Awaiting event..."
         msg <- receive inbox
-        chainMessage ch msg
+        chainConfigMessage ch msg
 
 chainEvent :: Publisher ChainEvent -> ChainEvent -> IO ()
 chainEvent pub e = do
@@ -223,14 +233,14 @@ processHeaders ch p hs = do
     ("Processing " <> cs (show len) <> " headers from peer: " <> p.label)
   let net = ch.config.net
   now <- getCurrentTime
-  pbest <- chainM ch.config getBestBlockHeader
+  pbest <- runReaderT getBestBlockHeader ch.config
   importHeaders ch now hs >>= \case
     Nothing -> do
       warnS "Chain" ("Could not connect headers from peer: " <> p.label)
       killPeer p
     Just done -> do
       setLastReceived ch.state
-      best <- chainM ch.config getBestBlockHeader
+      best <- runReaderT getBestBlockHeader ch.config
       when (pbest.header /= best.header) $
         chainEvent ch.config.pub (ChainBestBlock best)
       if done
@@ -257,7 +267,7 @@ syncNotif ch =
   notifySynced ch >>= \case
     False -> return ()
     True ->
-      chainM ch.config getBestBlockHeader
+      runReaderT getBestBlockHeader ch.config
         >>= chainEvent ch.config.pub . ChainSynced
 
 syncPeer :: Chain -> Peer -> IO ()
@@ -280,26 +290,26 @@ syncPeer ch p = do
         False -> return Nothing
         True -> do
           debugS "Chain" ("Locked peer: " <> p.label)
-          h <- chainM ch.config getBestBlockHeader
+          h <- runReaderT getBestBlockHeader ch.config
           Just <$> syncHeaders ch t h p
     syncing_me t m = do
       h <- case m of
-        Nothing -> chainM ch.config getBestBlockHeader
+        Nothing -> runReaderT getBestBlockHeader ch.config
         Just h -> return h
       Just <$> syncHeaders ch t h p
 
-chainMessage :: Chain -> ChainMessage -> IO ()
-chainMessage ch (ChainHeaders p hs) =
+chainConfigMessage :: Chain -> ChainMessage -> IO ()
+chainConfigMessage ch (ChainHeaders p hs) =
   processHeaders ch p hs
-chainMessage ch (ChainPeerConnected p) = do
+chainConfigMessage ch (ChainPeerConnected p) = do
   debugS "Chain" ("Peer connected: " <> p.label)
   addPeer ch.state p
   syncNewPeer ch
-chainMessage ch (ChainPeerDisconnected p) = do
+chainConfigMessage ch (ChainPeerDisconnected p) = do
   debugS "Chain" ("Peer disconnected: " <> p.label)
   finishPeer ch.state p
   syncNewPeer ch
-chainMessage ch ChainPing = do
+chainConfigMessage ch ChainPing = do
   debugS "Chain" "Internal clock event"
   let to = ch.config.timeout
   now <- getCurrentTime
@@ -337,7 +347,7 @@ initChainDB cfg@ChainConfig {db, cf, net} = do
     Nothing -> insert db ChainDataVersionKey dataVersion
     Just cf' -> insertCF db cf' ChainDataVersionKey dataVersion
   retrieveCommon db cf BestBlockKey >>= \b ->
-    when (isNothing (b :: Maybe BlockNode)) . chainM cfg $ do
+    when (isNothing (b :: Maybe BlockNode)) . flip runReaderT cfg $ do
       addBlockHeader (genesisNode net)
       setBestBlockHeader (genesisNode net)
 
@@ -380,8 +390,8 @@ importHeaders ch now hs =
   where
     set_best bb ChainSync {..} = ChainSync {best = bb, ..}
     timestamp = floor (utcTimeToPOSIXSeconds now)
-    connect = chainM ch.config (connectBlocks ch.config.net timestamp hs)
-    get_last = chainM ch.config $ getBlockHeader (headerHash (last hs))
+    connect = runReaderT (connectBlocks ch.config.net timestamp hs) ch.config
+    get_last = runReaderT (getBlockHeader (headerHash (last hs))) ch.config
 
 -- | Check if best block header is in sync with the rest of the block chain by
 -- comparing the best block with the current time, verifying that there are no
@@ -392,7 +402,7 @@ importHeaders ch now hs =
 -- 'True'.
 notifySynced :: Chain -> IO Bool
 notifySynced ch = do
-  bb <- chainM ch.config getBestBlockHeader
+  bb <- runReaderT getBestBlockHeader ch.config
   df <- (`diffUTCTime` block_time bb) <$> getCurrentTime
   atomically $ do
     s <- readTVar ch.state
@@ -434,7 +444,7 @@ syncHeaders ch now bb p = do
                 },
           peers = delete p s.peers
         }
-  loc <- chainM ch.config (blockLocator bb)
+  loc <- runReaderT (blockLocator bb) ch.config
   return
     GetHeaders
       { version = myVersion,
@@ -528,15 +538,15 @@ chainSyncingPeer st = (.syncing) <$> readTVarIO st
 
 -- | Get a block header from the block chain.
 chainGetBlock :: Chain -> BlockHash -> IO (Maybe BlockNode)
-chainGetBlock ch bh = chainM ch.config (getBlockHeader bh)
+chainGetBlock ch bh = runReaderT (getBlockHeader bh) ch.config
 
 -- | Get best block header from chain process.
 chainGetBest :: Chain -> IO BlockNode
-chainGetBest ch = chainM ch.config getBestBlockHeader
+chainGetBest ch = runReaderT getBestBlockHeader ch.config
 
 -- | Get ancestor of 'BlockNode' at 'BlockHeight' from chain process.
 chainGetAncestor :: Chain -> BlockHeight -> BlockNode -> IO (Maybe BlockNode)
-chainGetAncestor ch h bn = chainM ch.config (getAncestor h bn)
+chainGetAncestor ch h bn = runReaderT (getAncestor h bn) ch.config
 
 -- | Get parents of 'BlockNode' starting at 'BlockHeight' from chain process.
 chainGetParents :: Chain -> BlockHeight -> BlockNode -> IO [BlockNode]
@@ -553,7 +563,7 @@ chainGetParents ch height top =
 
 -- | Get last common block from chain process.
 chainGetSplitBlock :: Chain -> BlockNode -> BlockNode -> IO BlockNode
-chainGetSplitBlock ch l r = chainM ch.config (splitPoint l r)
+chainGetSplitBlock ch l r = runReaderT (splitPoint l r) ch.config
 
 -- | Notify chain that a new peer is connected.
 chainPeerConnected :: Chain -> Peer -> IO ()
