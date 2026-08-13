@@ -16,7 +16,6 @@ module Haskoin.Node.Peer
   ( PeerConfig (..),
     PeerEvent (..),
     Conduits (..),
-    PeerException (..),
     WithConnection,
     Peer (..),
     peer,
@@ -71,23 +70,6 @@ data PeerEvent
   = PeerConnected !Peer
   | PeerDisconnected !Peer
   | PeerMessage !Peer !Message
-  deriving (Eq)
-
-data PeerException
-  = PeerMisbehaving !String
-  | DuplicateVersion
-  | DecodeHeaderError
-  | CannotDecodePayload !MessageCommand
-  | PeerIsMyself
-  | PayloadTooLarge !Word32
-  | PeerAddressInvalid
-  | PeerSentBadHeaders
-  | NotNetworkPeer
-  | PeerNoSegWit
-  | PeerTimeout
-  | UnknownPeer
-  | PeerTooOld
-  | EmptyHeader
   deriving (Eq)
 
 -- | Mailbox for a peer.
