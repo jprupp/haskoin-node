@@ -211,7 +211,7 @@ dispatch mgr (PeerVersion p v) = do
     Nothing -> do
       $(logWarnS)
         "PeerMgr"
-        ("Version rejected for peer " <> p.label <> ": " <> cs (show v))
+        ("Version rejected for peer " <> p.label)
       killPeer p
 dispatch mgr (PeerVerAck p) = do
   atomically (setPeerVerAck mgr.peers p) >>= \case
