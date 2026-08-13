@@ -131,7 +131,6 @@ peer cfg@PeerConfig {label, net, connect, pub} busy inbox = do
       withAsync src $ \as -> do
         link as
         runConduit (go .| snk)
-        error $ "Peer " <> cs label <> " conduit failed"
     send_msg p msg = publish (PeerMessage p msg) pub
 
 -- | Internal function to dispatch peer messages.
@@ -150,12 +149,16 @@ dispatchMessage PeerConfig {label} KillPeer = do
 
 -- | Internal conduit to parse messages coming from peer.
 inPeerConduit :: (MonadLoggerIO m) => PeerConfig -> ConduitT ByteString Message m ()
-inPeerConduit pc@PeerConfig {label, net} = do
+inPeerConduit pc@PeerConfig {label, net} = forever $ do
   $(logDebugS) "Peer" (label <> " awaiting message...")
   x <- takeCE 24 .| foldC
+  when (B.null x) $ do
+    $(logErrorS) "Peer" (label <> " sent empty message header")
+    error "Peer sent empty message header"
   case decode x of
-    Left e ->
-      $(logErrorS) "Peer" (label <> " sent invalid or empty message header")
+    Left e -> do
+      $(logErrorS) "Peer" (label <> " sent invalid message header")
+      error "Peer sent invalid message header"
     Right (MessageHeader _ cmd len _)
       | len > 32 * 2 ^ (20 :: Int) ->
           $(logWarnS) "Peer" $
@@ -168,16 +171,16 @@ inPeerConduit pc@PeerConfig {label, net} = do
           $(logDebugS) "Peer" (label <> " sent cmd " <> cs (show cmd))
           y <- takeCE (fromIntegral len) .| foldC
           case runGet (getMessage net) $ x `B.append` y of
-            Left e ->
+            Left e -> do
               $(logErrorS)
                 "Peer"
                 (label <> " sent invalid payload for cmd " <> cs (show cmd))
+              error "Peer sent invalid payload"
             Right msg -> do
               $(logDebugS)
                 "Peer"
                 (label <> " sent payload for cmd " <> cs (show cmd))
               yield msg
-              inPeerConduit pc
 
 -- | Outgoing peer conduit to serialize and send messages.
 outPeerConduit :: (Monad m) => Network -> ConduitT Message ByteString m ()
