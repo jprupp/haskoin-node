@@ -301,16 +301,16 @@ sendPing mgr p = do
 processPeerOffline :: (MonadLoggerIO m) => PeerMgr -> Child -> m ()
 processPeerOffline mgr a = do
   atomically (findPeerAsync mgr.peers a) >>= \case
-    Nothing -> $(logWarnS) "PeerMgr" "Disconnected unknown peer"
+    Nothing -> $(logErrorS) "PeerMgr" "Disconnected unknown peer"
     Just o -> do
       if o.online
         then do
-          $(logWarnS)
+          $(logErrorS)
             "PeerMgr"
             ("Disconnected peer " <> o.mailbox.label)
           managerEvent mgr (PeerDisconnected o.mailbox)
         else
-          $(logWarnS)
+          $(logErrorS)
             "PeerMgr"
             ("Could not connect to peer " <> o.mailbox.label)
       atomically (removePeer mgr.peers o.mailbox)

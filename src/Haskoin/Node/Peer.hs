@@ -116,7 +116,7 @@ peer cfg@PeerConfig {label, net, connect, pub} busy inbox = do
   withRunInIO $ \run -> connect (run . peer_session p)
   where
     go = do
-      $(logDebugS) "Peer" $ label <> " awaiting event..."
+      $(logDebugS) "Peer " $ label <> " awaiting event..."
       msg <- receive inbox
       dispatchMessage cfg msg >>= bool (return ()) go
     peer_session p ad = do
@@ -131,6 +131,7 @@ peer cfg@PeerConfig {label, net, connect, pub} busy inbox = do
       withAsync src $ \as -> do
         link as
         runConduit (go .| snk)
+        error $ "Peer " <> cs label <> " conduit failed"
     send_msg p msg = publish (PeerMessage p msg) pub
 
 -- | Internal function to dispatch peer messages.
@@ -150,13 +151,11 @@ dispatchMessage PeerConfig {label} KillPeer = do
 -- | Internal conduit to parse messages coming from peer.
 inPeerConduit :: (MonadLoggerIO m) => PeerConfig -> ConduitT ByteString Message m ()
 inPeerConduit pc@PeerConfig {label, net} = do
-  $(logDebugS) "Peer" (label <> ": awaiting message...")
+  $(logDebugS) "Peer" (label <> " awaiting message...")
   x <- takeCE 24 .| foldC
-  when (B.null x) $ do
-    $(logWarnS) "Peer" (label <> " sent empty header")
   case decode x of
-    Left e -> do
-      $(logWarnS) "Peer" (label <> " sent invalid header")
+    Left e ->
+      $(logErrorS) "Peer" (label <> " sent invalid or empty message header")
     Right (MessageHeader _ cmd len _)
       | len > 32 * 2 ^ (20 :: Int) ->
           $(logWarnS) "Peer" $
@@ -172,11 +171,11 @@ inPeerConduit pc@PeerConfig {label, net} = do
             Left e ->
               $(logErrorS)
                 "Peer"
-                (label <> ": sent invalid payload for cmd " <> cs (show cmd))
+                (label <> " sent invalid payload for cmd " <> cs (show cmd))
             Right msg -> do
               $(logDebugS)
                 "Peer"
-                (label <> " sent full message for cmd " <> cs (show cmd))
+                (label <> " sent payload for cmd " <> cs (show cmd))
               yield msg
               inPeerConduit pc
 
