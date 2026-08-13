@@ -329,10 +329,16 @@ announcePeer mgr p = do
       $(logWarnS) "PeerMgr" ("Not announcing disconnected peer " <> p.label)
 
 getNewPeer :: (MonadIO m) => PeerMgr -> m (Maybe SockAddr)
-getNewPeer mgr = do
-  loadPeers mgr
-  atomically . stateTVar mgr.addresses $
-    first (listToMaybe . Set.elems) . Set.splitAt 1
+getNewPeer mgr =
+  g >>= \case
+    Nothing -> loadPeers mgr >> g
+    Just a -> return (Just a)
+  where
+    g =
+      atomically $
+        stateTVar
+          mgr.addresses
+          (first (listToMaybe . Set.elems) . Set.splitAt 1)
 
 connectPeer :: (MonadUnliftIO m, MonadLoggerIO m) => PeerMgr -> SockAddr -> m ()
 connectPeer mgr sa = do
