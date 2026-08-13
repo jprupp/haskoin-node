@@ -11,10 +11,9 @@
 module Haskoin.NodeSpec (spec) where
 
 import Conduit
-import Control.Concurrent.Async
-import Control.Logging
 import Control.Monad (forM_, forever, replicateM)
 import Control.Monad.Cont
+import Control.Monad.Logger
 import Control.Monad.Trans (lift)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
@@ -22,7 +21,7 @@ import Data.ByteString.Base64 (decodeBase64Lenient)
 import Data.Default (def)
 import Data.Either (fromRight)
 import Data.List (find)
-import Data.Maybe (isJust, mapMaybe)
+import Data.Maybe (isJust, listToMaybe, mapMaybe)
 import Data.Serialize (decode, get, runGet, runPut)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Database.RocksDB qualified as R
@@ -30,10 +29,10 @@ import Haskoin
 import Haskoin.Node
 import NQE
 import Network.Socket (AddrInfo (addrAddress), SockAddr (..))
-import System.IO.Temp
 import System.Random (randomIO)
 import Test.Hspec
 import Test.Hspec.QuickCheck
+import UnliftIO
 
 data TestNode = TestNode
   { testMgr :: PeerMgr,
@@ -106,8 +105,8 @@ spec = do
             if b
               then SockAddrInet p w1
               else SockAddrInet6 p 0 (w1, w2, w3, w4) 0
-      s <- head <$> toSockAddr net (show a)
-      s `shouldBe` a
+      s <- toSockAddr net (show a)
+      s `shouldStartWith` [a]
     it "reads some specific addresses" $ do
       toHostService "localhost" `shouldBe` (Just "localhost", Nothing)
       toHostService "::1" `shouldBe` (Just "::1", Nothing)
@@ -184,13 +183,17 @@ waitForPeer inbox =
     PeerEvent (PeerConnected p) -> Just p
     _ -> Nothing
 
-withTestNode :: Network -> String -> (TestNode -> IO a) -> IO a
-withTestNode net str f = withStderrLogging $ flip runContT return $ do
-  lift $ setLogLevel LevelError
+withLifted :: (MonadUnliftIO m) => ((a -> IO b) -> IO b) -> (a -> m b) -> m b
+withLifted w m = withRunInIO $ \io -> w (io . m)
+
+withTestNode ::
+  (MonadUnliftIO m) =>
+  Network -> String -> (TestNode -> m a) -> m a
+withTestNode net str f = runNoLoggingT $ flip runContT return $ do
   w <- ContT $ withSystemTempDirectory ("haskoin-node-test-" <> str <> "-")
   pub <- ContT withPublisher
   sub <- ContT $ withSubscription pub
-  db <- ContT $ R.withDBCF w cfg cols
+  db <- ContT $ withLifted (R.withDBCF w cfg cols)
   let ad =
         NetworkAddress
           nodeNetwork
@@ -203,7 +206,7 @@ withTestNode net str f = withStderrLogging $ flip runContT return $ do
         NodeConfig
           { maxPeers = 20,
             db = db,
-            cf = Just (head (R.columnFamilies db)),
+            cf = listToMaybe (R.columnFamilies db),
             peers = ["[::1]:17486"],
             discover = False,
             address = na,
@@ -214,7 +217,7 @@ withTestNode net str f = withStderrLogging $ flip runContT return $ do
             connect = dummyPeerConnect net ad
           }
   Node mgr ch <- ContT $ withNode cfg'
-  lift $
+  lift . lift $
     f
       TestNode
         { testMgr = mgr,

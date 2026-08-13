@@ -34,11 +34,9 @@ module Haskoin.Node.Peer
 where
 
 import Conduit
-import Control.Concurrent.Async
-import Control.Concurrent.STM
 import Control.Exception
-import Control.Logging
 import Control.Monad
+import Control.Monad.Logger
 import Control.Monad.Trans.Maybe
 import Data.Bool (bool)
 import Data.ByteString (ByteString)
@@ -52,8 +50,8 @@ import Data.Text (Text)
 import Data.Word (Word32)
 import Haskoin
 import NQE
-import System.Random (randomIO)
-import System.Timeout
+import System.Random
+import UnliftIO
 
 data Conduits = Conduits
   { inboundConduit :: ConduitT () ByteString IO (),
@@ -115,37 +113,37 @@ wrapPeer ::
   PeerConfig ->
   TVar Bool ->
   Mailbox PeerMessage ->
-  IO Peer
+  Peer
 wrapPeer cfg busy mbox =
-  return
-    Peer
-      { mailbox = mbox,
-        pub = cfg.pub,
-        label = cfg.label,
-        busy = busy
-      }
+  Peer
+    { mailbox = mbox,
+      pub = cfg.pub,
+      label = cfg.label,
+      busy = busy
+    }
 
 -- | Run peer process in current thread.
 peer ::
+  (MonadLoggerIO m, MonadUnliftIO m) =>
   PeerConfig ->
   TVar Bool ->
   Inbox PeerMessage ->
-  IO ()
-peer cfg@PeerConfig {..} busy inbox = do
-  p <- wrapPeer cfg busy (inboxToMailbox inbox)
-  connect $ peer_session p
+  m ()
+peer cfg@PeerConfig {label, net, connect, pub} busy inbox = do
+  let p = wrapPeer cfg busy (inboxToMailbox inbox)
+  withRunInIO $ \run -> connect (run . peer_session p)
   where
-    go = forever $ do
-      lift $ debugS "Peer" $ label <> " awaiting event..."
+    go = do
+      $(logDebugS) "Peer" $ label <> " awaiting event..."
       msg <- receive inbox
-      dispatchMessage cfg msg
+      dispatchMessage cfg msg >>= bool (return ()) go
     peer_session p ad = do
-      let ins = ad.inboundConduit
-          ons = ad.outboundConduit
+      let ins = transPipe liftIO ad.inboundConduit
+          ons = transPipe liftIO ad.outboundConduit
           src =
             runConduit $
               ins
-                .| inPeerConduit net cfg label
+                .| inPeerConduit cfg
                 .| mapM_C (send_msg p)
           snk = outPeerConduit net .| ons
       withAsync src $ \as -> do
@@ -155,80 +153,86 @@ peer cfg@PeerConfig {..} busy inbox = do
 
 -- | Internal function to dispatch peer messages.
 dispatchMessage ::
+  (MonadLoggerIO m) =>
   PeerConfig ->
   PeerMessage ->
-  ConduitT i Message IO ()
+  ConduitT i Message m Bool
 dispatchMessage PeerConfig {label} (SendMessage msg) = do
-  lift $ debugS "Peer" $ label <> " sending: " <> cs (show msg)
+  $(logDebugS) "Peer" (label <> " sending: " <> cs (show msg))
   yield msg
+  return True
 dispatchMessage PeerConfig {label} KillPeer = do
-  lift $ errorSL "Peer" $ label <> " disconnecting"
+  $(logInfoS) "Peer" (label <> " disconnecting")
+  return False
 
 -- | Internal conduit to parse messages coming from peer.
-inPeerConduit ::
-  Network ->
-  PeerConfig ->
-  Text ->
-  ConduitT ByteString Message IO ()
-inPeerConduit net PeerConfig {label} a =
-  forever $ do
-    lift $ debugS "Peer" $ label <> " awaiting network message..."
-    x <- takeCE 24 .| foldC
-    when (B.null x) $ do
-      lift $ errorSL "Peer" $ label <> " empty header"
-    case decode x of
-      Left e -> do
-        lift $ errorSL "Peer" $ label <> " error decoding header"
-      Right (MessageHeader _ cmd len _) -> do
-        lift $ debugS "Peer" $ label <> " received: " <> cs (show cmd)
-        when (len > 32 * 2 ^ (20 :: Int)) . lift . errorSL "Peer" $
-          label <> " payload too large: " <> cs (show len)
-        y <- takeCE (fromIntegral len) .| foldC
-        case runGet (getMessage net) $ x `B.append` y of
-          Left e -> do
-            lift $
-              errorSL "Peer" $
-                label
-                  <> " could not decode payload for cmd: "
-                  <> cs (show cmd)
-          Right msg -> do
-            lift $ debugS "Peer" $ label <> " forwarding: " <> cs (show msg)
-            yield msg
+inPeerConduit :: (MonadLoggerIO m) => PeerConfig -> ConduitT ByteString Message m ()
+inPeerConduit pc@PeerConfig {label, net} = do
+  $(logDebugS) "Peer" (label <> ": awaiting message...")
+  x <- takeCE 24 .| foldC
+  when (B.null x) $ do
+    $(logWarnS) "Peer" (label <> " sent empty header")
+  case decode x of
+    Left e -> do
+      $(logWarnS) "Peer" (label <> " sent invalid header")
+    Right (MessageHeader _ cmd len _)
+      | len > 32 * 2 ^ (20 :: Int) ->
+          $(logWarnS) "Peer" $
+            label
+              <> " wants to send "
+              <> cs (show len)
+              <> " bytes (too large) for cmd "
+              <> cs (show cmd)
+      | otherwise -> do
+          $(logDebugS) "Peer" (label <> " sent cmd " <> cs (show cmd))
+          y <- takeCE (fromIntegral len) .| foldC
+          case runGet (getMessage net) $ x `B.append` y of
+            Left e ->
+              $(logErrorS)
+                "Peer"
+                (label <> ": sent invalid payload for cmd " <> cs (show cmd))
+            Right msg -> do
+              $(logDebugS)
+                "Peer"
+                (label <> " sent full message for cmd " <> cs (show cmd))
+              yield msg
+              inPeerConduit pc
 
 -- | Outgoing peer conduit to serialize and send messages.
 outPeerConduit :: (Monad m) => Network -> ConduitT Message ByteString m ()
 outPeerConduit net = awaitForever $ yield . runPut . putMessage net
 
 -- | Kill a peer with the provided exception.
-killPeer :: Peer -> IO ()
+killPeer :: (MonadIO m) => Peer -> m ()
 killPeer p = KillPeer `send` p.mailbox
 
 -- | Send a network message to peer.
-sendMessage :: Message -> Peer -> IO ()
+sendMessage :: (MonadIO m) => Message -> Peer -> m ()
 sendMessage msg p = SendMessage msg `send` p.mailbox
 
-getBusy :: Peer -> IO Bool
+getBusy :: (MonadIO m) => Peer -> m Bool
 getBusy p = readTVarIO p.busy
 
-setBusy :: Peer -> IO Bool
+setBusy :: (MonadIO m) => Peer -> m Bool
 setBusy p =
   atomically $ do
     b <- readTVar p.busy
     unless b $ writeTVar p.busy True
     return $ not b
 
-setFree :: Peer -> IO ()
+setFree :: (MonadIO m) => Peer -> m ()
 setFree p = atomically $ writeTVar p.busy False
 
 -- | Request full blocks from peer. Will return 'Nothing' if the list of blocks
 -- returned by the peer is incomplete, comes out of order, or a timeout is
 -- reached.
 getBlocks ::
+  (MonadUnliftIO m) =>
   Network ->
   Int ->
   Peer ->
   [BlockHash] ->
-  IO (Maybe [Block])
+  m (Maybe [Block])
 getBlocks net time p bhs =
   runMaybeT $ mapM f =<< MaybeT (getData time p (GetData ivs))
   where
@@ -243,11 +247,12 @@ getBlocks net time p bhs =
 -- transactions returned by the peer is incomplete, comes out of order, or a
 -- timeout is reached.
 getTxs ::
+  (MonadUnliftIO m) =>
   Network ->
   Int ->
   Peer ->
   [TxHash] ->
-  IO (Maybe [Tx])
+  m (Maybe [Tx])
 getTxs net time p ths =
   runMaybeT $ mapM f =<< MaybeT (getData time p (GetData ivs))
   where
@@ -262,10 +267,10 @@ getTxs net time p ths =
 -- single inventory fails to be retrieved, if they come out of order, or if
 -- timeout is reached.
 getData ::
-  Int -> Peer -> GetData -> IO (Maybe [Either Tx Block])
+  (MonadUnliftIO m) => Int -> Peer -> GetData -> m (Maybe [Either Tx Block])
 getData seconds p gd@(GetData ivs) =
   withSubscription p.pub $ \inb -> do
-    r <- liftIO randomIO
+    r <- randomIO
     MGetData gd `sendMessage` p
     MPing (Ping r) `sendMessage` p
     fmap join
@@ -303,17 +308,17 @@ getData seconds p gd@(GetData ivs) =
 
 -- | Ping a peer and await response. Return 'False' if response not received
 -- before timeout.
-pingPeer :: Int -> Peer -> IO Bool
+pingPeer :: (MonadUnliftIO m) => Int -> Peer -> m Bool
 pingPeer time p =
   fmap isJust . withSubscription p.pub $ \sub -> do
-    r <- liftIO randomIO
+    r <- randomIO
     MPing (Ping r) `sendMessage` p
     receiveMatchS time sub $ \case
       PeerMessage p' (MPong (Pong r'))
         | p == p' && r == r' -> Just ()
       _ -> Nothing
 
-filterReceive :: Peer -> Inbox PeerEvent -> IO Message
+filterReceive :: (MonadIO m) => Peer -> Inbox PeerEvent -> m Message
 filterReceive p inb =
   receive inb >>= \case
     PeerMessage p' msg | p == p' -> return msg

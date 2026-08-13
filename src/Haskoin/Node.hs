@@ -20,12 +20,9 @@ module Haskoin.Node
   )
 where
 
-import Control.Concurrent
-import Control.Concurrent.Async
-import Control.Exception
-import Control.Logging
 import Control.Monad (forever)
 import Control.Monad.Cont (ContT (..), MonadCont (callCC), cont, runCont, runContT)
+import Control.Monad.Logger
 import Control.Monad.Trans (lift)
 import Data.Conduit.Network
 import Data.String.Conversions (cs)
@@ -38,6 +35,7 @@ import Haskoin.Node.PeerMgr
 import NQE
 import Network.Socket
 import Text.Read (readMaybe)
+import UnliftIO
 
 -- | General node configuration.
 data NodeConfig = NodeConfig
@@ -77,16 +75,16 @@ data NodeEvent
 withConnection :: SockAddr -> WithConnection
 withConnection na f =
   fromSockAddr na >>= \case
-    Nothing -> errorSL "Node" ("Peer address invalid: " <> cs (show na))
+    Nothing -> error $ "Invalid address " ++ show na
     Just cset ->
       runTCPClient cset $ \ad ->
         f (Conduits (appSource ad) (appSink ad))
 
-fromSockAddr :: SockAddr -> IO (Maybe ClientSettings)
+fromSockAddr :: (MonadUnliftIO m) => SockAddr -> m (Maybe ClientSettings)
 fromSockAddr sa = go `catch` e
   where
     go = do
-      (maybe_host, maybe_port) <- getNameInfo flags True True sa
+      (maybe_host, maybe_port) <- liftIO $ getNameInfo flags True True sa
       return $
         clientSettings
           <$> (readMaybe =<< maybe_port)
@@ -95,7 +93,8 @@ fromSockAddr sa = go `catch` e
     e :: (Monad m) => SomeException -> m (Maybe a)
     e _ = return Nothing
 
-chainEvents :: PeerMgr -> Inbox ChainEvent -> Publisher NodeEvent -> IO ()
+chainEvents ::
+  (MonadIO m) => PeerMgr -> Inbox ChainEvent -> Publisher NodeEvent -> m ()
 chainEvents mgr input output = forever $ do
   event <- receive input
   case event of
@@ -104,7 +103,8 @@ chainEvents mgr input output = forever $ do
   publish (ChainEvent event) output
 
 peerEvents ::
-  Chain -> PeerMgr -> Inbox PeerEvent -> Publisher NodeEvent -> IO ()
+  (MonadLoggerIO m) =>
+  Chain -> PeerMgr -> Inbox PeerEvent -> Publisher NodeEvent -> m ()
 peerEvents ch mgr input output = forever $ do
   event <- receive input
   case event of
@@ -131,7 +131,8 @@ peerEvents ch mgr input output = forever $ do
   publish (PeerEvent event) output
 
 -- | Launch node process in the foreground.
-withNode :: NodeConfig -> (Node -> IO a) -> IO a
+withNode ::
+  (MonadUnliftIO m, MonadLoggerIO m) => NodeConfig -> (Node -> m a) -> m a
 withNode NodeConfig {..} action = flip runContT return $ do
   peerPub <- ContT withPublisher
   peerSub <- ContT (withSubscription peerPub)
@@ -141,6 +142,6 @@ withNode NodeConfig {..} action = flip runContT return $ do
   let chainCfg = ChainConfig {pub = chainPub, ..}
   chain <- ContT (withChain chainCfg)
   peerMgr <- ContT $ withPeerMgr peerMgrCfg
-  lift . link =<< ContT (withAsync $ chainEvents peerMgr chainSub pub)
-  lift . link =<< ContT (withAsync $ peerEvents chain peerMgr peerSub pub)
+  link =<< ContT (withAsync $ chainEvents peerMgr chainSub pub)
+  link =<< ContT (withAsync $ peerEvents chain peerMgr peerSub pub)
   lift $ action Node {..}
