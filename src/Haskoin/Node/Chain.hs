@@ -391,7 +391,7 @@ importHeaders ch now hs =
           bb <- get_last
           atomically . modifyTVar ch.state $ \s ->
             s {syncing = set_best bb <$> s.syncing}
-          return (Just (length hs == 2000))
+          return (Just (length hs < 2000))
   where
     set_best bb ChainSync {..} = ChainSync {best = bb, ..}
     timestamp = floor (utcTimeToPOSIXSeconds now)
@@ -514,11 +514,11 @@ finishPeer st p =
     False ->
       $(logDebugS)
         "Chain"
-        ("Removed peer from queue: " <> p.label)
+        ("Removed peer " <> p.label <> " from queue")
     True -> do
       $(logDebugS)
         "Chain"
-        ("Releasing syncing peer: " <> p.label)
+        ("Releasing syncing peer " <> p.label)
       setFree p
   where
     remove_peer =
