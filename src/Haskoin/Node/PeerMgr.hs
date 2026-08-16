@@ -346,7 +346,7 @@ connectPeer mgr sa = do
     Just _ ->
       $(logWarnS) "PeerMgr" ("Duplicate connection to peer " <> cs (show sa))
     Nothing -> do
-      $(logWarnS) "PeerMgr" ("Connecting to peer " <> cs (show sa))
+      $(logInfoS) "PeerMgr" ("Connecting to peer " <> cs (show sa))
       nonce <- randomIO
       bb <- getBestBlock mgr
       now <- liftIO getCurrentTime
