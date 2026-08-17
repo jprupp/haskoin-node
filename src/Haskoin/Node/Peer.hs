@@ -148,7 +148,8 @@ dispatchMessage PeerConfig {label} KillPeer = do
   return False
 
 -- | Internal conduit to parse messages coming from peer.
-inPeerConduit :: (MonadLoggerIO m) => PeerConfig -> ConduitT ByteString Message m ()
+inPeerConduit ::
+  (MonadLoggerIO m) => PeerConfig -> ConduitT ByteString Message m ()
 inPeerConduit pc@PeerConfig {label, net} = forever $ do
   $(logDebugS) "Peer" (label <> " awaiting message...")
   x <- takeCE 24 .| foldC
