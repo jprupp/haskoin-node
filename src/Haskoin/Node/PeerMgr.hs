@@ -270,14 +270,15 @@ checkPeer mgr p =
       let deadline = mgr.config.timeout `addUTCTime` o.tickled
       if
         | now > expired -> do
-            $(logWarnS) "PeerMgr" ("Peer " <> p.label <> " is too old")
+            $(logErrorS) "PeerMgr" ("Peer " <> p.label <> " is too old")
             killPeer p
         | now > deadline -> do
-            $(logWarnS) "PeerMgr" ("Peer " <> p.label <> " timed out")
+            $(logErrorS) "PeerMgr" ("Peer " <> p.label <> " timed out")
             killPeer p
         | isNothing o.ping -> sendPing mgr p
         | otherwise -> return ()
-    _ -> return ()
+    Nothing -> do
+      $(logErrorS) "PeerMgr" ("Peer " <> p.label <> " is offline")
 
 sendPing :: (MonadLoggerIO m) => PeerMgr -> Peer -> m ()
 sendPing mgr p = do
@@ -313,6 +314,7 @@ processPeerOffline mgr a = do
           $(logErrorS)
             "PeerMgr"
             ("Could not connect to peer " <> o.mailbox.label)
+      cancel o.async
       atomically (removePeer mgr.peers o.mailbox)
       logConnectedPeers mgr
 
