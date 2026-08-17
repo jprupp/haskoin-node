@@ -314,7 +314,6 @@ processPeerOffline mgr a = do
           $(logErrorS)
             "PeerMgr"
             ("Could not connect to peer " <> o.mailbox.label)
-      cancel o.async
       atomically (removePeer mgr.peers o.mailbox)
       logConnectedPeers mgr
 
