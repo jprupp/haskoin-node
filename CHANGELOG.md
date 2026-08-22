@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [1.4.4] - Unreleased
 
+### Added
+
+- Log `connectBlocks` error message.
+
 ### Changed
 
 - Peer connection logged incorrectly as warn is now logged as info.
@@ -13,6 +17,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 ### Fixed
 
 - Stop peer housekeeping thread when peer disconnects.
+- Correct documentation for `importHeaders` function.
 
 ## [1.4.3] - 2026-08-13
 

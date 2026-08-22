@@ -378,20 +378,22 @@ purgeChainDB ChainConfig {db, cf} = liftIO $ do
         _ -> return []
 
 -- | Import a bunch of continuous headers. Returns 'True' if the number of
--- headers is 2000, which means that there are possibly more headers to sync
--- from whatever peer delivered these.
+-- headers is less than 2000, which means that there are no more headers to sync
+-- from the peer that delivered these.
 importHeaders ::
-  (MonadIO m) => Chain -> UTCTime -> [BlockHeader] -> m (Maybe Bool)
+  (MonadLoggerIO m) => Chain -> UTCTime -> [BlockHeader] -> m (Maybe Bool)
 importHeaders ch now hs =
   connect >>= \case
-    Left _ -> return Nothing
-    Right _
-      | null hs -> return (Just False)
+    Left e -> do
+      $(logErrorS) "Chain" ("connectBlocks: " <> cs e)
+      return Nothing
+    Right bns
+      | null bns -> return (Just False)
       | otherwise -> do
           bb <- get_last
           atomically . modifyTVar ch.state $ \s ->
             s {syncing = set_best bb <$> s.syncing}
-          return (Just (length hs < 2000))
+          return (Just (length bns < 2000))
   where
     set_best bb ChainSync {..} = ChainSync {best = bb, ..}
     timestamp = floor (utcTimeToPOSIXSeconds now)
