@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
-## [1.4.4] - Unreleased
+## [1.4.4] - 2026-08-31
 
 ### Added
 
@@ -16,7 +16,6 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Fixed
 
-- Stop peer housekeeping thread when peer disconnects.
 - Correct documentation for `importHeaders` function.
 
 ## [1.4.3] - 2026-08-13
