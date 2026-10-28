@@ -29,6 +29,7 @@ library
       Haskoin.Node
   other-modules:
       Haskoin.Node.Chain
+      Haskoin.Node.Loop
       Haskoin.Node.Peer
       Haskoin.Node.PeerMgr
       Paths_haskoin_node
