@@ -412,12 +412,21 @@ withConnectLoop mgr act =
         (getNewPeer mgr >>= mapM_ (managerConnect mgr))
       threadDelay =<< randomRIO (10 ^ 5, 5 * 10 ^ 6)
 
+-- | Upper bound on addresses remembered for future connections. Peers keep
+-- relaying addresses for as long as the node runs, and with every connection
+-- slot in use nothing ever removes them, so the pool must be bounded.
+maxKnownAddresses :: Int
+maxKnownAddresses = 4096
+
 newPeer :: (MonadIO m) => PeerMgr -> SockAddr -> m ()
 newPeer mgr sa =
   atomically $
     findPeerAddress mgr.peers sa >>= \case
       Just _ -> return ()
-      Nothing -> modifyTVar mgr.addresses $ Set.insert sa
+      Nothing -> modifyTVar' mgr.addresses $ \known ->
+        if Set.size known >= maxKnownAddresses
+          then known
+          else Set.insert sa known
 
 gotPong :: TVar [OnlinePeer] -> Word64 -> UTCTime -> Peer -> STM ()
 gotPong b nonce now p =
