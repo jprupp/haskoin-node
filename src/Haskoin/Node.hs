@@ -20,7 +20,6 @@ module Haskoin.Node
   )
 where
 
-import Control.Monad (forever)
 import Control.Monad.Cont (ContT (..), MonadCont (callCC), cont, runCont, runContT)
 import Control.Monad.Logger
 import Control.Monad.Trans (lift)
@@ -30,6 +29,7 @@ import Data.Time.Clock (NominalDiffTime)
 import Database.RocksDB (ColumnFamily, DB)
 import Haskoin
 import Haskoin.Node.Chain
+import Haskoin.Node.Loop (loopForever)
 import Haskoin.Node.Peer
 import Haskoin.Node.PeerMgr
 import NQE
@@ -95,7 +95,7 @@ fromSockAddr sa = go `catch` e
 
 chainEvents ::
   (MonadIO m) => PeerMgr -> Inbox ChainEvent -> Publisher NodeEvent -> m ()
-chainEvents mgr input output = forever $ do
+chainEvents mgr input output = loopForever $ do
   event <- receive input
   case event of
     ChainBestBlock bb -> peerMgrBest mgr bb.height
@@ -105,7 +105,7 @@ chainEvents mgr input output = forever $ do
 peerEvents ::
   (MonadLoggerIO m) =>
   Chain -> PeerMgr -> Inbox PeerEvent -> Publisher NodeEvent -> m ()
-peerEvents ch mgr input output = forever $ do
+peerEvents ch mgr input output = loopForever $ do
   event <- receive input
   case event of
     PeerConnected p ->

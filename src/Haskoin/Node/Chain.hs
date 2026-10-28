@@ -36,7 +36,7 @@ module Haskoin.Node.Chain
   )
 where
 
-import Control.Monad (forM_, forever, guard, when)
+import Control.Monad (forM_, guard, when)
 import Control.Monad.Logger
 import Control.Monad.Trans.Reader
 import Data.ByteString qualified as B
@@ -52,6 +52,7 @@ import Database.RocksDB (ColumnFamily, DB)
 import Database.RocksDB qualified as R
 import Database.RocksDB.Query
 import Haskoin hiding (Key)
+import Haskoin.Node.Loop (loopForever)
 import Haskoin.Node.Peer
 import Haskoin.Node.PeerMgr (myVersion)
 import NQE
@@ -209,7 +210,7 @@ withChain cfg action = do
     run ch inbox = do
       runReaderT getBestBlockHeader cfg
         >>= chainEvent cfg.pub . ChainBestBlock
-      forever $ do
+      loopForever $ do
         $(logDebugS) "Chain" "Awaiting event..."
         msg <- receive inbox
         chainConfigMessage ch msg
@@ -332,7 +333,7 @@ withSyncLoop mbox mf =
   withAsync go $ \a ->
     link a >> mf
   where
-    go = forever $ do
+    go = loopForever $ do
       delay <- randomRIO (2 * 10 ^ 6, 2 * 10 ^ 7)
       threadDelay delay
       ChainPing `send` mbox

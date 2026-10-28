@@ -49,6 +49,7 @@ import Data.Time.Clock
 import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
 import Data.Word (Word32, Word64)
 import Haskoin
+import Haskoin.Node.Loop (loopForever)
 import Haskoin.Node.Peer
 import NQE
 import Network.Socket
@@ -146,7 +147,7 @@ peerManager mgr ibx = do
   putBestBlock mgr <=< receiveMatch ibx $ \case
     ManagerBest b -> Just b
     _ -> Nothing
-  forever $ do
+  loopForever $ do
     $(logDebugS) "PeerMgr" "Awaiting event..."
     dispatch mgr =<< receive ibx
 
@@ -393,7 +394,7 @@ connectPeer mgr sa = do
 
 withPeerLoop :: (MonadUnliftIO m) => PeerMgr -> Peer -> (Async a -> m a) -> m a
 withPeerLoop mgr p =
-  withAsync . forever $ do
+  withAsync . loopForever $ do
     let timeout = mgr.config.timeout
         ms = floor (timeout * 1000 * 1000)
     r <- randomRIO (ms `div` 4, ms `div` 2)
@@ -404,7 +405,7 @@ withConnectLoop :: (MonadUnliftIO m) => PeerMgr -> m a -> m a
 withConnectLoop mgr act =
   withAsync go $ \a -> link a >> act
   where
-    go = forever $ do
+    go = loopForever $ do
       l <- length <$> getOnlinePeers mgr
       when
         (l < mgr.config.maxPeers)
