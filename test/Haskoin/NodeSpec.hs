@@ -13,7 +13,6 @@ module Haskoin.NodeSpec (spec) where
 import Conduit
 import Control.Monad (forM_, forever, replicateM)
 import Control.Monad.Cont
-import Control.Monad.Logger
 import Control.Monad.Trans (lift)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
@@ -189,7 +188,7 @@ withLifted w m = withRunInIO $ \io -> w (io . m)
 withTestNode ::
   (MonadUnliftIO m) =>
   Network -> String -> (TestNode -> m a) -> m a
-withTestNode net str f = runNoLoggingT $ flip runContT return $ do
+withTestNode net str f = flip runContT return $ do
   w <- ContT $ withSystemTempDirectory ("haskoin-node-test-" <> str <> "-")
   pub <- ContT withPublisher
   sub <- ContT $ withSubscription pub
@@ -214,10 +213,11 @@ withTestNode net str f = runNoLoggingT $ flip runContT return $ do
             pub = pub,
             timeout = 120,
             maxPeerLife = 48 * 3600,
-            connect = dummyPeerConnect net ad
+            connect = dummyPeerConnect net ad,
+            logger = Logger {level = LevelError, source = "", push = \_ -> return ()}
           }
   Node mgr ch <- ContT $ withNode cfg'
-  lift . lift $
+  lift $
     f
       TestNode
         { testMgr = mgr,

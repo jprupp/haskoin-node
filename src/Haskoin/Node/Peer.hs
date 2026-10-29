@@ -8,7 +8,6 @@
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE NoFieldSelectors #-}
 
@@ -35,7 +34,6 @@ where
 import Conduit
 import Control.Exception
 import Control.Monad
-import Control.Monad.Logger
 import Control.Monad.Trans.Maybe
 import Data.Bool (bool)
 import Data.ByteString (ByteString)
@@ -48,6 +46,7 @@ import Data.String.Conversions (cs)
 import Data.Text (Text)
 import Data.Word (Word32)
 import Haskoin
+import Haskoin.Node.Logger
 import NQE
 import System.Random
 import UnliftIO
@@ -63,7 +62,8 @@ data PeerConfig = PeerConfig
   { pub :: !(Publisher PeerEvent),
     net :: !Network,
     label :: !Text,
-    connect :: !WithConnection
+    connect :: !WithConnection,
+    logger :: !Logger
   }
 
 data PeerEvent
@@ -106,17 +106,17 @@ wrapPeer cfg busy mbox =
 
 -- | Run peer process in current thread.
 peer ::
-  (MonadLoggerIO m, MonadUnliftIO m) =>
+  (MonadUnliftIO m) =>
   PeerConfig ->
   TVar Bool ->
   Inbox PeerMessage ->
   m ()
-peer cfg@PeerConfig {label, net, connect, pub} busy inbox = do
+peer cfg@PeerConfig {label, net, connect, pub, logger} busy inbox = do
   let p = wrapPeer cfg busy (inboxToMailbox inbox)
   withRunInIO $ \run -> connect (run . peer_session p)
   where
     go = do
-      $(logDebugS) "Peer " $ label <> " awaiting event..."
+      logDebug logger $ label <> " awaiting event..."
       msg <- receive inbox
       dispatchMessage cfg msg >>= bool (return ()) go
     peer_session p ad = do
@@ -135,51 +135,51 @@ peer cfg@PeerConfig {label, net, connect, pub} busy inbox = do
 
 -- | Internal function to dispatch peer messages.
 dispatchMessage ::
-  (MonadLoggerIO m) =>
+  (MonadIO m) =>
   PeerConfig ->
   PeerMessage ->
   ConduitT i Message m Bool
-dispatchMessage PeerConfig {label} (SendMessage msg) = do
-  $(logDebugS) "Peer" (label <> " sending: " <> cs (show msg))
+dispatchMessage PeerConfig {label, logger} (SendMessage msg) = do
+  logDebug logger (label <> " sending: " <> cs (show msg))
   yield msg
   return True
-dispatchMessage PeerConfig {label} KillPeer = do
-  $(logInfoS) "Peer" (label <> " disconnecting")
+dispatchMessage PeerConfig {label, logger} KillPeer = do
+  logInfo logger (label <> " disconnecting")
   return False
 
 -- | Internal conduit to parse messages coming from peer.
 inPeerConduit ::
-  (MonadLoggerIO m) => PeerConfig -> ConduitT ByteString Message m ()
-inPeerConduit pc@PeerConfig {label, net} = forever $ do
-  $(logDebugS) "Peer" (label <> " awaiting message...")
+  (MonadIO m) => PeerConfig -> ConduitT ByteString Message m ()
+inPeerConduit pc@PeerConfig {label, net, logger} = forever $ do
+  logDebug logger (label <> " awaiting message...")
   x <- takeCE 24 .| foldC
   when (B.null x) $ do
-    $(logErrorS) "Peer" (label <> " sent empty message header")
+    logError logger (label <> " sent empty message header")
     error "Peer sent empty message header"
   case decode x of
     Left e -> do
-      $(logErrorS) "Peer" (label <> " sent invalid message header")
+      logError logger (label <> " sent invalid message header")
       error "Peer sent invalid message header"
     Right (MessageHeader _ cmd len _)
       | len > 32 * 2 ^ (20 :: Int) ->
-          $(logWarnS) "Peer" $
+          logWarn logger $
             label
               <> " wants to send "
               <> cs (show len)
               <> " bytes (too large) for cmd "
               <> cs (show cmd)
       | otherwise -> do
-          $(logDebugS) "Peer" (label <> " sent cmd " <> cs (show cmd))
+          logDebug logger (label <> " sent cmd " <> cs (show cmd))
           y <- takeCE (fromIntegral len) .| foldC
           case runGet (getMessage net) $ x `B.append` y of
             Left e -> do
-              $(logErrorS)
-                "Peer"
+              logError
+                logger
                 (label <> " sent invalid payload for cmd " <> cs (show cmd))
               error "Peer sent invalid payload"
             Right msg -> do
-              $(logDebugS)
-                "Peer"
+              logDebug
+                logger
                 (label <> " sent payload for cmd " <> cs (show cmd))
               yield msg
 
