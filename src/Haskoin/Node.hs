@@ -12,6 +12,7 @@ module Haskoin.Node
   ( module Haskoin.Node.Peer,
     module Haskoin.Node.PeerMgr,
     module Haskoin.Node.Chain,
+    module Haskoin.Node.Logger,
     NodeConfig (..),
     NodeEvent (..),
     Node (..),
@@ -21,7 +22,6 @@ module Haskoin.Node
 where
 
 import Control.Monad.Cont (ContT (..), MonadCont (callCC), cont, runCont, runContT)
-import Control.Monad.Logger
 import Control.Monad.Trans (lift)
 import Data.Conduit.Network
 import Data.String.Conversions (cs)
@@ -29,6 +29,7 @@ import Data.Time.Clock (NominalDiffTime)
 import Database.RocksDB (ColumnFamily, DB)
 import Haskoin
 import Haskoin.Node.Chain
+import Haskoin.Node.Logger
 import Haskoin.Node.Loop (loopForever)
 import Haskoin.Node.Peer
 import Haskoin.Node.PeerMgr
@@ -59,7 +60,9 @@ data NodeConfig = NodeConfig
     timeout :: !NominalDiffTime,
     -- | peer disconnect after seconds
     maxPeerLife :: !NominalDiffTime,
-    connect :: !(SockAddr -> WithConnection)
+    connect :: !(SockAddr -> WithConnection),
+    -- | log messages here
+    logger :: !Logger
   }
 
 data Node = Node
@@ -103,7 +106,7 @@ chainEvents mgr input output = loopForever $ do
   publish (ChainEvent event) output
 
 peerEvents ::
-  (MonadLoggerIO m) =>
+  (MonadIO m) =>
   Chain -> PeerMgr -> Inbox PeerEvent -> Publisher NodeEvent -> m ()
 peerEvents ch mgr input output = loopForever $ do
   event <- receive input
@@ -132,14 +135,16 @@ peerEvents ch mgr input output = loopForever $ do
 
 -- | Launch node process in the foreground.
 withNode ::
-  (MonadUnliftIO m, MonadLoggerIO m) => NodeConfig -> (Node -> m a) -> m a
+  (MonadUnliftIO m) => NodeConfig -> (Node -> m a) -> m a
 withNode NodeConfig {..} action = flip runContT return $ do
   peerPub <- ContT withPublisher
   peerSub <- ContT (withSubscription peerPub)
   chainPub <- ContT withPublisher
   chainSub <- ContT (withSubscription chainPub)
-  let peerMgrCfg = PeerMgrConfig {pub = peerPub, ..}
-  let chainCfg = ChainConfig {pub = chainPub, ..}
+  let peerMgrCfg =
+        PeerMgrConfig {pub = peerPub, logger = withSource "PeerMgr" logger, ..}
+  let chainCfg =
+        ChainConfig {pub = chainPub, logger = withSource "Chain" logger, ..}
   chain <- ContT (withChain chainCfg)
   peerMgr <- ContT $ withPeerMgr peerMgrCfg
   link =<< ContT (withAsync $ chainEvents peerMgr chainSub pub)
