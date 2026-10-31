@@ -5,40 +5,47 @@
 
 packages:
 - completed:
-    hackage: secp256k1-haskell-1.5.0@sha256:009a0d57651a0f4eeeafd2b480a45fbc049015252fe92388ae4bb2115f765430,2077
+    hackage: base16-2.0@sha256:3cfa8002b7fd079be0552a116f27073e895b62a56d7a1cb7dd4f7a5ea3c8f6ae,3089
     pantry-tree:
-      sha256: 3c3cbc95e94347d2d37c3a74e3703fd0b65161bfe353e37caa3cf8ddf2018463
+      sha256: f9f7257c23f33cd2b9a837ec8b495d5880a6f2b5745b33f10b0aa450d22b5cbf
+      size: 1826
+  original:
+    hackage: base16-2.0
+- completed:
+    hackage: secp256k1-haskell-1.7.0@sha256:b235f096b362c8d18d0b1894d17aa4a35b1e8d851892605d0536ebdefe393593,2077
+    pantry-tree:
+      sha256: 25df8b13bd37f1690b09ecc24122d35eb98f7c64571a3fc30e2cd8d70f0c2ae8
       size: 881
   original:
-    hackage: secp256k1-haskell-1.5.0@sha256:009a0d57651a0f4eeeafd2b480a45fbc049015252fe92388ae4bb2115f765430,2077
+    hackage: secp256k1-haskell-1.7.0
 - completed:
     hackage: rocksdb-haskell-jprupp-2.3.0@sha256:ce2aaf7dd26114c489213e4089c719651550259cad42eb1b2317f2662bb3029d,1589
     pantry-tree:
       sha256: 6cbad8da561372c2e016fefba73f0034cc1429377df2c01c0661ab85bbe92f59
       size: 711
   original:
-    hackage: rocksdb-haskell-jprupp-2.3.0@sha256:ce2aaf7dd26114c489213e4089c719651550259cad42eb1b2317f2662bb3029d,1589
+    hackage: rocksdb-haskell-jprupp-2.3.0
 - completed:
     hackage: rocksdb-query-0.6.0@sha256:d312b7e8b351f7aef5028718868f4aaa65406cb828367309a7f4cfa222b3d593,1439
     pantry-tree:
       sha256: 516c59b74d9a9153b11cde9e28d6f9b28f8562f212c4523d980b31be03b19c1e
       size: 381
   original:
-    hackage: rocksdb-query-0.6.0@sha256:d312b7e8b351f7aef5028718868f4aaa65406cb828367309a7f4cfa222b3d593,1439
+    hackage: rocksdb-query-0.6.0
 - completed:
     name: haskoin-core
     pantry-tree:
-      sha256: fb6707970e936a29e02027fc70daa77ec97827c3f67c3ea5b1ae447acab2e2d2
-      size: 7358
-    sha256: 7fc8ffb2d6454763412967dd95845ab67c095dd0d2255c623598b5250df00fc8
-    size: 482854
-    url: https://github.com/jprupp/haskoin-core/archive/51e936a2377b63fbfc5897fb057d0b31928339ed.tar.gz
+      sha256: cec9225c5c7607d34bde97565c8d92bf18461183fc9785d980c9eb1004bbab4d
+      size: 7359
+    sha256: ee3bd366eea1a6b69d894d8df1055f4966e492ff068a53a63ff95f893cc3e014
+    size: 482950
+    url: https://github.com/jprupp/haskoin-core/archive/f8b30d66fcdcc55c1c2340c85af9abd4d2629a99.tar.gz
     version: 1.4.0
   original:
-    url: https://github.com/jprupp/haskoin-core/archive/51e936a2377b63fbfc5897fb057d0b31928339ed.tar.gz
+    url: https://github.com/jprupp/haskoin-core/archive/f8b30d66fcdcc55c1c2340c85af9abd4d2629a99.tar.gz
 snapshots:
 - completed:
-    sha256: 6a751c3fdab86bdc1605c9983f0bceebb072f7ffecef2eaa3be3f8ff19807a47
-    size: 774375
-    url: https://raw.githubusercontent.com/commercialhaskell/stackage-snapshots/master/nightly/2026/8/31.yaml
-  original: nightly-2026-08-31
+    sha256: 5a365a790387c6fee9c1158c97f3701fdb34e523ba85730c8f0e45e1c4c30a7b
+    size: 780550
+    url: https://raw.githubusercontent.com/commercialhaskell/stackage-snapshots/master/nightly/2026/10/28.yaml
+  original: nightly-2026-10-28

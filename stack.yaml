@@ -1,4 +1,4 @@
-resolver: nightly-2026-08-31
+resolver: nightly-2026-10-28
 nix:
   packages:
     - rocksdb
@@ -6,8 +6,9 @@ nix:
     - zlib
     - pkg-config
 extra-deps:
-  - secp256k1-haskell-1.5.0@sha256:009a0d57651a0f4eeeafd2b480a45fbc049015252fe92388ae4bb2115f765430,2077
-  - rocksdb-haskell-jprupp-2.3.0@sha256:ce2aaf7dd26114c489213e4089c719651550259cad42eb1b2317f2662bb3029d,1589
-  - rocksdb-query-0.6.0@sha256:d312b7e8b351f7aef5028718868f4aaa65406cb828367309a7f4cfa222b3d593,1439
+  - base16-2.0
+  - secp256k1-haskell-1.7.0
+  - rocksdb-haskell-jprupp-2.3.0
+  - rocksdb-query-0.6.0
   - github: jprupp/haskoin-core
-    commit: '51e936a2377b63fbfc5897fb057d0b31928339ed'
+    commit: 'f8b30d66fcdcc55c1c2340c85af9abd4d2629a99'
