@@ -33,16 +33,12 @@ packages:
   original:
     hackage: rocksdb-query-0.6.0
 - completed:
-    name: haskoin-core
+    hackage: haskoin-core-1.4.0@sha256:67dbe1c1a9af806fab933b028ea694a9238c05eed96c45cfb1b7d1ea6bd4f82b,5544
     pantry-tree:
-      sha256: cec9225c5c7607d34bde97565c8d92bf18461183fc9785d980c9eb1004bbab4d
-      size: 7359
-    sha256: ee3bd366eea1a6b69d894d8df1055f4966e492ff068a53a63ff95f893cc3e014
-    size: 482950
-    url: https://github.com/jprupp/haskoin-core/archive/f8b30d66fcdcc55c1c2340c85af9abd4d2629a99.tar.gz
-    version: 1.4.0
+      sha256: d86c9c938e51119e8de41ad7f31d26d5dec0f8938f6b11f1bf1084ebf913e71e
+      size: 6682
   original:
-    url: https://github.com/jprupp/haskoin-core/archive/f8b30d66fcdcc55c1c2340c85af9abd4d2629a99.tar.gz
+    hackage: haskoin-core-1.4.0
 snapshots:
 - completed:
     sha256: 5a365a790387c6fee9c1158c97f3701fdb34e523ba85730c8f0e45e1c4c30a7b
