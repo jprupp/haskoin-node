@@ -32,19 +32,25 @@ import System.Random (randomIO)
 import Test.Hspec
 import Test.Hspec.QuickCheck
 import UnliftIO
+import UnliftIO.Concurrent (threadDelay)
 
 data TestNode = TestNode
   { testMgr :: PeerMgr,
     testChain :: Chain,
-    nodeEvents :: Inbox NodeEvent
+    nodeEvents :: Inbox NodeEvent,
+    -- | how many getheaders messages the mock peer has received
+    getHeadersCount :: TVar Int
   }
 
+-- | Connect to a mock peer that serves these blocks.
 dummyPeerConnect ::
+  [Block] ->
+  TVar Int ->
   Network ->
   NetworkAddress ->
   SockAddr ->
   WithConnection
-dummyPeerConnect net ad sa f = do
+dummyPeerConnect blocks count net ad sa f = do
   r <- newInbox
   s <- newInbox
   let s' = inboxToMailbox s
@@ -63,10 +69,14 @@ dummyPeerConnect net ad sa f = do
       runConduit $
         forever (receive r >>= yield)
           .| inc
-          .| concatMapC mockPeerReact
+          .| iterMC count_getheaders
+          .| concatMapC (mockPeerReact blocks)
           .| outc
           .| awaitForever (`send` s)
     outc = mapMC $ \msg -> return $ runPut (putMessage net msg)
+    count_getheaders = \case
+      MGetHeaders _ -> atomically (modifyTVar' count (+ 1))
+      _ -> return ()
     inc =
       forever $ do
         x <- takeCE 24 .| foldC
@@ -80,19 +90,19 @@ dummyPeerConnect net ad sa f = do
               "Dummy peer could not decode payload: " <> show e
           Right msg -> yield msg
 
-mockPeerReact :: Message -> [Message]
-mockPeerReact (MPing (Ping n)) = [MPong (Pong n)]
-mockPeerReact (MVersion _) = [MVerAck]
-mockPeerReact (MGetHeaders (GetHeaders _ _hs _)) = [MHeaders (Headers hs')]
+mockPeerReact :: [Block] -> Message -> [Message]
+mockPeerReact _ (MPing (Ping n)) = [MPong (Pong n)]
+mockPeerReact _ (MVersion _) = [MVerAck]
+mockPeerReact blocks (MGetHeaders (GetHeaders _ _hs _)) = [MHeaders (Headers hs')]
   where
     f b = (b.header, (VarInt . fromIntegral . length) b.txs)
-    hs' = map f allBlocks
-mockPeerReact (MGetData (GetData ivs)) = mapMaybe f ivs
+    hs' = map f blocks
+mockPeerReact blocks (MGetData (GetData ivs)) = mapMaybe f ivs
   where
-    f (InvVector InvBlock h) = MBlock <$> find (l h) allBlocks
+    f (InvVector InvBlock h) = MBlock <$> find (l h) blocks
     f _ = Nothing
     l h b = headerHash b.header == BlockHash h
-mockPeerReact _ = []
+mockPeerReact _ _ = []
 
 spec :: Spec
 spec = do
@@ -140,6 +150,15 @@ spec = do
         testMerkle b1
         testMerkle b2
   describe "chain on test network" $ do
+    it "stops asking a peer that has no more headers" $
+      -- The peer answers getheaders with an empty headers message, as a
+      -- peer does when the node already has its whole chain. The node must
+      -- take that as the end of the sync instead of asking again.
+      withTestNodeBlocks [] net "no-headers" $ \TestNode {..} -> do
+        _ <- waitForPeer nodeEvents
+        atomically $ readTVar getHeadersCount >>= checkSTM . (>= 1)
+        threadDelay (1000 * 1000)
+        readTVarIO getHeadersCount `shouldReturn` 1
     it "syncs some headers" $
       withTestNode net "connect-sync" $ \TestNode {..} -> do
         let bh =
@@ -188,8 +207,15 @@ withLifted w m = withRunInIO $ \io -> w (io . m)
 withTestNode ::
   (MonadUnliftIO m) =>
   Network -> String -> (TestNode -> m a) -> m a
-withTestNode net str f = flip runContT return $ do
+withTestNode = withTestNodeBlocks allBlocks
+
+-- | Like 'withTestNode', with the mock peer serving these blocks.
+withTestNodeBlocks ::
+  (MonadUnliftIO m) =>
+  [Block] -> Network -> String -> (TestNode -> m a) -> m a
+withTestNodeBlocks blocks net str f = flip runContT return $ do
   w <- ContT $ withSystemTempDirectory ("haskoin-node-test-" <> str <> "-")
+  count <- newTVarIO 0
   pub <- ContT withPublisher
   sub <- ContT $ withSubscription pub
   db <- ContT $ withLifted (R.withDBCF w cfg cols)
@@ -214,7 +240,7 @@ withTestNode net str f = flip runContT return $ do
             pub = pub,
             timeout = 120,
             maxPeerLife = 48 * 3600,
-            connect = dummyPeerConnect net ad,
+            connect = dummyPeerConnect blocks count net ad,
             logger = Logger {level = LevelError, source = "", push = \_ -> return ()}
           }
   Node mgr ch <- ContT $ withNode cfg'
@@ -223,7 +249,8 @@ withTestNode net str f = flip runContT return $ do
       TestNode
         { testMgr = mgr,
           testChain = ch,
-          nodeEvents = sub
+          nodeEvents = sub,
+          getHeadersCount = count
         }
   where
     cfg = def {R.createIfMissing = True, R.errorIfExists = True}

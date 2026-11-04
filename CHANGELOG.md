@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- An empty headers message from the syncing peer ends the header sync. The
+  node used to take it as a reason to ask the same peer again, and kept
+  sending getheaders in a tight loop, thousands per second, whenever its
+  best header was the peer's tip after a full batch of 2000.
+
 ## [2.1.1] - 2026-11-04
 
 ### Changed
