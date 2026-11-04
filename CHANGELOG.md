@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Bitcoin Cash headers sync again. This package now requires haskoin-core
+  1.5.1, which evaluates the ASERT difficulty rule at the parent block. With
+  haskoin-core 1.5.0 the node stopped at mainnet block 975899 with
+  `Incorrect difficulty bits`, because that release checked the bits of each
+  header with a formula that used the header's own timestamp.
 - Network magic and payload size are checked right after the message header,
   before the payload is read. The size limit is the network's
   `maxMessageSize` instead of a fixed 32 MiB. An oversized message used to be
