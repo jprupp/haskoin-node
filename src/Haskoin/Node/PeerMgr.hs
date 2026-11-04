@@ -23,6 +23,7 @@ module Haskoin.Node.PeerMgr
     peerMgrPong,
     peerMgrAddrs,
     peerMgrVerAck,
+    peerMgrSync,
     getPeers,
     getOnlinePeer,
     ticklePeer,
@@ -30,6 +31,7 @@ module Haskoin.Node.PeerMgr
     myVersion,
     toSockAddr,
     toHostService,
+    isRoutable,
   )
 where
 
@@ -45,7 +47,7 @@ import Data.Set qualified as Set
 import Data.String.Conversions (cs)
 import Data.Time.Clock
 import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
-import Data.Word (Word32, Word64)
+import Data.Word (Word32, Word64, Word8)
 import Haskoin
 import Haskoin.Node.Logger
 import Haskoin.Node.Loop (loopForever)
@@ -88,6 +90,7 @@ data PeerMgrMessage
   | PeerPing !Peer !Word64
   | PeerPong !Peer !Word64
   | PeerAddrs !Peer ![NetworkAddress]
+  | Sync !(Listen ())
 
 -- | Data structure representing an online peer.
 data OnlinePeer = OnlinePeer
@@ -222,18 +225,32 @@ dispatch mgr (PeerVerAck p) = do
     Nothing -> do
       logWarn
         mgr.config.logger
-        ("Received verack from unknown peer " <> p.label)
+        ("Verack rejected for peer " <> p.label)
       killPeer p
 dispatch mgr (PeerAddrs p nas)
-  | mgr.config.discover = do
-      let sas = map (hostToSockAddr . (.address)) nas
-          len = length sas
-      logDebug
-        mgr.config.logger
-        ("Received " <> cs (show len) <> " addresses from peer " <> p.label)
-      forM_ sas (newPeer mgr)
+  | mgr.config.discover =
+      getOnlinePeer mgr p >>= \case
+        Just OnlinePeer {online = True} -> do
+          let sas = filter isRoutable $ map (hostToSockAddr . (.address)) nas
+          logDebug
+            mgr.config.logger
+            ( "Received "
+                <> cs (show (length nas))
+                <> " addresses from peer "
+                <> p.label
+                <> ", "
+                <> cs (show (length sas))
+                <> " routable"
+            )
+          forM_ sas (newPeer mgr)
+        _ ->
+          logDebug
+            mgr.config.logger
+            ("Ignoring addresses from peer before handshake " <> p.label)
   | otherwise =
       logDebug mgr.config.logger ("Ignoring addresses from peer " <> p.label)
+dispatch _ (Sync r) =
+  atomically (r ())
 dispatch mgr (PeerPong p n) = do
   logDebug
     mgr.config.logger
@@ -268,13 +285,18 @@ checkPeer mgr p =
     Just o -> do
       now <- liftIO getCurrentTime
       let expired = mgr.config.maxPeerLife `addUTCTime` o.connected
-      let deadline = mgr.config.timeout `addUTCTime` o.tickled
+          deadline = mgr.config.timeout `addUTCTime` o.tickled
+          -- Other traffic must not keep a peer that ignores our ping.
+          pingDeadline = (\(t, _) -> mgr.config.timeout `addUTCTime` t) <$> o.ping
       if
         | now > expired -> do
             logError mgr.config.logger ("Peer " <> p.label <> " is too old")
             killPeer p
         | now > deadline -> do
             logError mgr.config.logger ("Peer " <> p.label <> " timed out")
+            killPeer p
+        | maybe False (now >) pingDeadline -> do
+            logError mgr.config.logger ("Peer " <> p.label <> " did not answer ping")
             killPeer p
         | isNothing o.ping -> sendPing mgr p
         | otherwise -> return ()
@@ -344,7 +366,15 @@ getNewPeer mgr =
 
 connectPeer :: (MonadUnliftIO m) => PeerMgr -> SockAddr -> m ()
 connectPeer mgr sa = do
+  n <- length <$> getOnlinePeers mgr
   atomically (findPeerAddress mgr.peers sa) >>= \case
+    _
+      | n >= mgr.config.maxPeers ->
+          -- The connect loop may have queued this before the last free slot
+          -- was taken.
+          logDebug
+            mgr.config.logger
+            ("Not connecting to peer " <> cs (show sa) <> ": no free slots")
     Just _ ->
       logWarn mgr.config.logger ("Duplicate connection to peer " <> cs (show sa))
     Nothing -> do
@@ -366,9 +396,10 @@ connectPeer mgr sa = do
                 logger = withSource "Peer" mgr.config.logger
               }
       busy <- newTVarIO False
-      let p = wrapPeer pc busy mailbox
+      pending <- newTVarIO 0
+      let p = wrapPeer pc busy pending mailbox
       a <- withRunInIO $ \io ->
-        mgr.supervisor `addChild` io (launch pc busy inbox p)
+        mgr.supervisor `addChild` io (launch pc inbox p)
       MVersion ver `sendMessage` p
       atomically $
         insertPeer
@@ -390,8 +421,8 @@ connectPeer mgr sa = do
     srv net
       | net.segWit = 8
       | otherwise = 0
-    launch pc busy inbox p =
-      withPeerLoop mgr p (\a -> link a >> peer pc busy inbox)
+    launch pc inbox p =
+      withPeerLoop mgr p (\a -> link a >> peer pc p inbox)
 
 withPeerLoop :: (MonadUnliftIO m) => PeerMgr -> Peer -> (Async a -> m a) -> m a
 withPeerLoop mgr p =
@@ -452,6 +483,8 @@ setPeerVersion b p v
           else
             findPeer b p >>= \case
               Nothing -> return Nothing -- peer not found
+              Just OnlinePeer {version = Just _} ->
+                return Nothing -- duplicate version
               Just o -> do
                 let n = o {version = Just v, online = o.verack}
                 insertPeer b n
@@ -460,6 +493,7 @@ setPeerVersion b p v
 setPeerVerAck :: TVar [OnlinePeer] -> Peer -> STM (Maybe OnlinePeer)
 setPeerVerAck b p =
   findPeer b p >>= \case
+    Just OnlinePeer {verack = True} -> return Nothing -- duplicate verack
     Just o -> do
       let o' = o {verack = True, online = isJust o.version}
       insertPeer b o'
@@ -519,6 +553,54 @@ peerMgrPong mgr p nonce = PeerPong p nonce `send` mgr.mailbox
 
 peerMgrAddrs :: (MonadIO m) => PeerMgr -> Peer -> [NetworkAddress] -> m ()
 peerMgrAddrs mgr p addrs = PeerAddrs p addrs `send` mgr.mailbox
+
+-- | Wait until the peer manager has handled every message sent to it before.
+peerMgrSync :: (MonadIO m) => PeerMgr -> m ()
+peerMgrSync mgr = Sync `query` mgr.mailbox
+
+-- | Whether an address that a peer relayed is worth connecting to: a public
+-- unicast address with a port. Loopback, private, link-local, shared,
+-- documentation, multicast and reserved ranges are refused, so that a peer
+-- cannot make the node connect to services on its own host or network.
+-- Static peers in the configuration are not checked.
+isRoutable :: SockAddr -> Bool
+isRoutable (SockAddrInet port h) =
+  port /= 0 && routable4 (hostAddressToTuple h)
+isRoutable (SockAddrInet6 port _ h _) =
+  port /= 0 && case hostAddress6ToTuple h of
+    (0, 0, 0, 0, 0, 0xffff, hi, lo) ->
+      routable4
+        ( fromIntegral (hi `div` 256),
+          fromIntegral (hi `mod` 256),
+          fromIntegral (lo `div` 256),
+          fromIntegral (lo `mod` 256)
+        )
+    (a, b, _, _, _, _, _, _)
+      | a == 0 -> False -- unspecified, loopback, IPv4-compatible
+      | a .&. 0xfe00 == 0xfc00 -> False -- unique local
+      | a .&. 0xffc0 == 0xfe80 -> False -- link-local
+      | a .&. 0xffc0 == 0xfec0 -> False -- site-local
+      | a .&. 0xff00 == 0xff00 -> False -- multicast
+      | a == 0x2001 && b == 0x0db8 -> False -- documentation
+      | otherwise -> True
+isRoutable _ = False
+
+routable4 :: (Word8, Word8, Word8, Word8) -> Bool
+routable4 (a, b, c, _)
+  | a == 0 = False -- this network
+  | a == 10 = False -- private
+  | a == 100 && b .&. 0xc0 == 64 = False -- shared address space
+  | a == 127 = False -- loopback
+  | a == 169 && b == 254 = False -- link-local
+  | a == 172 && b .&. 0xf0 == 16 = False -- private
+  | a == 192 && b == 0 && c == 0 = False -- protocol assignments
+  | a == 192 && b == 0 && c == 2 = False -- documentation
+  | a == 192 && b == 168 = False -- private
+  | a == 198 && b .&. 0xfe == 18 = False -- benchmarking
+  | a == 198 && b == 51 && c == 100 = False -- documentation
+  | a == 203 && b == 0 && c == 113 = False -- documentation
+  | a >= 224 = False -- multicast and reserved
+  | otherwise = True
 
 toHostService :: String -> (Maybe String, Maybe String)
 toHostService str =

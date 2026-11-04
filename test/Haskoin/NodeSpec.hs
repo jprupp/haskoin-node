@@ -6,6 +6,7 @@
 {-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE TupleSections #-}
 {-# LANGUAGE NoFieldSelectors #-}
 
 module Haskoin.NodeSpec (spec) where
@@ -22,12 +23,13 @@ import Data.Either (fromRight)
 import Data.List (find)
 import Data.Maybe (isJust, listToMaybe, mapMaybe)
 import Data.Serialize (decode, get, runGet, runPut)
+import Data.Time.Clock (NominalDiffTime)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Database.RocksDB qualified as R
 import Haskoin
 import Haskoin.Node
 import NQE
-import Network.Socket (AddrInfo (addrAddress), SockAddr (..))
+import Network.Socket (AddrInfo (addrAddress), SockAddr (..), tupleToHostAddress, tupleToHostAddress6)
 import System.Random (randomIO)
 import Test.Hspec
 import Test.Hspec.QuickCheck
@@ -38,19 +40,40 @@ data TestNode = TestNode
   { testMgr :: PeerMgr,
     testChain :: Chain,
     nodeEvents :: Inbox NodeEvent,
+    testDB :: R.DB,
     -- | how many getheaders messages the mock peer has received
     getHeadersCount :: TVar Int
   }
 
--- | Connect to a mock peer that serves these blocks.
+-- | What the mock peer sends back for each message: a message to serialize
+-- for the test network, or raw bytes.
+type React = Message -> [Either ByteString Message]
+
+-- | How to set up a test node.
+data TestOpts = TestOpts
+  { react :: React,
+    -- | runs on the database before the node starts
+    setup :: R.DB -> IO (),
+    timeout :: NominalDiffTime
+  }
+
+defOpts :: [Block] -> TestOpts
+defOpts blocks =
+  TestOpts
+    { react = map Right . mockPeerReact blocks,
+      setup = \_ -> return (),
+      timeout = 120
+    }
+
+-- | Connect to a mock peer that reacts to messages like this.
 dummyPeerConnect ::
-  [Block] ->
+  React ->
   TVar Int ->
   Network ->
   NetworkAddress ->
   SockAddr ->
   WithConnection
-dummyPeerConnect blocks count net ad sa f = do
+dummyPeerConnect react count net ad sa f = do
   r <- newInbox
   s <- newInbox
   let s' = inboxToMailbox s
@@ -70,10 +93,10 @@ dummyPeerConnect blocks count net ad sa f = do
         forever (receive r >>= yield)
           .| inc
           .| iterMC count_getheaders
-          .| concatMapC (mockPeerReact blocks)
+          .| concatMapC react
           .| outc
           .| awaitForever (`send` s)
-    outc = mapMC $ \msg -> return $ runPut (putMessage net msg)
+    outc = mapMC $ return . either id (runPut . putMessage net)
     count_getheaders = \case
       MGetHeaders _ -> atomically (modifyTVar' count (+ 1))
       _ -> return ()
@@ -149,6 +172,114 @@ spec = do
             testMerkle b = buildMerkleRoot (ths b) `shouldBe` Right b.header.merkle
         testMerkle b1
         testMerkle b2
+  describe "untrusted peers" $ do
+    it "imports a full batch of 2000 headers" $
+      withTestNodeOpts
+        (defOpts allBlocks) {react = reactAfterVerAck [Right (manyHeaders net 2000)]}
+        net
+        "full-batch"
+        $ \TestNode {..} -> do
+          bn <-
+            receiveMatch nodeEvents $ \case
+              ChainEvent (ChainBestBlock bn) | bn.height > 0 -> Just bn
+              _ -> Nothing
+          bn.height `shouldBe` 2000
+    it "disconnects a peer that sends more than 2000 headers" $
+      withTestNodeOpts
+        (defOpts allBlocks) {react = reactAfterVerAck [Right (manyHeaders net 2001)]}
+        net
+        "too-many-headers"
+        $ \TestNode {..} -> do
+          p <- waitForPeer nodeEvents
+          waitForDisconnect nodeEvents p
+          (.height) <$> chainGetBest testChain `shouldReturn` 0
+    it "disconnects a peer that sends more than 1000 addresses" $ do
+      let na = NetworkAddress 0 (sockToHostAddress (SockAddrInet 8333 0x08080808))
+          addrs = MAddr (Addr (replicate 1001 (0, na)))
+      withTestNodeOpts
+        (defOpts allBlocks) {react = reactAfterVerAck [Right addrs]}
+        net
+        "too-many-addrs"
+        $ \TestNode {..} -> do
+          p <- waitForPeer nodeEvents
+          waitForDisconnect nodeEvents p
+    it "disconnects a peer that sends the wrong network magic" $ do
+      let bad = runPut (putMessage btc (MPing (Ping 1)))
+      withTestNodeOpts
+        (defOpts allBlocks) {react = reactAfterVerAck [Left bad]}
+        net
+        "wrong-magic"
+        $ \TestNode {..} -> do
+          p <- waitForPeer nodeEvents
+          waitForDisconnect nodeEvents p
+    it "disconnects a peer that sends a second verack" $
+      withTestNodeOpts
+        (defOpts allBlocks) {react = reactAfterVerAck [Right MVerAck]}
+        net
+        "duplicate-verack"
+        $ \TestNode {..} -> do
+          p <- waitForPeer nodeEvents
+          waitForDisconnect nodeEvents p
+    it "ignores headers sent before the handshake" $ do
+      let hs = MHeaders (Headers [(b.header, VarInt 0) | b <- allBlocks])
+          react = \case
+            MVersion _ -> [Right hs, Right MVerAck]
+            MPing (Ping n) -> [Right (MPong (Pong n))]
+            _ -> []
+      withTestNodeOpts (defOpts allBlocks) {react = react} net "early-headers" $
+        \TestNode {..} -> do
+          _ <- waitForPeer nodeEvents
+          threadDelay (500 * 1000)
+          (.height) <$> chainGetBest testChain `shouldReturn` 0
+    it "disconnects a peer that chatters instead of answering a ping" $ do
+      -- Answer the node's ping with a ping of our own, and its pong with
+      -- another ping, so that the peer is never silent.
+      let react = \case
+            MVersion _ -> [Right MVerAck]
+            MPing _ -> [Right (MPing (Ping 1))]
+            MPong _ -> [Right (MPing (Ping 1))]
+            -- end the header sync so its own timeout does not apply
+            MGetHeaders _ -> [Right (MHeaders (Headers []))]
+            _ -> []
+      withTestNodeOpts
+        (defOpts allBlocks) {react = react, timeout = 2}
+        net
+        "ignored-ping"
+        $ \TestNode {..} -> do
+          p <- waitForPeer nodeEvents
+          waitForDisconnect nodeEvents p
+    it "does not connect to private addresses that peers relay" $ do
+      let v4 a b c d p = SockAddrInet p (tupleToHostAddress (a, b, c, d))
+          v6 t p = SockAddrInet6 p 0 (tupleToHostAddress6 t) 0
+      isRoutable (v4 8 8 8 8 8333) `shouldBe` True
+      isRoutable (v4 8 8 8 8 0) `shouldBe` False
+      isRoutable (v4 127 0 0 1 8333) `shouldBe` False
+      isRoutable (v4 10 1 2 3 8333) `shouldBe` False
+      isRoutable (v4 172 16 0 1 8333) `shouldBe` False
+      isRoutable (v4 172 32 0 1 8333) `shouldBe` True
+      isRoutable (v4 192 168 1 1 8333) `shouldBe` False
+      isRoutable (v4 169 254 1 1 8333) `shouldBe` False
+      isRoutable (v4 100 64 0 1 8333) `shouldBe` False
+      isRoutable (v4 224 0 0 1 8333) `shouldBe` False
+      isRoutable (v6 (0x2a01, 0x4f8, 0, 0, 0, 0, 0, 1) 8333) `shouldBe` True
+      isRoutable (v6 (0, 0, 0, 0, 0, 0, 0, 1) 8333) `shouldBe` False
+      isRoutable (v6 (0xfd00, 0, 0, 0, 0, 0, 0, 1) 8333) `shouldBe` False
+      isRoutable (v6 (0xfe80, 0, 0, 0, 0, 0, 0, 1) 8333) `shouldBe` False
+      isRoutable (v6 (0, 0, 0, 0, 0, 0xffff, 0x7f00, 1) 8333) `shouldBe` False
+      isRoutable (v6 (0, 0, 0, 0, 0, 0xffff, 0x0808, 0x0808) 8333) `shouldBe` True
+      isRoutable (hostToSockAddr (sockToHostAddress (v4 127 0 0 1 8333)))
+        `shouldBe` False
+  describe "chain database" $ do
+    it "leaves the default column family alone when purging" $ do
+      -- The same key in both families: the purge must delete it only from
+      -- the family that holds the chain.
+      let k = B.pack [0x90, 1, 2, 3]
+          setup db = do
+            R.put db k "keep"
+            forM_ (R.columnFamilies db) $ \cf -> R.putCF db cf k "stale"
+      withTestNodeOpts (defOpts allBlocks) {setup = setup} net "purge-cf" $
+        \TestNode {..} -> do
+          R.get testDB k `shouldReturn` Just "keep"
   describe "chain on test network" $ do
     it "stops asking a peer that has no more headers" $
       -- The peer answers getheaders with an empty headers message, as a
@@ -195,6 +326,33 @@ spec = do
         forM_ (zip ps hs) $ \(p, h) ->
           headerHash p.header `shouldBe` h
 
+-- | Wait for the node to disconnect from this peer, failing after a while.
+waitForDisconnect :: Inbox NodeEvent -> Peer -> IO ()
+waitForDisconnect inbox p =
+  timeout (20 * 1000 * 1000) wait >>= \case
+    Just () -> return ()
+    Nothing -> expectationFailure "peer was not disconnected"
+  where
+    wait =
+      receiveMatch inbox $ \case
+        PeerEvent (PeerDisconnected p') | p == p' -> Just ()
+        _ -> Nothing
+
+-- | Mock peer that answers the handshake and pings, and sends these right
+-- after its version ack.
+reactAfterVerAck :: [Either ByteString Message] -> React
+reactAfterVerAck extra = \case
+  MVersion _ -> Right MVerAck : extra
+  MPing (Ping n) -> [Right (MPong (Pong n))]
+  _ -> []
+
+-- | Headers message with a valid chain of this many headers on top of
+-- genesis.
+manyHeaders :: Network -> Int -> Message
+manyHeaders net n =
+  MHeaders . Headers $
+    map (,VarInt 0) (appendBlocks net 0 net.genesisHeader n)
+
 waitForPeer :: (MonadIO m) => Inbox NodeEvent -> m Peer
 waitForPeer inbox =
   receiveMatch inbox $ \case
@@ -213,12 +371,18 @@ withTestNode = withTestNodeBlocks allBlocks
 withTestNodeBlocks ::
   (MonadUnliftIO m) =>
   [Block] -> Network -> String -> (TestNode -> m a) -> m a
-withTestNodeBlocks blocks net str f = flip runContT return $ do
+withTestNodeBlocks blocks = withTestNodeOpts (defOpts blocks)
+
+withTestNodeOpts ::
+  (MonadUnliftIO m) =>
+  TestOpts -> Network -> String -> (TestNode -> m a) -> m a
+withTestNodeOpts opts net str f = flip runContT return $ do
   w <- ContT $ withSystemTempDirectory ("haskoin-node-test-" <> str <> "-")
   count <- newTVarIO 0
   pub <- ContT withPublisher
   sub <- ContT $ withSubscription pub
   db <- ContT $ withLifted (R.withDBCF w cfg cols)
+  liftIO (opts.setup db)
   let ad =
         NetworkAddress
           nodeNetwork
@@ -238,9 +402,9 @@ withTestNodeBlocks blocks net str f = flip runContT return $ do
             address = na,
             net = net,
             pub = pub,
-            timeout = 120,
+            timeout = opts.timeout,
             maxPeerLife = 48 * 3600,
-            connect = dummyPeerConnect blocks count net ad,
+            connect = dummyPeerConnect opts.react count net ad,
             logger = Logger {level = LevelError, source = "", push = \_ -> return ()}
           }
   Node mgr ch <- ContT $ withNode cfg'
@@ -250,6 +414,7 @@ withTestNodeBlocks blocks net str f = flip runContT return $ do
         { testMgr = mgr,
           testChain = ch,
           nodeEvents = sub,
+          testDB = db,
           getHeadersCount = count
         }
   where

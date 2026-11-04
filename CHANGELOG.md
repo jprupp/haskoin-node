@@ -4,6 +4,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Breaking: `Peer` has a `pending` field, `wrapPeer` takes its `TVar Int`,
+  and `peer` takes the `Peer` that `wrapPeer` built instead of the busy
+  `TVar`.
+- Messages from a peer apply backpressure. A peer may have at most
+  `maxPendingMessages` messages waiting for the node; after that the node
+  stops reading its socket until it catches up. Address, header, version,
+  verack, ping and pong messages are handled to completion before the next
+  one is taken. A fast peer could fill the node's unbounded queues before.
+- Outgoing messages are logged by command at debug level, not in full.
+
+### Fixed
+
+- Network magic and payload size are checked right after the message header,
+  before the payload is read. The size limit is the network's
+  `maxMessageSize` instead of a fixed 32 MiB. An oversized message used to be
+  logged and its payload then parsed as the next header.
+- Peers that send more than 2000 headers or more than 1000 addresses in one
+  message are disconnected before the message is decoded.
+- Address and header messages from a peer are ignored until it completes the
+  handshake.
+- A second version or verack from a peer disconnects it. Each one used to
+  announce the peer as connected again.
+- Relayed addresses that are not public unicast addresses (loopback,
+  private, link-local, multicast, documentation and similar ranges, or port
+  0) are not added to the address pool. `isRoutable` is exported.
+- A peer that does not answer a ping within the timeout is disconnected, even
+  if it keeps sending other messages.
+- Only headers from the syncing peer reset its sync timeout. Another peer's
+  headers could keep a silent syncing peer from ever timing out.
+- The peer manager rechecks `maxPeers` when it handles a queued connection,
+  so the connect loop can no longer go over the limit while the manager is
+  busy.
+- Purging an old chain database with a column family deleted the same keys
+  from the default column family too. The purge now deletes keys as it walks
+  them instead of building a list of all of them in memory.
+
 ## [2.1.2] - 2026-11-04
 
 ### Fixed

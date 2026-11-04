@@ -32,6 +32,7 @@ module Haskoin.Node.Chain
     chainIsSynced,
     chainBlockMain,
     chainHeaders,
+    chainSync,
   )
 where
 
@@ -80,6 +81,7 @@ data ChainMessage
   | ChainPeerConnected !Peer
   | ChainPeerDisconnected !Peer
   | ChainPing
+  | ChainSyncMsg !(Listen ())
 
 -- | Events originating from chain syncing process.
 data ChainEvent
@@ -245,7 +247,7 @@ processHeaders ch p hs = do
         ("Could not connect headers from peer " <> p.label)
       killPeer p
     Just done -> do
-      setLastReceived ch.state
+      setLastReceived ch.state p
       best <- runReaderT getBestBlockHeader ch.config
       when (pbest.header /= best.header) $
         chainEvent ch.config (ChainBestBlock best)
@@ -315,6 +317,8 @@ chainConfigMessage ch (ChainPeerDisconnected p) = do
   logDebug ch.config.logger ("Disconnected peer " <> p.label)
   finishPeer ch p
   syncNewPeer ch
+chainConfigMessage _ (ChainSyncMsg r) =
+  atomically (r ())
 chainConfigMessage ch ChainPing = do
   logDebug ch.config.logger "Internal clock event"
   let to = ch.config.timeout
@@ -348,7 +352,7 @@ dataVersion = 1
 initChainDB :: (MonadIO m) => ChainConfig -> m ()
 initChainDB cfg@ChainConfig {db, cf, net} = liftIO $ do
   ver <- retrieveCommon db cf ChainDataVersionKey
-  when (ver /= Just dataVersion) $ purgeChainDB cfg >>= writeBatch db
+  when (ver /= Just dataVersion) $ purgeChainDB cfg
   case cf of
     Nothing -> insert db ChainDataVersionKey dataVersion
     Just cf' -> insertCF db cf' ChainDataVersionKey dataVersion
@@ -358,26 +362,29 @@ initChainDB cfg@ChainConfig {db, cf, net} = liftIO $ do
       setBestBlockHeader (genesisNode net)
 
 -- | Purge database of elements having keys that may conflict with those used in
--- this module.
-purgeChainDB :: (MonadIO m) => ChainConfig -> m [R.BatchOp]
+-- this module. Keys are deleted from the column family that holds the chain,
+-- one at a time as the iterator walks them, so that memory use does not grow
+-- with the size of the database.
+purgeChainDB :: (MonadIO m) => ChainConfig -> m ()
 purgeChainDB ChainConfig {db, cf} = liftIO $ do
   with_iter $ \it -> do
     R.iterSeek it (B.singleton 0x90)
-    recurse_delete it
+    go it
   where
     with_iter = case cf of
       Nothing -> R.withIter db
       Just cf' -> R.withIterCF db cf'
-    recurse_delete it =
+    del k = case cf of
+      Nothing -> R.delete db k
+      Just cf' -> R.deleteCF db cf' k
+    go it =
       R.iterKey it >>= \case
         Just k
-          | B.head k == 0x90 || B.head k == 0x91 -> do
-              case cf of
-                Nothing -> R.delete db k
-                Just cf' -> R.deleteCF db cf' k
+          | B.take 1 k `elem` [B.singleton 0x90, B.singleton 0x91] -> do
+              del k
               R.iterNext it
-              (R.Del k :) <$> recurse_delete it
-        _ -> return []
+              go it
+        _ -> return ()
 
 -- | Import a bunch of continuous headers. Returns 'True' if the number of
 -- headers is less than 2000, which means that there are no more headers to sync
@@ -465,11 +472,15 @@ syncHeaders ch now bb p = do
   where
     z = "0000000000000000000000000000000000000000000000000000000000000000"
 
--- | Set the time of last received data to now if a syncing peer is active.
-setLastReceived :: (MonadIO m) => TVar ChainState -> m ()
-setLastReceived st = do
+-- | Set the time of last received data to now if the given peer is the one
+-- being synced against. Headers from other peers must not keep a silent
+-- syncing peer from timing out.
+setLastReceived :: (MonadIO m) => TVar ChainState -> Peer -> m ()
+setLastReceived st p = do
   now <- liftIO getCurrentTime
-  let f ChainSync {..} = ChainSync {timestamp = now, ..}
+  let f c@ChainSync {..}
+        | peer == p = ChainSync {timestamp = now, ..}
+        | otherwise = c
   atomically (modifyTVar st (\s -> s {syncing = f <$> s.syncing}))
 
 -- | Add a new peer to the queue of peers to sync against.
@@ -608,3 +619,7 @@ chainIsSynced ch =
 chainHeaders :: (MonadIO m) => Chain -> Peer -> [BlockHeader] -> m ()
 chainHeaders ch p hs =
   ChainHeaders p hs `send` ch.mailbox
+
+-- | Wait until the chain process has handled every message sent to it before.
+chainSync :: (MonadIO m) => Chain -> m ()
+chainSync ch = ChainSyncMsg `query` ch.mailbox
