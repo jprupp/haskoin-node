@@ -10,5 +10,4 @@ extra-deps:
   - secp256k1-haskell-2.0.0
   - rocksdb-haskell-jprupp-2.5.0
   - rocksdb-query-0.6.0
-  - github: jprupp/haskoin-core
-    commit: 3b0cb2b28382c1695ad2dcbd755b6bca3fa3e871
+  - haskoin-core-1.5.1
