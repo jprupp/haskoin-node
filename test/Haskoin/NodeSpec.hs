@@ -136,7 +136,7 @@ spec = do
         headerHash b1.header `shouldBe` h1
         headerHash b2.header `shouldBe` h2
         let ths b = map txHash b.txs
-            testMerkle b = b.header.merkle `shouldBe` buildMerkleRoot (ths b)
+            testMerkle b = buildMerkleRoot (ths b) `shouldBe` Right b.header.merkle
         testMerkle b1
         testMerkle b2
   describe "chain on test network" $ do

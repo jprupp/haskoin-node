@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 - Replace monad-logger with fast-logger. Configuration records take a `Logger`,
   and functions need only `MonadIO` or `MonadUnliftIO`.
+- Require haskoin-core 1.5.0, whose `buildMerkleRoot` returns
+  `Either String MerkleRoot`.
 
 ## [1.4.4] - 2026-08-31
 
