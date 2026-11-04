@@ -105,6 +105,11 @@ chainEvents mgr input output = loopForever $ do
     _ -> return ()
   publish (ChainEvent event) output
 
+-- | Route events from peers to the peer manager and chain. A message from a
+-- peer is handled to completion before the peer may send another one past its
+-- small allowance of pending messages (see 'maxPendingMessages'), so that the
+-- node's queues cannot grow faster than it can work. Address and header
+-- messages are only taken from peers that completed the handshake.
 peerEvents ::
   (MonadIO m) =>
   Chain -> PeerMgr -> Inbox PeerEvent -> Publisher NodeEvent -> m ()
@@ -118,20 +123,26 @@ peerEvents ch mgr input output = loopForever $ do
     PeerMessage p msg -> do
       case msg of
         MVersion v ->
-          peerMgrVersion mgr p v
+          peerMgrVersion mgr p v >> peerMgrSync mgr
         MVerAck ->
-          peerMgrVerAck mgr p
+          peerMgrVerAck mgr p >> peerMgrSync mgr
         MPing (Ping n) ->
-          peerMgrPing mgr p n
+          peerMgrPing mgr p n >> peerMgrSync mgr
         MPong (Pong n) ->
-          peerMgrPong mgr p n
+          peerMgrPong mgr p n >> peerMgrSync mgr
         MAddr (Addr ns) ->
-          peerMgrAddrs mgr p (map snd ns)
+          whenOnline p $ peerMgrAddrs mgr p (map snd ns) >> peerMgrSync mgr
         MHeaders (Headers hs) ->
-          chainHeaders ch p (map fst hs)
+          whenOnline p $ chainHeaders ch p (map fst hs) >> chainSync ch
         _ -> return ()
       ticklePeer mgr p
+      peerMessageDone p
   publish (PeerEvent event) output
+  where
+    whenOnline p act =
+      getOnlinePeer mgr p >>= \case
+        Just OnlinePeer {online = True} -> act
+        _ -> return ()
 
 -- | Launch node process in the foreground.
 withNode ::

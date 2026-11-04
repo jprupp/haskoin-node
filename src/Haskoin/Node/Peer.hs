@@ -28,6 +28,10 @@ module Haskoin.Node.Peer
     getBusy,
     setBusy,
     setFree,
+    peerMessageDone,
+    maxPendingMessages,
+    maxHeadersCount,
+    maxAddrCount,
   )
 where
 
@@ -41,10 +45,10 @@ import Data.ByteString qualified as B
 import Data.Function (on)
 import Data.List (union)
 import Data.Maybe (isJust)
-import Data.Serialize (decode, runGet, runPut)
+import Data.Serialize (decode, get, runGet, runPut)
 import Data.String.Conversions (cs)
 import Data.Text (Text)
-import Data.Word (Word32)
+import Data.Word (Word32, Word64)
 import Haskoin
 import Haskoin.Node.Logger
 import Haskoin.Node.Loop (loopForever)
@@ -78,7 +82,9 @@ data Peer = Peer
   { mailbox :: !(Mailbox PeerMessage),
     pub :: !(Publisher PeerEvent),
     label :: !Text,
-    busy :: !(TVar Bool)
+    busy :: !(TVar Bool),
+    -- | messages from this peer that the node has not finished handling
+    pending :: !(TVar Int)
   }
 
 instance Eq Peer where
@@ -95,44 +101,73 @@ data PeerMessage
 wrapPeer ::
   PeerConfig ->
   TVar Bool ->
+  TVar Int ->
   Mailbox PeerMessage ->
   Peer
-wrapPeer cfg busy mbox =
+wrapPeer cfg busy pending mbox =
   Peer
     { mailbox = mbox,
       pub = cfg.pub,
       label = cfg.label,
-      busy = busy
+      busy = busy,
+      pending = pending
     }
 
--- | Run peer process in current thread.
+-- | Most messages from one peer that may wait for the node to handle them.
+-- When a peer gets this far ahead, the node stops reading from its socket
+-- until it catches up, so that a peer that sends faster than the node can
+-- handle fills its own TCP window instead of the node's memory.
+maxPendingMessages :: Int
+maxPendingMessages = 16
+
+-- | Most block headers a @headers@ message may carry. Bitcoin Core never
+-- sends more and disconnects peers that do.
+maxHeadersCount :: Word64
+maxHeadersCount = 2000
+
+-- | Most addresses an @addr@ or @addrv2@ message may carry.
+maxAddrCount :: Word64
+maxAddrCount = 1000
+
+-- | Tell the peer process that the node has finished handling one of the
+-- messages that it published, so that it may read another one.
+peerMessageDone :: (MonadIO m) => Peer -> m ()
+peerMessageDone p = atomically $ modifyTVar' p.pending (max 0 . subtract 1)
+
+-- | Run peer process in current thread. The 'Peer' must be the one that
+-- 'wrapPeer' built with the mailbox of this inbox.
 peer ::
   (MonadUnliftIO m) =>
   PeerConfig ->
-  TVar Bool ->
+  Peer ->
   Inbox PeerMessage ->
   m ()
-peer cfg@PeerConfig {label, net, connect, pub, logger} busy inbox = do
-  let p = wrapPeer cfg busy (inboxToMailbox inbox)
-  withRunInIO $ \run -> connect (run . peer_session p)
+peer cfg@PeerConfig {label, net, connect, pub, logger} p inbox =
+  withRunInIO $ \run -> connect (run . peer_session)
   where
     go = do
       logDebug logger $ label <> " awaiting event..."
       msg <- receive inbox
       dispatchMessage cfg msg >>= bool (return ()) go
-    peer_session p ad = do
+    peer_session ad = do
       let ins = transPipe liftIO ad.inboundConduit
           ons = transPipe liftIO ad.outboundConduit
           src =
             runConduit $
               ins
                 .| inPeerConduit cfg
-                .| mapM_C (send_msg p)
+                .| mapM_C send_msg
           snk = outPeerConduit net .| ons
       withAsync src $ \as -> do
         link as
         runConduit (go .| snk)
-    send_msg p msg = publish (PeerMessage p msg) pub
+    -- Wait until the node has room for another message from this peer.
+    send_msg msg = do
+      atomically $ do
+        n <- readTVar p.pending
+        checkSTM (n < maxPendingMessages)
+        writeTVar p.pending (n + 1)
+      publish (PeerMessage p msg) pub
 
 -- | Internal function to dispatch peer messages.
 dispatchMessage ::
@@ -141,48 +176,71 @@ dispatchMessage ::
   PeerMessage ->
   ConduitT i Message m Bool
 dispatchMessage PeerConfig {label, logger} (SendMessage msg) = do
-  logDebug logger (label <> " sending: " <> cs (show msg))
+  logDebug logger (label <> " sending cmd " <> cs (show (msgType msg)))
   yield msg
   return True
 dispatchMessage PeerConfig {label, logger} KillPeer = do
   logInfo logger (label <> " disconnecting")
   return False
 
--- | Internal conduit to parse messages coming from peer.
+-- | Internal conduit to parse messages coming from peer. The header is checked
+-- before the payload is read, so that a peer cannot make the node buffer a
+-- payload that it will reject anyway. A peer that sends anything invalid is
+-- disconnected.
 inPeerConduit ::
   (MonadIO m) => PeerConfig -> ConduitT ByteString Message m ()
-inPeerConduit pc@PeerConfig {label, net, logger} = loopForever $ do
+inPeerConduit PeerConfig {label, net, logger} = loopForever $ do
   logDebug logger (label <> " awaiting message...")
   x <- takeCE 24 .| foldC
   when (B.null x) $ do
     logError logger (label <> " sent empty message header")
     error "Peer sent empty message header"
-  case decode x of
-    Left e -> do
-      logError logger (label <> " sent invalid message header")
-      error "Peer sent invalid message header"
-    Right (MessageHeader _ cmd len _)
-      | len > 32 * 2 ^ (20 :: Int) ->
-          logWarn logger $
-            label
-              <> " wants to send "
-              <> cs (show len)
-              <> " bytes (too large) for cmd "
-              <> cs (show cmd)
-      | otherwise -> do
-          logDebug logger (label <> " sent cmd " <> cs (show cmd))
-          y <- takeCE (fromIntegral len) .| foldC
-          case runGet (getMessage net) $ x `B.append` y of
-            Left e -> do
-              logError
-                logger
-                (label <> " sent invalid payload for cmd " <> cs (show cmd))
-              error "Peer sent invalid payload"
-            Right msg -> do
-              logDebug
-                logger
-                (label <> " sent payload for cmd " <> cs (show cmd))
-              yield msg
+  MessageHeader mgc cmd len _ <- case decode x of
+    Left _ -> bad "invalid message header"
+    Right h -> return h
+  when (mgc /= net.magic) $
+    bad ("wrong network magic " <> cs (show mgc))
+  when (len > net.maxMessageSize) $
+    bad
+      ( "too large payload of "
+          <> cs (show len)
+          <> " bytes for cmd "
+          <> cs (show cmd)
+      )
+  logDebug logger (label <> " sent cmd " <> cs (show cmd))
+  y <- takeCE (fromIntegral len) .| foldC
+  when (B.length y /= fromIntegral len) $
+    bad ("truncated payload for cmd " <> cs (show cmd))
+  forM_ (countLimit cmd) $ \limit ->
+    case runGet getCount y of
+      Right n
+        | n > limit ->
+            bad
+              ( "too many items ("
+                  <> cs (show n)
+                  <> ") in cmd "
+                  <> cs (show cmd)
+              )
+      _ -> return ()
+  case runGet (getMessage net) $ x `B.append` y of
+    Left _ -> bad ("invalid payload for cmd " <> cs (show cmd))
+    Right msg -> do
+      logDebug
+        logger
+        (label <> " sent payload for cmd " <> cs (show cmd))
+      yield msg
+  where
+    bad :: (MonadIO m) => Text -> m a
+    bad e = do
+      logError logger (label <> " sent " <> e)
+      error ("Peer sent " <> cs e)
+    getCount = do
+      VarInt n <- get
+      return n
+    countLimit MCHeaders = Just maxHeadersCount
+    countLimit MCAddr = Just maxAddrCount
+    countLimit MCAddrV2 = Just maxAddrCount
+    countLimit _ = Nothing
 
 -- | Outgoing peer conduit to serialize and send messages.
 outPeerConduit :: (Monad m) => Network -> ConduitT Message ByteString m ()
