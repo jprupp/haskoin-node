@@ -7,7 +7,7 @@ nix:
     - pkg-config
 extra-deps:
   - base16-2.0
-  - secp256k1-haskell-1.7.0
+  - secp256k1-haskell-2.0.0
   - rocksdb-haskell-jprupp-2.3.1
   - rocksdb-query-0.6.0
-  - haskoin-core-1.4.0
+  - haskoin-core-1.5.0
