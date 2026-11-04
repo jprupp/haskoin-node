@@ -381,7 +381,8 @@ purgeChainDB ChainConfig {db, cf} = liftIO $ do
 
 -- | Import a bunch of continuous headers. Returns 'True' if the number of
 -- headers is less than 2000, which means that there are no more headers to sync
--- from the peer that delivered these.
+-- from the peer that delivered these. An empty headers message, which a peer
+-- sends when it has nothing after the locator, counts as done too.
 importHeaders ::
   (MonadIO m) => Chain -> UTCTime -> [BlockHeader] -> m (Maybe Bool)
 importHeaders ch now hs =
@@ -390,7 +391,7 @@ importHeaders ch now hs =
       logError ch.config.logger ("connectBlocks: " <> cs e)
       return Nothing
     Right bns
-      | null bns -> return (Just False)
+      | null bns -> return (Just True)
       | otherwise -> do
           bb <- get_last
           atomically . modifyTVar ch.state $ \s ->
