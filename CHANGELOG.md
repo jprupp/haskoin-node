@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- The loop that parses messages from a peer uses `loopForever` too, like
+  every other long-running loop.
+
 ## [2.1.0] - 2026-11-03
 
 - Update to haskoin-core-1.5.0.

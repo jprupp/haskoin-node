@@ -47,6 +47,7 @@ import Data.Text (Text)
 import Data.Word (Word32)
 import Haskoin
 import Haskoin.Node.Logger
+import Haskoin.Node.Loop (loopForever)
 import NQE
 import System.Random
 import UnliftIO
@@ -150,7 +151,7 @@ dispatchMessage PeerConfig {label, logger} KillPeer = do
 -- | Internal conduit to parse messages coming from peer.
 inPeerConduit ::
   (MonadIO m) => PeerConfig -> ConduitT ByteString Message m ()
-inPeerConduit pc@PeerConfig {label, net, logger} = forever $ do
+inPeerConduit pc@PeerConfig {label, net, logger} = loopForever $ do
   logDebug logger (label <> " awaiting message...")
   x <- takeCE 24 .| foldC
   when (B.null x) $ do
