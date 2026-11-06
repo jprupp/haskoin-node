@@ -4,6 +4,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2026-11-06
+
+### Changed
+
+- This package requires haskoin-core 1.6.0, the release with the fixes of
+  the November 2026 security review.
+- Breaking: the `version`, `timestamp` and `startHeight` fields of the
+  `Version` of an `OnlinePeer` are signed numbers, as haskoin-core 1.6.0
+  reads them. `buildVersion` takes the same arguments as before.
+- The headers are not reported as synced before the best header has the
+  `minimumChainWork` of the network. This holds for the `ChainSynced` event
+  and for `chainIsSynced`. A recent header on a chain with less work used to
+  be enough.
+- Once the best header has the `minimumChainWork` of the network, a peer
+  whose headers fork from far below the tip, on a chain with less work, is
+  disconnected. haskoin-core 1.6.0 refuses such headers.
+- A peer that sends a header the node already has at or below a checkpoint
+  is no longer disconnected. haskoin-core 1.6.0 returns the stored header.
+- Transactions from Bitcoin Cash peers are read in the format without
+  witness only, as haskoin-core 1.6.0 reads them on a network without SegWit.
+- The log line for an invalid payload gives the reason the parser refused it.
+- The payload size limit is the `maxPayloadSize` of the command on the
+  network instead of the network's `maxMessageSize`. On Bitcoin Cash that is
+  2 MiB for every message but `block`, `cmpctblock` and `blocktxn`, which may
+  be twice the block size.
+
+### Fixed
+
+- Peers that send more than 50000 entries in an `inv` or `getdata` message,
+  or a block locator of more than 101 hashes, are disconnected. haskoin-core
+  1.6.0 refuses such a message as soon as it reads the count.
+
 ## [2.2.0] - 2026-11-04
 
 ### Changed

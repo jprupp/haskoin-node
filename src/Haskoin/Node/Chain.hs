@@ -386,10 +386,11 @@ purgeChainDB ChainConfig {db, cf} = liftIO $ do
               go it
         _ -> return ()
 
--- | Import a bunch of continuous headers. Returns 'True' if the number of
--- headers is less than 2000, which means that there are no more headers to sync
--- from the peer that delivered these. An empty headers message, which a peer
--- sends when it has nothing after the locator, counts as done too.
+-- | Import a bunch of continuous headers. Returns 'True' when the peer that
+-- delivered them has no more headers to sync. That is the case when it sent
+-- fewer than 'maxHeadersSize' (2000) headers, the most that one message may
+-- hold. An empty headers message, which a peer sends when it has nothing
+-- after the locator, counts as done too.
 importHeaders ::
   (MonadIO m) => Chain -> UTCTime -> [BlockHeader] -> m (Maybe Bool)
 importHeaders ch now hs =
@@ -403,7 +404,7 @@ importHeaders ch now hs =
           bb <- get_last
           atomically . modifyTVar ch.state $ \s ->
             s {syncing = set_best bb <$> s.syncing}
-          return (Just (length bns < 2000))
+          return (Just (length bns < fromIntegral maxHeadersSize))
   where
     set_best bb ChainSync {..} = ChainSync {best = bb, ..}
     timestamp = floor (utcTimeToPOSIXSeconds now)
@@ -417,6 +418,11 @@ importHeaders ch now hs =
 -- whether to notify other processes that the header chain has been synced. The
 -- state of the chain will be flipped to synced when this function returns
 -- 'True'.
+--
+-- The best block must also have the 'minimumChainWork' of the network.
+-- Bitcoin Core requires the same before it leaves initial block download. A
+-- chain with less work is not the real one, however recent its last block
+-- is. Below that work 'connectBlocks' does not refuse cheap forks either.
 notifySynced :: (MonadIO m) => Chain -> m Bool
 notifySynced ch = do
   bb <- runReaderT getBestBlockHeader ch.config
@@ -425,6 +431,7 @@ notifySynced ch = do
     s <- readTVar ch.state
     if
       | df > 7200 -> return False
+      | bb.work < ch.config.net.minimumChainWork -> return False
       | isJust s.syncing -> return False
       | not (null s.peers) -> return False
       | s.beenInSync -> return False

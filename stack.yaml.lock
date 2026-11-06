@@ -32,13 +32,6 @@ packages:
       size: 381
   original:
     hackage: rocksdb-query-0.6.0
-- completed:
-    hackage: haskoin-core-1.5.1@sha256:75886a86e8d6382da1f6e42aef65cfbf6cd8f01400a688b229b0d8fb3f880d19,5818
-    pantry-tree:
-      sha256: 3db392bc7373ac8d8e051807b3fdcc04a9e5ca43698b418baf03159f86cf0156
-      size: 7149
-  original:
-    hackage: haskoin-core-1.5.1
 snapshots:
 - completed:
     sha256: 5a365a790387c6fee9c1158c97f3701fdb34e523ba85730c8f0e45e1c4c30a7b

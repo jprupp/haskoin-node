@@ -658,15 +658,18 @@ buildVersion ::
   Word64 ->
   Version
 buildVersion net nonce height loc rmt time =
+  -- The version, timestamp and start height of a version message are signed
+  -- numbers, as in Bitcoin Core. The values the node sends are far below the
+  -- point where the conversion would change them.
   Version
-    { version = myVersion,
+    { version = fromIntegral myVersion,
       services = loc.services,
-      timestamp = time,
+      timestamp = fromIntegral time,
       addrRecv = rmt,
       addrSend = loc,
       nonce = nonce,
       userAgent = VarString net.userAgent,
-      startHeight = height,
+      startHeight = fromIntegral height,
       relay = True
     }
 
