@@ -10,5 +10,4 @@ extra-deps:
   - secp256k1-haskell-2.0.0
   - rocksdb-haskell-jprupp-2.5.0
   - rocksdb-query-0.6.0
-  # haskoin-core 1.6.0 from the local checkout next to this repository
-  - ../haskoin-core
+  - haskoin-core-1.6.0
