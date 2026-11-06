@@ -30,8 +30,6 @@ module Haskoin.Node.Peer
     setFree,
     peerMessageDone,
     maxPendingMessages,
-    maxHeadersCount,
-    maxAddrCount,
   )
 where
 
@@ -45,10 +43,10 @@ import Data.ByteString qualified as B
 import Data.Function (on)
 import Data.List (union)
 import Data.Maybe (isJust)
-import Data.Serialize (decode, get, runGet, runPut)
+import Data.Serialize (decode, runGet, runPut)
 import Data.String.Conversions (cs)
 import Data.Text (Text)
-import Data.Word (Word32, Word64)
+import Data.Word (Word32)
 import Haskoin
 import Haskoin.Node.Logger
 import Haskoin.Node.Loop (loopForever)
@@ -120,15 +118,6 @@ wrapPeer cfg busy pending mbox =
 maxPendingMessages :: Int
 maxPendingMessages = 16
 
--- | Most block headers a @headers@ message may carry. Bitcoin Core never
--- sends more and disconnects peers that do.
-maxHeadersCount :: Word64
-maxHeadersCount = 2000
-
--- | Most addresses an @addr@ or @addrv2@ message may carry.
-maxAddrCount :: Word64
-maxAddrCount = 1000
-
 -- | Tell the peer process that the node has finished handling one of the
 -- messages that it published, so that it may read another one.
 peerMessageDone :: (MonadIO m) => Peer -> m ()
@@ -185,8 +174,13 @@ dispatchMessage PeerConfig {label, logger} KillPeer = do
 
 -- | Internal conduit to parse messages coming from peer. The header is checked
 -- before the payload is read, so that a peer cannot make the node buffer a
--- payload that it will reject anyway. A peer that sends anything invalid is
--- disconnected.
+-- payload that it will reject anyway. The size limit is the 'maxPayloadSize'
+-- of the command. On Bitcoin Cash only messages that carry block content may
+-- be larger than 2 MiB. A peer that sends anything invalid is disconnected.
+--
+-- The counts of list messages are not checked here. 'getMessage' fails as
+-- soon as it reads a count above the limit of the message. The limits are
+-- 2000 headers and 1000 addresses, for example.
 inPeerConduit ::
   (MonadIO m) => PeerConfig -> ConduitT ByteString Message m ()
 inPeerConduit PeerConfig {label, net, logger} = loopForever $ do
@@ -200,7 +194,7 @@ inPeerConduit PeerConfig {label, net, logger} = loopForever $ do
     Right h -> return h
   when (mgc /= net.magic) $
     bad ("wrong network magic " <> cs (show mgc))
-  when (len > net.maxMessageSize) $
+  when (len > maxPayloadSize net cmd) $
     bad
       ( "too large payload of "
           <> cs (show len)
@@ -211,19 +205,14 @@ inPeerConduit PeerConfig {label, net, logger} = loopForever $ do
   y <- takeCE (fromIntegral len) .| foldC
   when (B.length y /= fromIntegral len) $
     bad ("truncated payload for cmd " <> cs (show cmd))
-  forM_ (countLimit cmd) $ \limit ->
-    case runGet getCount y of
-      Right n
-        | n > limit ->
-            bad
-              ( "too many items ("
-                  <> cs (show n)
-                  <> ") in cmd "
-                  <> cs (show cmd)
-              )
-      _ -> return ()
   case runGet (getMessage net) $ x `B.append` y of
-    Left _ -> bad ("invalid payload for cmd " <> cs (show cmd))
+    Left e ->
+      bad
+        ( "invalid payload for cmd "
+            <> cs (show cmd)
+            <> ": "
+            <> cs (firstLine e)
+        )
     Right msg -> do
       logDebug
         logger
@@ -234,13 +223,9 @@ inPeerConduit PeerConfig {label, net, logger} = loopForever $ do
     bad e = do
       logError logger (label <> " sent " <> e)
       error ("Peer sent " <> cs e)
-    getCount = do
-      VarInt n <- get
-      return n
-    countLimit MCHeaders = Just maxHeadersCount
-    countLimit MCAddr = Just maxAddrCount
-    countLimit MCAddrV2 = Just maxAddrCount
-    countLimit _ = Nothing
+    -- The reason is on the first line of the parser's error text. The lines
+    -- after it are call stack noise.
+    firstLine = takeWhile (/= '\n')
 
 -- | Outgoing peer conduit to serialize and send messages.
 outPeerConduit :: (Monad m) => Network -> ConduitT Message ByteString m ()

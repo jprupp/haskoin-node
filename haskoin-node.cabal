@@ -5,7 +5,7 @@ cabal-version: 1.12
 -- see: https://github.com/sol/hpack
 
 name:           haskoin-node
-version:        2.1.2
+version:        2.2.0
 synopsis:       P2P library for Bitcoin and Bitcoin Cash
 description:    Please see the README on GitHub at <https://github.com/jprupp/haskoin-node#readme>
 category:       Bitcoin, Finance, Network
@@ -47,7 +47,7 @@ library
     , data-default
     , fast-logger
     , hashable
-    , haskoin-core >=1.5.1
+    , haskoin-core >=1.6.0
     , mtl
     , network
     , nqe >=0.6.3
@@ -84,7 +84,7 @@ test-suite spec
     , data-default
     , fast-logger
     , hashable
-    , haskoin-core >=1.5.1
+    , haskoin-core >=1.6.0
     , haskoin-node
     , hspec
     , mtl

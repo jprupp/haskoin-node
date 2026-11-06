@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.2.0] - 2026-11-06
 
 ### Changed
 
@@ -17,20 +17,41 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   verack, ping and pong messages are handled to completion before the next
   one is taken. A fast peer could fill the node's unbounded queues before.
 - Outgoing messages are logged by command at debug level, not in full.
+- This package requires haskoin-core 1.6.0, the release with the fixes of
+  the November 2026 security review.
+- Breaking: the `version`, `timestamp` and `startHeight` fields of the
+  `Version` of an `OnlinePeer` are signed numbers, as haskoin-core 1.6.0
+  reads them. `buildVersion` takes the same arguments as before.
+- The headers are not reported as synced before the best header has the
+  `minimumChainWork` of the network. This holds for the `ChainSynced` event
+  and for `chainIsSynced`. A recent header on a chain with less work used to
+  be enough.
+- Once the best header has the `minimumChainWork` of the network, a peer
+  whose headers fork from far below the tip, on a chain with less work, is
+  disconnected. haskoin-core 1.6.0 refuses such headers.
+- A peer that sends a header the node already has at or below a checkpoint
+  is no longer disconnected. haskoin-core 1.6.0 returns the stored header.
+- Transactions from Bitcoin Cash peers are read in the format without
+  witness only, as haskoin-core 1.6.0 reads them on a network without SegWit.
+- The log line for an invalid payload gives the reason the parser refused it.
 
 ### Fixed
 
-- Bitcoin Cash headers sync again. This package now requires haskoin-core
-  1.5.1, which evaluates the ASERT difficulty rule at the parent block. With
+- Bitcoin Cash headers sync again. haskoin-core evaluates the ASERT
+  difficulty rule at the parent block since version 1.5.1. With
   haskoin-core 1.5.0 the node stopped at mainnet block 975899 with
   `Incorrect difficulty bits`, because that release checked the bits of each
   header with a formula that used the header's own timestamp.
 - Network magic and payload size are checked right after the message header,
-  before the payload is read. The size limit is the network's
-  `maxMessageSize` instead of a fixed 32 MiB. An oversized message used to be
-  logged and its payload then parsed as the next header.
+  before the payload is read. The size limit is the `maxPayloadSize` of the
+  command on the network instead of a fixed 32 MiB. On Bitcoin Cash that is
+  2 MiB for every message but `block`, `cmpctblock` and `blocktxn`, which may
+  be twice the block size. An oversized message used to be logged and its
+  payload then parsed as the next header.
 - Peers that send more than 2000 headers or more than 1000 addresses in one
-  message are disconnected before the message is decoded.
+  message are disconnected. So are peers that send more than 50000 entries in
+  an `inv` or `getdata` message, or a block locator of more than 101 hashes.
+  haskoin-core 1.6.0 refuses such a message as soon as it reads the count.
 - Address and header messages from a peer are ignored until it completes the
   handshake.
 - A second version or verack from a peer disconnects it. Each one used to

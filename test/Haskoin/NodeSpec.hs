@@ -22,7 +22,7 @@ import Data.Default (def)
 import Data.Either (fromRight)
 import Data.List (find)
 import Data.Maybe (isJust, listToMaybe, mapMaybe)
-import Data.Serialize (decode, get, runGet, runPut)
+import Data.Serialize (decode, get, put, runGet, runPut)
 import Data.Time.Clock (NominalDiffTime)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Database.RocksDB qualified as R
@@ -172,6 +172,26 @@ spec = do
             testMerkle b = buildMerkleRoot (ths b) `shouldBe` Right b.header.merkle
         testMerkle b1
         testMerkle b2
+    it "downloads a block larger than 2 MiB" $ do
+      -- On Bitcoin Cash a block message may be up to twice the block size,
+      -- while every other message is limited to 2 MiB (2097152 bytes).
+      let script = B.replicate 3000000 0x6a
+          tx = Tx 1 [TxIn nullOutPoint B.empty maxBound] [TxOut 0 script] [] 0
+          firstBlock : _ = allBlocks
+          big = Block firstBlock.header [tx]
+      withTestNodeBlocks [big] net "big-block" $ \TestNode {..} -> do
+        p <- waitForPeer nodeEvents
+        pbs <- getBlocks net 10 p [headerHash big.header]
+        let scriptSizes =
+              [[B.length o.script | o <- t.outputs] | b <- concat pbs, t <- b.txs]
+        scriptSizes `shouldBe` [[3000000]]
+    it "builds a version message with the given height and time" $ do
+      let local = NetworkAddress nodeNetwork (sockToHostAddress (SockAddrInet 0 0))
+          remote = NetworkAddress 0 (sockToHostAddress (SockAddrInet 8333 0x08080808))
+          v = buildVersion net 7 650000 local remote 1700000000
+      v.version `shouldBe` 70012
+      v.startHeight `shouldBe` 650000
+      v.timestamp `shouldBe` 1700000000
   describe "untrusted peers" $ do
     it "imports a full batch of 2000 headers" $
       withTestNodeOpts
@@ -209,6 +229,20 @@ spec = do
         (defOpts allBlocks) {react = reactAfterVerAck [Left bad]}
         net
         "wrong-magic"
+        $ \TestNode {..} -> do
+          p <- waitForPeer nodeEvents
+          waitForDisconnect nodeEvents p
+    it "disconnects a peer that announces a tx message larger than 2 MiB" $ do
+      -- Only the header is sent, with a length of 2 MiB plus one byte:
+      -- 2 × 1024 × 1024 + 1 = 2097153. The node must refuse it there,
+      -- without waiting for the payload.
+      let oversized =
+            runPut . put $
+              MessageHeader net.magic MCTx 2097153 (checkSum32 B.empty)
+      withTestNodeOpts
+        (defOpts allBlocks) {react = reactAfterVerAck [Left oversized]}
+        net
+        "oversized-tx"
         $ \TestNode {..} -> do
           p <- waitForPeer nodeEvents
           waitForDisconnect nodeEvents p
@@ -290,6 +324,29 @@ spec = do
         atomically $ readTVar getHeadersCount >>= checkSTM . (>= 1)
         threadDelay (1000 * 1000)
         readTVarIO getHeadersCount `shouldReturn` 1
+    it "reports the headers as synced when the best header has the minimum chain work" $ do
+      -- Every regtest header has a work of 2. Genesis and one header on top
+      -- of it have 2 + 2 = 4, which is the minimum here.
+      fresh <- freshHeader net
+      let net4 = net {minimumChainWork = 4}
+      withTestNodeBlocks [Block fresh []] net4 "min-work-reached" $
+        \TestNode {..} -> do
+          receiveMatch nodeEvents $ \case
+            ChainEvent (ChainBestBlock bn) | bn.height == 1 -> Just ()
+            _ -> Nothing
+          chainSync testChain
+          chainIsSynced testChain `shouldReturn` True
+    it "does not report the headers as synced below the minimum chain work" $ do
+      -- Same chain with a work of 2 + 2 = 4, one short of a minimum of 5.
+      fresh <- freshHeader net
+      let net5 = net {minimumChainWork = 5}
+      withTestNodeBlocks [Block fresh []] net5 "min-work-missing" $
+        \TestNode {..} -> do
+          receiveMatch nodeEvents $ \case
+            ChainEvent (ChainBestBlock bn) | bn.height == 1 -> Just ()
+            _ -> Nothing
+          chainSync testChain
+          chainIsSynced testChain `shouldReturn` False
     it "syncs some headers" $
       withTestNode net "connect-sync" $ \TestNode {..} -> do
         let bh =
@@ -352,6 +409,19 @@ manyHeaders :: Network -> Int -> Message
 manyHeaders net n =
   MHeaders . Headers $
     map (,VarInt 0) (appendBlocks net 0 net.genesisHeader n)
+
+-- | Valid header on top of genesis that is dated now. The node only counts
+-- its headers as synced when the best one is less than two hours old, and
+-- the headers of the other fixtures are years old.
+freshHeader :: Network -> IO BlockHeader
+freshHeader net = do
+  now <- round <$> getPOSIXTime
+  let genesis = net.genesisHeader
+  return $
+    mineBlock
+      net
+      0
+      genesis {version = 4, prev = headerHash genesis, timestamp = now}
 
 waitForPeer :: (MonadIO m) => Inbox NodeEvent -> m Peer
 waitForPeer inbox =
