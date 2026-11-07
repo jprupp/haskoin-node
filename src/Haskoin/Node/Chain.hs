@@ -15,6 +15,34 @@
 {-# LANGUAGE NoFieldSelectors #-}
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
+-- |
+-- Module      : Haskoin.Node.Chain
+-- Copyright   : (c) Haskoin Developers
+-- License     : MIT
+-- Maintainer  : jprupp@protonmail.ch
+-- Stability   : experimental
+-- Portability : POSIX
+--
+-- The block header chain.
+--
+-- The chain process downloads block headers from connected peers, one peer at a
+-- time, connects them to the headers it already has, and stores them in RocksDB.
+-- It follows the chain with the most work, and publishes a 'ChainBestBlock'
+-- event whenever the best block changes. Once the best block is recent (less
+-- than two hours old), has at least the minimum chain work of the network, and
+-- no peer is left to sync from, it publishes a single 'ChainSynced' event.
+--
+-- After a peer has delivered all its headers, it is asked to announce new
+-- blocks with headers messages, which are fed back to the chain process by
+-- "Haskoin.Node".
+--
+-- = Database
+--
+-- Headers are stored as 'BlockNode' values in the configured column family, or
+-- the default one, under keys starting with byte @0x90@. The best block is
+-- stored under key @0x91@ and a data version under key @0x92@. If the data
+-- version does not match, keys @0x90@ and @0x91@ are deleted when the chain
+-- starts. Applications that share the database must not use these prefixes.
 module Haskoin.Node.Chain
   ( ChainConfig (..),
     ChainEvent (..),
@@ -70,31 +98,43 @@ data ChainConfig = ChainConfig
     net :: !Network,
     -- | send header chain events here
     pub :: !(Publisher ChainEvent),
-    -- | timeout in seconds
+    -- | seconds to wait for headers from the syncing peer before it is
+    -- disconnected
     timeout :: !NominalDiffTime,
     -- | log messages here
     logger :: !Logger
   }
 
+-- | Messages handled by the chain process.
 data ChainMessage
-  = ChainHeaders !Peer ![BlockHeader]
-  | ChainPeerConnected !Peer
-  | ChainPeerDisconnected !Peer
-  | ChainPing
-  | ChainSyncMsg !(Listen ())
+  = -- | a peer sent headers
+    ChainHeaders !Peer ![BlockHeader]
+  | -- | a peer completed the handshake
+    ChainPeerConnected !Peer
+  | -- | a peer disconnected
+    ChainPeerDisconnected !Peer
+  | -- | periodic tick to check the syncing peer for timeouts
+    ChainPing
+  | -- | reply once every previous message has been handled
+    ChainSyncMsg !(Listen ())
 
 -- | Events originating from chain syncing process.
 data ChainEvent
   = -- | chain has new best block
     ChainBestBlock !BlockNode
-  | -- | chain is in sync with the network
+  | -- | chain is in sync with the network; published only once, with the best
+    -- block at that time
     ChainSynced !BlockNode
   deriving (Eq, Show)
 
--- | State and configuration.
+-- | Handle to a running chain process. Obtain one with 'withChain', or from
+-- the 'Haskoin.Node.Node' returned by 'Haskoin.Node.withNode'.
 data Chain = Chain
-  { config :: !ChainConfig,
+  { -- | configuration
+    config :: !ChainConfig,
+    -- | mailbox of the chain process
     mailbox :: !(Mailbox ChainMessage),
+    -- | syncing state
     state :: !(TVar ChainState)
   }
 
@@ -115,9 +155,13 @@ instance Serialize ChainDataVersionKey where
     return ChainDataVersionKey
   put ChainDataVersionKey = putWord8 0x92
 
+-- | State of the sync against one peer.
 data ChainSync = ChainSync
-  { peer :: !Peer,
+  { -- | peer being synced against
+    peer :: !Peer,
+    -- | when it last sent headers, or when syncing started
     timestamp :: !UTCTime,
+    -- | last header it sent, from which to continue syncing
     best :: !(Maybe BlockNode)
   }
 
@@ -155,11 +199,17 @@ instance Serialize BestBlockKey where
     return BestBlockKey
   put BestBlockKey = putWord8 0x91
 
+-- | Monad transformer with access to a 'Chain'. It has a 'BlockHeaders'
+-- instance, so the header functions of haskoin-core, such as 'getAncestor' and
+-- 'splitPoint', can run in it against the database of the chain.
 type ChainT m = ReaderT Chain m
 
+-- | Run a 'ChainT' action against a chain.
 runChainT :: ChainT m a -> Chain -> m a
 runChainT = runReaderT
 
+-- | Read and write headers in the database of a chain configuration. Orphan
+-- instance.
 instance (MonadIO m) => BlockHeaders (ReaderT ChainConfig m) where
   addBlockHeader bn = ReaderT $ \ChainConfig {db, cf} -> liftIO $ do
     case cf of
@@ -185,6 +235,7 @@ instance (MonadIO m) => BlockHeaders (ReaderT ChainConfig m) where
         Nothing -> insertOp (BlockHeaderKey (h bn)) bn
         Just cf' -> insertOpCF cf' (BlockHeaderKey (h bn)) bn
 
+-- | Read and write headers in the database of a chain. Orphan instance.
 instance (MonadIO m) => BlockHeaders (ChainT m) where
   addBlockHeader bn = withReaderT (.config) (addBlockHeader bn)
   getBlockHeader bh = withReaderT (.config) (getBlockHeader bh)
@@ -192,6 +243,13 @@ instance (MonadIO m) => BlockHeaders (ChainT m) where
   setBestBlockHeader bn = withReaderT (.config) (setBestBlockHeader bn)
   addBlockHeaders bns = withReaderT (.config) (addBlockHeaders bns)
 
+-- | Start the chain process and pass its handle to the given action. The process
+-- is stopped when the action returns, and its exceptions are re-thrown in the
+-- calling thread.
+--
+-- The database is initialised first: purged if its data version is old, and
+-- seeded with the genesis block of the network if it has no best block. The
+-- current best block is published as a 'ChainBestBlock' event on start.
 withChain ::
   (MonadUnliftIO m) => ChainConfig -> (Chain -> m a) -> m a
 withChain cfg action = do
@@ -218,6 +276,7 @@ withChain cfg action = do
         msg <- receive inbox
         chainConfigMessage ch msg
 
+-- | Log and publish a chain event.
 chainEvent :: (MonadIO m) => ChainConfig -> ChainEvent -> m ()
 chainEvent cfg e = do
   case e of
@@ -231,6 +290,10 @@ chainEvent cfg e = do
         ("Headers in sync at height " <> cs (show b.height))
   publish e cfg.pub
 
+-- | Import headers sent by a peer. Disconnect the peer if they do not connect.
+-- Publish a new best block if it changed. If the peer has no more headers, move
+-- on to the next peer and check whether the chain is now in sync; otherwise ask
+-- it for more.
 processHeaders :: (MonadIO m) => Chain -> Peer -> [BlockHeader] -> m ()
 processHeaders ch p hs = do
   let len = length hs
@@ -259,6 +322,7 @@ processHeaders ch p hs = do
           syncNotif ch
         else syncPeer ch p
 
+-- | Start syncing against the next peer in the queue, unless a peer is already being synced.
 syncNewPeer :: (MonadIO m) => Chain -> m ()
 syncNewPeer ch =
   getSyncingPeer ch.state >>= \case
@@ -270,6 +334,7 @@ syncNewPeer ch =
           logDebug ch.config.logger ("Syncing against peer " <> p.label)
           syncPeer ch p
 
+-- | Publish a 'ChainSynced' event if the chain just became synced.
 syncNotif :: (MonadIO m) => Chain -> m ()
 syncNotif ch =
   notifySynced ch >>= \case
@@ -278,6 +343,8 @@ syncNotif ch =
       runReaderT getBestBlockHeader ch.config
         >>= chainEvent ch.config . ChainSynced
 
+-- | Ask a peer for headers, continuing from the last header it sent, or from the
+-- best block. Does nothing if another peer is being synced.
 syncPeer :: (MonadIO m) => Chain -> Peer -> m ()
 syncPeer ch p = do
   t <- liftIO getCurrentTime
@@ -306,6 +373,7 @@ syncPeer ch p = do
         Just h -> return h
       Just <$> syncHeaders ch t h p
 
+-- | Handle a message sent to the chain process.
 chainConfigMessage :: (MonadIO m) => Chain -> ChainMessage -> m ()
 chainConfigMessage ch (ChainHeaders p hs) =
   processHeaders ch p hs
@@ -333,6 +401,8 @@ chainConfigMessage ch ChainPing = do
       | otherwise -> return ()
     Nothing -> syncNewPeer ch
 
+-- | Run a loop in the background that sends a 'ChainPing' to the chain process
+-- every 2 to 20 seconds.
 withSyncLoop :: (MonadUnliftIO m) => Mailbox ChainMessage -> m a -> m a
 withSyncLoop mbox mf =
   withAsync go $ \a ->
@@ -502,6 +572,8 @@ getSyncingPeer st =
     ChainState {syncing = Just ChainSync {peer}} -> return (Just peer)
     _ -> return Nothing
 
+-- | Reserve a peer with 'setBusy' and make it the syncing peer. Returns 'False'
+-- if the peer is busy with something else.
 setSyncingPeer :: (MonadIO m) => Chain -> Peer -> m Bool
 setSyncingPeer ch p =
   setBusy p >>= \case
@@ -565,7 +637,8 @@ finishPeer ch p =
 chainSyncingPeer :: (MonadIO m) => TVar ChainState -> m (Maybe ChainSync)
 chainSyncingPeer st = (.syncing) <$> readTVarIO st
 
--- | Get a block header from the block chain.
+-- | Get a block header from the block chain. Returns headers on side chains
+-- too; use 'chainBlockMain' to check whether a block is in the main chain.
 chainGetBlock :: (MonadIO m) => Chain -> BlockHash -> m (Maybe BlockNode)
 chainGetBlock ch bh = runReaderT (getBlockHeader bh) ch.config
 
@@ -573,12 +646,15 @@ chainGetBlock ch bh = runReaderT (getBlockHeader bh) ch.config
 chainGetBest :: (MonadIO m) => Chain -> m BlockNode
 chainGetBest ch = runReaderT getBestBlockHeader ch.config
 
--- | Get ancestor of 'BlockNode' at 'BlockHeight' from chain process.
+-- | Get ancestor of 'BlockNode' at 'BlockHeight' from chain process. Returns
+-- 'Nothing' if the height is above that of the node.
 chainGetAncestor ::
   (MonadIO m) => Chain -> BlockHeight -> BlockNode -> m (Maybe BlockNode)
 chainGetAncestor ch h bn = runReaderT (getAncestor h bn) ch.config
 
 -- | Get parents of 'BlockNode' starting at 'BlockHeight' from chain process.
+-- The result is in ascending order, from the block at the given height up to
+-- the parent of the given node, which is not included.
 chainGetParents ::
   (MonadIO m) => Chain -> BlockHeight -> BlockNode -> m [BlockNode]
 chainGetParents ch height top =
@@ -592,12 +668,14 @@ chainGetParents ch height top =
             Nothing -> return acc
             Just p -> go (p : acc) p
 
--- | Get last common block from chain process.
+-- | Get last common block from chain process: the most recent block that is an
+-- ancestor of both nodes.
 chainGetSplitBlock ::
   (MonadIO m) => Chain -> BlockNode -> BlockNode -> m BlockNode
 chainGetSplitBlock ch l r = runReaderT (splitPoint l r) ch.config
 
--- | Notify chain that a new peer is connected.
+-- | Notify chain that a new peer is connected. It is added to the queue of
+-- peers to sync against.
 chainPeerConnected :: (MonadIO m) => Chain -> Peer -> m ()
 chainPeerConnected ch p =
   ChainPeerConnected p `send` ch.mailbox
@@ -617,12 +695,14 @@ chainBlockMain ch bh =
       bm@(Just bn) ->
         (== bm) <$> chainGetAncestor ch bn.height bb
 
--- | Is chain in sync with network?
+-- | Is chain in sync with network? Once 'True', it stays 'True' even if the
+-- chain falls behind later.
 chainIsSynced :: (MonadIO m) => Chain -> m Bool
 chainIsSynced ch =
   (.beenInSync) <$> readTVarIO (ch.state)
 
--- | Peer sends a bunch of headers to the chain process.
+-- | Peer sends a bunch of headers to the chain process. "Haskoin.Node" calls
+-- this for every headers message received from an online peer.
 chainHeaders :: (MonadIO m) => Chain -> Peer -> [BlockHeader] -> m ()
 chainHeaders ch p hs =
   ChainHeaders p hs `send` ch.mailbox
