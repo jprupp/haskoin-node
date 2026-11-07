@@ -150,13 +150,13 @@ add it and its dependencies to `stack.yaml`:
 
 ```yaml
 extra-deps:
-  - haskoin-node-2.3.0
+  - haskoin-node-2.3.1
   - haskoin-core-1.6.1
   - secp256k1-haskell-2.0.0
   - base16-2.0
-  - rocksdb-haskell-jprupp-2.6.0
-  - rocksdb-query-0.6.0
-  - nqe-0.6.7
+  - rocksdb-haskell-jprupp-2.6.1
+  - rocksdb-query-0.6.1
+  - nqe-0.6.9
 ```
 
 ### Step by step with Stack
