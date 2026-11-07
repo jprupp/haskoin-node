@@ -19,9 +19,12 @@ the data you need. It is the networking layer of
 
 ## Contents
 
+- [Why Haskoin Node](#why-haskoin-node)
+- [Design principles](#design-principles)
 - [Features](#features)
 - [Installation](#installation)
 - [Quick start](#quick-start)
+- [Tutorial: a block watcher](#tutorial-a-block-watcher)
 - [Concepts](#concepts)
 - [Usage guide](#usage-guide)
 - [Configuration](#configuration)
@@ -30,6 +33,43 @@ the data you need. It is the networking layer of
 - [Development](#development)
 - [Related projects](#related-projects)
 - [License](#license)
+
+## Why Haskoin Node
+
+A program that wants Bitcoin data has two usual options. It can run a full node
+such as Bitcoin Core next to it and talk to its RPC interface, which means
+operating a second large piece of software. Or it can speak the peer-to-peer
+protocol itself, which means solving the same problems every node solves:
+finding peers, keeping good ones, dropping bad ones, parsing untrusted
+messages safely, and following the header chain through reorganisations.
+
+Haskoin Node solves those problems once, as a library. It gives a Haskell
+program a direct, well-behaved presence on the network, and stops there: what
+to download, what to validate and what to store is up to the program. It is
+the networking layer of [Haskoin Store](https://github.com/jprupp/haskoin-store),
+which indexes the whole Bitcoin and Bitcoin Cash block chains this way without
+a full node.
+
+## Design principles
+
+- **Do one job.** Keep connected and keep the header chain current. Blocks,
+  transactions, validation and storage of anything but headers belong to the
+  application, because every application wants something different.
+- **Headers are the source of truth.** Headers are small (80 bytes) and carry
+  the proof of work. With them, the node knows which chain is real without
+  downloading blocks, and can tell the application which blocks to fetch.
+- **Tell, don't ask.** Everything the node learns becomes an event on a
+  publisher. The application subscribes and reacts; the node never needs to know
+  who is listening.
+- **Peers are strangers.** Message sizes are checked before payloads are read,
+  anything invalid ends the connection, relayed addresses are filtered, and a
+  peer cannot push data faster than the node can handle it.
+- **Prefer good peers, but keep moving.** Peers are ranked by measured latency
+  so the fastest are used first, and every connection is eventually replaced so
+  the node never depends on the same few peers forever.
+- **Small, isolated components.** The peer manager, the header chain and each
+  connection are separate [NQE](https://github.com/jprupp/nqe) processes with
+  their own state. One misbehaving peer dies alone.
 
 ## Features
 
@@ -76,6 +116,13 @@ Some older distributions ship a libsecp256k1 below 0.2.0. See the
 [haskoin-core installation notes](https://github.com/jprupp/haskoin-core#system-library)
 for how to build it.
 
+### Check the libraries are found
+
+```sh
+pkg-config --modversion libsecp256k1   # 0.2.0 or later
+ls /usr/include/rocksdb/c.h            # or $(brew --prefix)/include/rocksdb/c.h
+```
+
 ### Compiler
 
 It needs GHC 9.2 or later, because it uses `OverloadedRecordDot`. It is built
@@ -111,6 +158,31 @@ extra-deps:
   - rocksdb-query-0.6.0
   - nqe-0.6.7
 ```
+
+### Step by step with Stack
+
+1. Install [Stack](https://docs.haskellstack.org/) and the libraries above.
+2. Create a project:
+
+   ```sh
+   stack new node-demo simple
+   cd node-demo
+   ```
+
+3. Add the packages listed under [With Cabal](#with-cabal) to `build-depends`
+   in `node-demo.cabal`, plus `network`.
+4. If your resolver is older than the packages, add the `extra-deps` shown
+   under [With Stack](#with-stack) to `stack.yaml`.
+5. Put the [quick start](#quick-start) program in `src/Main.hs` and run it:
+
+   ```sh
+   stack run
+   ```
+
+   Within a few seconds it logs connections and starts printing header
+   heights. A full header sync of Bitcoin usually takes minutes and on the
+   order of a hundred megabytes of disk; it resumes where it stopped if you
+   interrupt it.
 
 ## Quick start
 
@@ -162,6 +234,75 @@ main =
 
 Subscribe to the publisher before calling `withNode`, as here, or you may miss
 the first events.
+
+## Tutorial: a block watcher
+
+This builds a program that prints every new Bitcoin block with its number of
+transactions. It shows the intended division of labour: the node follows
+headers and tells you about them, and you fetch what you need.
+
+### 1. Wait until the headers are synced
+
+At start-up the node downloads hundreds of thousands of headers, each one a
+`ChainBestBlock` event. Reacting to each of those would mean fetching every
+historical block. Wait for `ChainSynced` first:
+
+```haskell
+waitSynced :: Inbox NodeEvent -> IO ()
+waitSynced events =
+  receive events >>= \case
+    ChainEvent (ChainSynced _) -> return ()
+    _ -> waitSynced events
+```
+
+### 2. React to new best headers
+
+After that, each `ChainBestBlock` is a new block at the tip, or the new tip
+after a reorganisation:
+
+```haskell
+watch :: Network -> Node -> Inbox NodeEvent -> IO ()
+watch net node events = forever $
+  receive events >>= \case
+    ChainEvent (ChainBestBlock bn) -> fetch net node bn
+    _ -> return ()
+```
+
+### 3. Fetch the block from the fastest peer
+
+`getPeers` lists online peers, fastest first. Ask one, and try the next if it
+fails or times out:
+
+```haskell
+fetch :: Network -> Node -> BlockNode -> IO ()
+fetch net node bn = getPeers node.peerMgr >>= go
+  where
+    hash = headerHash bn.header
+    go [] = putStrLn ("No peer could send block " <> show bn.height)
+    go (op : ops) =
+      getBlocks net 30 op.mailbox [hash] >>= \case
+        Just [b] ->
+          putStrLn (show bn.height <> ": " <> show (length b.txs) <> " transactions")
+        _ -> go ops
+```
+
+### 4. Put it together
+
+Use the configuration from the [quick start](#quick-start), and run the watcher
+inside `withNode`:
+
+```haskell
+withNode cfg $ \node -> do
+  waitSynced events
+  watch btc node events
+```
+
+### What the node did for you
+
+While this runs, the node keeps eight connections, measures and ranks them,
+drops silent or misbehaving peers and finds replacements, stores headers so a
+restart is quick, and switches to a heavier chain if one appears. The watcher is
+only twenty lines because none of that is its concern.
 
 ## Concepts
 

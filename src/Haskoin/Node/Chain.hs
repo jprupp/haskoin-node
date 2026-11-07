@@ -36,6 +36,29 @@
 -- blocks with headers messages, which are fed back to the chain process by
 -- "Haskoin.Node".
 --
+-- = Why it works this way
+--
+-- * __One peer at a time.__ Headers form a single chain, so asking several
+--   peers for the same range at once would only download it several times.
+--   The chain syncs from one peer and moves to the next when it is done or
+--   times out, which also means every connected peer eventually gets a chance
+--   to show a better chain.
+--
+-- * __Most work wins.__ The best chain is the one with the most accumulated
+--   proof of work, not the longest or the first seen, as in every Bitcoin
+--   implementation.
+--
+-- * __"Synced" has to be earned.__ Recent headers alone do not prove much: a
+--   peer can feed a cheap chain with fresh timestamps. The chain only counts as
+--   synced once its work reaches the network's minimum chain work, the same
+--   guard Bitcoin Core uses before leaving initial block download. Applications
+--   use 'ChainSynced' to start work that only makes sense at the tip, so a false
+--   signal would be costly.
+--
+-- * __Headers are stored, not kept in memory.__ Storing them in RocksDB lets a
+--   restart resume where it stopped instead of downloading the whole chain
+--   again.
+--
 -- = Database
 --
 -- Headers are stored as 'BlockNode' values in the configured column family, or

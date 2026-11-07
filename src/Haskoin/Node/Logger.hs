@@ -6,6 +6,11 @@
 
 -- | Logging to standard error. A 'Logger' is a plain value carried in
 -- configuration records, so code that logs only needs 'MonadIO'.
+--
+-- The node used to log through a logging monad transformer. That forced every
+-- function into that monad, and made polymorphic loops leak memory when GHC did
+-- not specialise them (see "Haskoin.Node.Loop"). A plain value avoids both, and
+-- programs that log elsewhere can supply their own @push@ function.
 module Haskoin.Node.Logger
   ( Logger (..),
     LogLevel (..),

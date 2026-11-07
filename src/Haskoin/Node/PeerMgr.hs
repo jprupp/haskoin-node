@@ -38,6 +38,26 @@
 -- Most of the @peerMgr*@ functions are used by "Haskoin.Node" to feed messages
 -- received from peers to the peer manager; applications rarely need to call
 -- them directly.
+--
+-- = Why it works this way
+--
+-- * __Peers are ranked by measured latency.__ The fastest peers deliver
+--   blocks and transactions soonest, so applications that pick the first peer
+--   from 'getPeers' get the best service without measuring anything themselves.
+--
+-- * __Connections rotate.__ Peers are dropped after 'maxPeerLife' even when
+--   they behave. A node that keeps the same few peers forever is easier to
+--   isolate from the honest network, and stuck with them if they degrade.
+--   Rotation keeps the peer set fresh.
+--
+-- * __Silence is failure.__ A peer that sends nothing, or ignores a ping, for
+--   longer than 'timeout' is dropped. Waiting for a peer that has gone away
+--   would stall whatever was waiting on it.
+--
+-- * __Relayed addresses are untrusted.__ Peers gossip addresses, and a
+--   malicious peer could gossip private or loopback addresses to make the node
+--   probe its own network. Only public addresses are accepted, and only a
+--   bounded number are kept, so gossip cannot exhaust memory.
 module Haskoin.Node.PeerMgr
   ( PeerMgrConfig (..),
     PeerEvent (..),
@@ -589,6 +609,10 @@ setPeerPing b nonce now p =
 
 -- | Store the version of a peer. Returns 'Nothing' to reject it if the peer does
 -- not serve the full chain, is ourselves, is unknown, or already sent a version.
+--
+-- A peer must offer the full chain ('nodeNetwork') to be useful for syncing, and
+-- a version whose nonce matches one of ours means the node has connected to
+-- itself, which happens when it learns its own address from gossip.
 setPeerVersion :: TVar [OnlinePeer] -> Peer -> Version -> STM (Maybe OnlinePeer)
 setPeerVersion b p v
   | v.services .&. nodeNetwork == 0 = return Nothing

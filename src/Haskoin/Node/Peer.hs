@@ -27,6 +27,21 @@
 -- by "Haskoin.Node.PeerMgr"; applications mostly use 'sendMessage',
 -- 'getBlocks', 'getTxs' and 'getData' on peers obtained from
 -- 'Haskoin.Node.PeerMgr.getPeers'.
+--
+-- = Defensive by design
+--
+-- A peer is anyone on the Internet. The code here assumes the worst of it:
+--
+-- * The 24-byte header of each message is read and checked first: network
+--   magic, and payload size against the limit for that command. Only then is
+--   the payload read, so a peer cannot make the node buffer a huge message it
+--   would refuse anyway.
+--
+-- * Anything that does not parse closes the connection. There is no attempt to
+--   recover, because a peer that sends garbage once is not worth the risk.
+--
+-- * Reading pauses when the node falls behind ('maxPendingMessages'), so the
+--   speed of the node, not the speed of the peer, sets the pace.
 module Haskoin.Node.Peer
   ( PeerConfig (..),
     PeerEvent (..),
@@ -71,6 +86,9 @@ import System.Random
 import UnliftIO
 
 -- | The two directions of a network connection, as conduits.
+--
+-- Connections are abstract conduits rather than sockets, so that the same peer
+-- code runs over TCP, through a proxy, or against an in-memory mock in tests.
 data Conduits = Conduits
   { -- | bytes received from the peer
     inboundConduit :: ConduitT () ByteString IO (),
@@ -291,6 +309,10 @@ getBusy p = readTVarIO p.busy
 
 -- | Try to reserve a peer for a task, such as syncing headers. Returns 'True' if
 -- the peer was free and is now reserved, or 'False' if it was already busy.
+--
+-- Reservation exists because some conversations with a peer span many
+-- messages, like downloading a long run of headers. Two tasks using the same peer
+-- for such a conversation at once would confuse each other's replies.
 setBusy :: (MonadIO m) => Peer -> m Bool
 setBusy p =
   atomically $ do

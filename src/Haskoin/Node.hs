@@ -39,6 +39,38 @@
 -- connecting and disconnecting, and every message received from a peer, such as
 -- inventory announcements, blocks and transactions.
 --
+-- = Purpose
+--
+-- Talking to the Bitcoin network well is a job of its own, independent of what
+-- a program does with the data. Peers have to be found, kept, measured and
+-- dropped; messages have to be parsed defensively, because anyone can connect;
+-- and the header chain, the backbone that tells which blocks are real, has to
+-- be followed through reorganisations. This library does that job and nothing
+-- else, so that wallets, indexers and monitors can be built on it without each
+-- reimplementing it.
+--
+-- = Design
+--
+-- * __Headers only.__ The node syncs block headers, which are small and enough
+--   to know the best chain, and leaves blocks and transactions to the
+--   application. Applications differ wildly in what they need: an indexer wants
+--   every block, a wallet a few transactions, a monitor nothing but
+--   announcements. Fetching on request serves all of them.
+--
+-- * __Events, not callbacks.__ Everything the node learns is published. The
+--   node does not know who listens or how many listeners there are, and a slow
+--   listener cannot reach into the node's own state.
+--
+-- * __Processes with one job each.__ The peer manager, the chain and every
+--   peer connection are separate NQE processes. Each owns its state and is fed
+--   by messages, which keeps the concurrency easy to reason about and lets a
+--   failing peer die without disturbing the rest.
+--
+-- * __Trust nothing from the network.__ Peers are strangers. Every message is
+--   checked against size limits before it is read, invalid input disconnects
+--   the peer, and a peer cannot make the node allocate memory faster than it
+--   can work.
+--
 -- = Example
 --
 -- @
@@ -111,6 +143,9 @@ import Text.Read (readMaybe)
 import UnliftIO
 
 -- | General node configuration. Passed to 'withNode'.
+--
+-- Connecting is a parameter ('connect') rather than hard-wired so that tests can
+-- plug in simulated peers, and deployments can route through a proxy.
 data NodeConfig = NodeConfig
   { -- | maximum number of connected peers allowed
     maxPeers :: !Int,
