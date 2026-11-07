@@ -19,19 +19,26 @@ packages:
   original:
     hackage: secp256k1-haskell-2.0.0
 - completed:
-    hackage: rocksdb-haskell-jprupp-2.5.0@sha256:bb37d94f20ba83330016d5e03b84db0127c6ce906b7c4ae382a36a7d97386dda,1589
+    hackage: rocksdb-haskell-jprupp-2.6.1@sha256:b97e92f311865e12242868ec8dcc53a66a96da489b4cd9996be3b5893c9d5e6a,1589
     pantry-tree:
-      sha256: b498eb44ff16681d0bfb572025852fa00edcef24959f8807c9261c4096814a43
-      size: 712
+      sha256: 14453887f9c9836a22ced79318a72e89fdd4f348fd3342afddb107b4fae8d87a
+      size: 718
   original:
-    hackage: rocksdb-haskell-jprupp-2.5.0
+    hackage: rocksdb-haskell-jprupp-2.6.1
 - completed:
-    hackage: rocksdb-query-0.6.0@sha256:d312b7e8b351f7aef5028718868f4aaa65406cb828367309a7f4cfa222b3d593,1439
+    hackage: rocksdb-query-0.6.1@sha256:46918664cceca0e69a91828eccc214f1f0ae88aa29825c31f8fc4d6b2b298496,1439
     pantry-tree:
-      sha256: 516c59b74d9a9153b11cde9e28d6f9b28f8562f212c4523d980b31be03b19c1e
-      size: 381
+      sha256: d71559aecf61da5ad2837d52d08e288384ca5a83e7fad74ab7ba872590c2a814
+      size: 384
   original:
-    hackage: rocksdb-query-0.6.0
+    hackage: rocksdb-query-0.6.1
+- completed:
+    hackage: nqe-0.6.9@sha256:65b548dcaa0b663a800f60a6d75f264df1a5b8572d106917176a0d9ec187d608,1542
+    pantry-tree:
+      sha256: 1e043327670ecd938fd1fdbc8ecd5487fa868869dd82e66c7808418fa17a9d9d
+      size: 671
+  original:
+    hackage: nqe-0.6.9
 - completed:
     hackage: haskoin-core-1.6.1@sha256:9cb562c94482bbad41cce33679850d49ed9ec355377a0f6573b07a0f880d48c4,6180
     pantry-tree:
@@ -41,7 +48,7 @@ packages:
     hackage: haskoin-core-1.6.1
 snapshots:
 - completed:
-    sha256: 5a365a790387c6fee9c1158c97f3701fdb34e523ba85730c8f0e45e1c4c30a7b
-    size: 780550
-    url: https://raw.githubusercontent.com/commercialhaskell/stackage-snapshots/master/nightly/2026/10/28.yaml
-  original: nightly-2026-10-28
+    sha256: 2c234e9f6c9b52dbbd8e0c369dd55e275f1c143474d4a984a000588d37306e2c
+    size: 780950
+    url: https://raw.githubusercontent.com/commercialhaskell/stackage-snapshots/master/nightly/2026/11/7.yaml
+  original: nightly-2026-11-07
