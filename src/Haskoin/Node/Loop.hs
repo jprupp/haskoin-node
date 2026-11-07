@@ -12,6 +12,8 @@
 -- stacks, so it never accumulates.
 module Haskoin.Node.Loop (loopForever) where
 
+-- | Run an action over and over, forever, discarding its results. Only
+-- exceptions stop the loop.
 loopForever :: (Monad m) => m a -> m b
 loopForever action = go
   where

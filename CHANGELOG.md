@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## [2.3.1] - 2026-11-07
+
+### Changed
+
+- Documentation: the README explains the purpose and design of the node, with
+  installation steps, configuration, security notes and a tutorial, and the
+  Haddock of every module and function says why it works the way it does.
+- Build against nqe 0.6.9, rocksdb-haskell-jprupp 2.6.1, rocksdb-query 0.6.1
+  and Stackage nightly-2026-11-07.
+
 ## [2.3.0] - 2026-11-06
 
 ### Changed

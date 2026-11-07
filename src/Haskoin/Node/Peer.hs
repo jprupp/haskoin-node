@@ -11,6 +11,37 @@
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE NoFieldSelectors #-}
 
+-- |
+-- Module      : Haskoin.Node.Peer
+-- Copyright   : (c) Haskoin Developers
+-- License     : MIT
+-- Maintainer  : jprupp@protonmail.ch
+-- Stability   : experimental
+-- Portability : POSIX
+--
+-- A single connection to a peer on the Bitcoin network.
+--
+-- Each peer runs as its own process. It reads messages from the network,
+-- parses them, and publishes them as 'PeerEvent's. It also accepts messages to
+-- send to the peer through its mailbox. Peers are normally started and managed
+-- by "Haskoin.Node.PeerMgr"; applications mostly use 'sendMessage',
+-- 'getBlocks', 'getTxs' and 'getData' on peers obtained from
+-- 'Haskoin.Node.PeerMgr.getPeers'.
+--
+-- = Defensive by design
+--
+-- A peer is anyone on the Internet. The code here assumes the worst of it:
+--
+-- * The 24-byte header of each message is read and checked first: network
+--   magic, and payload size against the limit for that command. Only then is
+--   the payload read, so a peer cannot make the node buffer a huge message it
+--   would refuse anyway.
+--
+-- * Anything that does not parse closes the connection. There is no attempt to
+--   recover, because a peer that sends garbage once is not worth the risk.
+--
+-- * Reading pauses when the node falls behind ('maxPendingMessages'), so the
+--   speed of the node, not the speed of the peer, sets the pace.
 module Haskoin.Node.Peer
   ( PeerConfig (..),
     PeerEvent (..),
@@ -54,32 +85,55 @@ import NQE
 import System.Random
 import UnliftIO
 
+-- | The two directions of a network connection, as conduits.
+--
+-- Connections are abstract conduits rather than sockets, so that the same peer
+-- code runs over TCP, through a proxy, or against an in-memory mock in tests.
 data Conduits = Conduits
-  { inboundConduit :: ConduitT () ByteString IO (),
+  { -- | bytes received from the peer
+    inboundConduit :: ConduitT () ByteString IO (),
+    -- | bytes to send to the peer
     outboundConduit :: ConduitT ByteString Void IO ()
   }
 
+-- | A function that opens a connection, passes its 'Conduits' to the given
+-- action, and closes the connection when the action returns.
 type WithConnection = (Conduits -> IO ()) -> IO ()
 
+-- | Configuration of a peer process.
 data PeerConfig = PeerConfig
-  { pub :: !(Publisher PeerEvent),
+  { -- | peer events are published here
+    pub :: !(Publisher PeerEvent),
+    -- | network constants
     net :: !Network,
+    -- | name of the peer in logs, usually its address
     label :: !Text,
+    -- | how to open the connection to the peer
     connect :: !WithConnection,
+    -- | log messages here
     logger :: !Logger
   }
 
+-- | Events published about peers.
 data PeerEvent
-  = PeerConnected !Peer
-  | PeerDisconnected !Peer
-  | PeerMessage !Peer !Message
+  = -- | the peer completed the version handshake and is online
+    PeerConnected !Peer
+  | -- | the peer disconnected
+    PeerDisconnected !Peer
+  | -- | the peer sent a message
+    PeerMessage !Peer !Message
   deriving (Eq)
 
--- | Mailbox for a peer.
+-- | Mailbox for a peer. Peers are compared by their mailbox, and shown by their
+-- label.
 data Peer = Peer
-  { mailbox :: !(Mailbox PeerMessage),
+  { -- | send 'PeerMessage's to the peer process here
+    mailbox :: !(Mailbox PeerMessage),
+    -- | events from this peer are published here
     pub :: !(Publisher PeerEvent),
+    -- | name of the peer in logs, usually its address
     label :: !Text,
+    -- | whether the peer is reserved for a task; see 'setBusy'
     busy :: !(TVar Bool),
     -- | messages from this peer that the node has not finished handling
     pending :: !(TVar Int)
@@ -93,9 +147,13 @@ instance Show Peer where
 
 -- | Incoming messages that a peer accepts.
 data PeerMessage
-  = KillPeer
-  | SendMessage !Message
+  = -- | disconnect from the peer
+    KillPeer
+  | -- | send a network message to the peer
+    SendMessage !Message
 
+-- | Build a 'Peer' handle from its configuration, its busy flag, its counter of
+-- pending messages, and the mailbox of its process.
 wrapPeer ::
   PeerConfig ->
   TVar Bool ->
@@ -125,6 +183,11 @@ peerMessageDone p = atomically $ modifyTVar' p.pending (max 0 . subtract 1)
 
 -- | Run peer process in current thread. The 'Peer' must be the one that
 -- 'wrapPeer' built with the mailbox of this inbox.
+--
+-- Opens the connection, then reads and publishes messages from the peer while
+-- sending the messages that arrive in the inbox. Returns when 'killPeer' is
+-- called or the connection is closed, and throws if the peer sends invalid
+-- data.
 peer ::
   (MonadUnliftIO m) =>
   PeerConfig ->
@@ -231,17 +294,25 @@ inPeerConduit PeerConfig {label, net, logger} = loopForever $ do
 outPeerConduit :: (Monad m) => Network -> ConduitT Message ByteString m ()
 outPeerConduit net = awaitForever $ yield . runPut . putMessage net
 
--- | Kill a peer with the provided exception.
+-- | Ask a peer to disconnect. The peer process stops after sending any messages
+-- queued before this one.
 killPeer :: (MonadIO m) => Peer -> m ()
 killPeer p = KillPeer `send` p.mailbox
 
--- | Send a network message to peer.
+-- | Send a network message to peer. Returns as soon as the message is queued.
 sendMessage :: (MonadIO m) => Message -> Peer -> m ()
 sendMessage msg p = SendMessage msg `send` p.mailbox
 
+-- | Check whether a peer is reserved for a task.
 getBusy :: (MonadIO m) => Peer -> m Bool
 getBusy p = readTVarIO p.busy
 
+-- | Try to reserve a peer for a task, such as syncing headers. Returns 'True' if
+-- the peer was free and is now reserved, or 'False' if it was already busy.
+--
+-- Reservation exists because some conversations with a peer span many
+-- messages, like downloading a long run of headers. Two tasks using the same peer
+-- for such a conversation at once would confuse each other's replies.
 setBusy :: (MonadIO m) => Peer -> m Bool
 setBusy p =
   atomically $ do
@@ -249,12 +320,16 @@ setBusy p =
     unless b $ writeTVar p.busy True
     return $ not b
 
+-- | Release a peer reserved with 'setBusy'.
 setFree :: (MonadIO m) => Peer -> m ()
 setFree p = atomically $ writeTVar p.busy False
 
 -- | Request full blocks from peer. Will return 'Nothing' if the list of blocks
 -- returned by the peer is incomplete, comes out of order, or a timeout is
 -- reached.
+--
+-- The 'Int' argument is the timeout in seconds. On networks with SegWit,
+-- blocks are requested with their witness data.
 getBlocks ::
   (MonadUnliftIO m) =>
   Network ->
@@ -275,6 +350,9 @@ getBlocks net time p bhs =
 -- | Request transactions from peer. Will return 'Nothing' if the list of
 -- transactions returned by the peer is incomplete, comes out of order, or a
 -- timeout is reached.
+--
+-- The 'Int' argument is the timeout in seconds. Peers normally only serve
+-- transactions that are in their mempool.
 getTxs ::
   (MonadUnliftIO m) =>
   Network ->
@@ -295,6 +373,11 @@ getTxs net time p ths =
 -- | Request transactions and/or blocks from peer. Return 'Nothing' if any
 -- single inventory fails to be retrieved, if they come out of order, or if
 -- timeout is reached.
+--
+-- The first argument is the timeout in seconds. A ping is sent right after the
+-- request; since peers answer in order, receiving the matching pong before all
+-- items means that the peer will not send the rest. Transactions are returned
+-- as 'Left' and blocks as 'Right', in the order they were requested.
 getData ::
   (MonadUnliftIO m) => Int -> Peer -> GetData -> m (Maybe [Either Tx Block])
 getData seconds p gd@(GetData ivs) =
@@ -336,7 +419,7 @@ getData seconds p gd@(GetData ivs) =
     is_block _ = False
 
 -- | Ping a peer and await response. Return 'False' if response not received
--- before timeout.
+-- before timeout. The first argument is the timeout in seconds.
 pingPeer :: (MonadUnliftIO m) => Int -> Peer -> m Bool
 pingPeer time p =
   fmap isJust . withSubscription p.pub $ \sub -> do
@@ -347,6 +430,8 @@ pingPeer time p =
         | p == p' && r == r' -> Just ()
       _ -> Nothing
 
+-- | Receive the next message from the given peer, discarding events about other
+-- peers.
 filterReceive :: (MonadIO m) => Peer -> Inbox PeerEvent -> m Message
 filterReceive p inb =
   receive inb >>= \case
