@@ -49,7 +49,7 @@ instance Arbitrary Input where
       <$> oneof
         [ Heard <$> time,
           GotHandshake <$> elements [GotVersion version, GotVerAck],
-          Refused <$> elements [NotFullNode, ConnectedToSelf],
+          Refused <$> elements [NotFullNode, NotWitnessNode, ConnectedToSelf],
           GotPong <$> time <*> nonce,
           Tick <$> time <*> nonce
         ]
@@ -125,6 +125,11 @@ spec = describe "connection lifecycle" $ do
     it "rotates a peer connected for too long" $
       drop 2 (snd (run (online <> [Heard (at 100), Tick (at 101) 1])))
         `shouldBe` [Disconnect TooOld]
+
+    it "keeps a peer connected for exactly its maximum life" $
+      -- 100 seconds is the maximum life here; the peer is pinged instead
+      drop 2 (snd (run (online <> [Heard (at 100), Tick (at 100) 1])))
+        `shouldBe` [SendPing 1]
 
     it "rotates before checking anything else" $
       snd (run [Tick (at 101) 1]) `shouldBe` [Disconnect TooOld]

@@ -63,8 +63,11 @@ a full node.
   publisher. The application subscribes and reacts; the node never needs to know
   who is listening.
 - **Peers are strangers.** Message sizes are checked before payloads are read,
-  anything invalid ends the connection, relayed addresses are filtered, and a
-  peer cannot push data faster than the node can handle it.
+  a payload costs time linear in its size however it is split, anything
+  invalid ends the connection, a block must hold the transactions its header
+  commits to, relayed addresses are filtered and spread over network groups,
+  and the node reads a peer only as fast as it handles its messages. Your
+  subscribers are not throttled: one that falls behind holds memory.
 - **Prefer good peers, but keep moving.** Peers are ranked by measured latency
   so the fastest are used first, and every connection is eventually replaced so
   the node never depends on the same few peers forever.
@@ -80,9 +83,12 @@ a full node.
   no `MonadIO` or `MonadUnliftIO` constraints. Types say exactly what runs, GHC
   has nothing to specialise, and long-running loops cannot leak through an
   unspecialised dictionary. From your own monad, call the node with `liftIO`.
-- **Never stuck.** Every hint that a peer has blocks the node lacks makes it ask
-  for headers, and a quiet period makes it ask every peer, so a missed
-  announcement cannot leave the chain behind.
+- **Keep moving.** Every hint that a peer has blocks the node lacks makes it
+  ask that peer for headers, at once even while another peer syncs, and a
+  quiet period makes it ask every peer, so a missed announcement cannot leave
+  the chain behind. A syncing peer loses its turn when it sends nothing new,
+  and when it runs past the deadline that Bitcoin Core gives its initial
+  headers sync.
 
 ## Features
 
@@ -90,11 +96,11 @@ a full node.
 | --------------- | ---------------------------------------------------------------------------------------------- |
 | Networks        | Every network of haskoin-core: Bitcoin and Bitcoin Cash mainnet, testnets and regtest           |
 | Peer discovery  | DNS seeds and addresses relayed by peers, or a static list of peers                             |
-| Peer management | Version handshake, ping-based latency, peers sorted by median ping, rotation after a maximum age, retry backoff and bans for bad addresses |
-| Header sync     | Headers downloaded from one peer at a time, connected to the chain with the most work, stored in RocksDB; new blocks followed whether peers announce them with headers or inventory, and peers polled after a quiet period |
+| Peer management | Version handshake, ping-based latency, peers sorted by median ping, rotation after a maximum age, retry backoff and bans for bad addresses, random choice among learned addresses with one connection per network group |
+| Header sync     | Headers downloaded from one peer at a time, with a deadline per turn, connected to the chain with the most work, stored in RocksDB; new blocks followed whether peers announce them with headers or inventory, announcing peers asked at once, and peers polled after a quiet period |
 | Events          | Best header changes, sync completion, peer connections and every message received              |
-| Data requests   | Fetch blocks and transactions from a peer, with a timeout                                       |
-| Protection      | Strict parsing, per-command size limits, back-pressure, bounded address pool, explicit handshake states |
+| Data requests   | Fetch blocks and transactions from a peer, with a timeout; every block checked against its header's Merkle root and witness commitment |
+| Protection      | Strict parsing, per-command size limits, linear-time reads, back-pressure, bounded address pool, explicit handshake states, connect timeout |
 
 ### What is not included
 
@@ -202,13 +208,14 @@ extra-deps:
 This program connects to Bitcoin, syncs headers, and prints what happens:
 
 ```haskell
+{-# LANGUAGE DisambiguateRecordFields #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedRecordDot #-}
 
 import Control.Monad (forever)
 import Data.Default (def)
 import Database.RocksDB (Config (..), withDB)
-import Haskoin (NetworkAddress (..), btc, sockToHostAddress)
+import Haskoin (BlockNode (..), NetworkAddress (..), btc, sockToHostAddress)
 import Haskoin.Node
 import NQE (receive, withPublisher, withSubscription)
 import Network.Socket (SockAddr (..))
@@ -302,7 +309,8 @@ fetch net node bn = getPeers node.peerMgr >>= go
 ### 4. Put it together
 
 Use the configuration from the [quick start](#quick-start), and run the watcher
-inside `withNode`:
+inside `withNode`. Besides the imports of the quick start, the watcher needs
+`Block (..)`, `Network` and `headerHash` from `Haskoin`, and `Inbox` from `NQE`:
 
 ```haskell
 withNode cfg $ \node -> do
@@ -325,13 +333,17 @@ only twenty lines because none of that is its concern.
 
 - The **peer manager** (`Haskoin.Node.PeerMgr`) finds peer addresses, connects
   to them, does the version handshake, pings them, and drops those that are slow,
-  silent, misbehaving or too old. An address whose connection failed is tried
-  again later each time, and one whose peer misbehaved waits a day.
+  silent, misbehaving or too old. Configured peers are tried first; learned
+  addresses are picked at random, at most one per network group. An address
+  whose connection failed is tried again later each time, and one whose peer
+  misbehaved waits a day.
 - The **chain** (`Haskoin.Node.Chain`) asks one peer at a time for headers,
   connects them to the headers it has, follows the chain with the most work, and
   stores the headers in RocksDB. It asks a peer for headers whenever the peer
-  announces blocks it does not know, with headers or with inventory, and asks
-  every peer when it has heard nothing for `timeout` seconds.
+  announces blocks it does not know, with headers or with inventory, at once if
+  another peer holds the turn, and asks every peer when it has heard nothing
+  for `timeout` seconds. A turn ends when the peer has nothing more, sends a
+  full batch with nothing new, or runs past its deadline.
 
 The rules for talking to peers are pure state machines, each in its own module:
 
@@ -347,6 +359,10 @@ The rules for talking to peers are pure state machines, each in its own module:
 The processes store the state and carry out what a transition says. Time is an
 input to the transitions, so every timing rule is tested without waiting.
 
+`Haskoin.Node.Block` is a pure check of another kind: whether the
+transactions of a block are the ones its header commits to. Every block a peer
+sends passes through it.
+
 Each peer connection is its own process (`Haskoin.Node.Peer`), run by a
 supervisor inside the peer manager.
 
@@ -360,7 +376,14 @@ Everything is published to the `Publisher NodeEvent` in the configuration:
 | `ChainEvent (ChainSynced node)`         | Headers caught up with the network (once)               |
 | `PeerEvent (PeerConnected peer)`        | A peer finished the handshake                           |
 | `PeerEvent (PeerDisconnected peer)`     | An online peer went away                                |
-| `PeerEvent (PeerMessage peer msg)`      | A peer sent a message: `MInv`, `MBlock`, `MTx` and so on |
+| `PeerEvent (PeerMessage peer msg)`      | An online peer sent a message: `MInv`, `MBlock`, `MTx` and so on |
+
+Messages are published only from peers that are online, except `version` and
+`verack`, which are the handshake itself. A block in an `MBlock` message has
+passed `blockMutation`: its transactions hash to the Merkle root of its header,
+and its witness data matches its coinbase when the node knows its parent.
+Nothing else about it is checked, and a transaction in an `MTx` message is not
+checked at all.
 
 "In sync" means the best header is less than two hours old, has at least the
 minimum chain work of the network, and no peer is left to sync from.
@@ -369,8 +392,10 @@ minimum chain work of the network, and no peer is left to sync from.
 
 A peer may have at most 16 messages published and not yet handled by the node.
 Past that, the node stops reading its socket, so a fast peer fills its own TCP
-window instead of the node's memory. Your subscriber should keep reading events;
-a subscription that falls far behind holds memory.
+window instead of the node's memory. The node does not wait for your
+subscriber, though: a subscription is an unbounded queue, and one that falls
+behind holds every event it has not read. Keep reading events, and hand slow
+work to another thread.
 
 ### Database layout
 
@@ -404,6 +429,13 @@ case ps of
 `getBlocks`, `getTxs` and `getData` return `Nothing` if the peer does not send
 everything, in order, before the timeout in seconds. Unrelated messages that the
 peer sends in between are ignored. `pingPeer` measures a round trip.
+
+A block that `getBlocks` returns holds the transactions its header commits to.
+A peer that sends another block under the requested header is disconnected,
+and the request gives `Nothing` when it times out. The transactions are not
+validated otherwise. A transaction from `getTxs` is matched by its id, which
+does not cover its witness, so treat its witness data as unauthenticated until
+you find the transaction in a block.
 
 `getPeers` leaves out peers that are being disconnected, even before their
 connection closes.
@@ -446,11 +478,16 @@ cfg {peers = ["node1.example.com", "10.0.0.5:8333", "[2001:db8::1]:8333"], disco
 
 A peer without a port uses the default port of the network.
 
+Addresses from DNS seeds must be public, like relayed addresses. On regtest the
+seed of haskoin-core is `localhost`, which is not, so list local peers in
+`peers` instead of relying on discovery.
+
 ### Custom connections
 
 `connect` decides how to open a connection. `withConnection` opens a plain TCP
-socket. Replace it to go through a proxy, or to plug in mock peers in tests, as
-the test suite does.
+socket, and gives up if it does not open within five seconds (`connectTimeout`,
+as in Bitcoin Core). Replace it to go through a proxy, or to plug in mock peers
+in tests, as the test suite does.
 
 ### Logging
 
@@ -483,6 +520,7 @@ own `push` function to log elsewhere.
 | -------------- | --------------------------------------------------------------------------- |
 | Node           | `NodeConfig`, `NodeEvent`, `Node`, `withNode`, `withConnection`              |
 | Peers          | `Peer`, `PeerEvent`, `PeerException`, `sendMessage`, `getBlocks`, `getTxs`, `getData`, `pingPeer`, `killPeer`, `newOwner`, `reservePeer`, `releasePeer` |
+| Blocks         | `blockMutation`, `BlockMutation`, `witnessCheck`, `WitnessCheck`, `segWitHeight` |
 | Peer manager   | `PeerMgr`, `OnlinePeer`, `PeerState`, `Stage`, `DisconnectReason`, `getPeers`, `getOnlinePeer`, `toSockAddr`, `isRoutable` |
 | Chain          | `Chain`, `ChainEvent`, `chainGetBest`, `chainGetBlock`, `chainGetAncestor`, `chainGetParents`, `chainGetSplitBlock`, `chainBlockMain`, `chainIsSynced`, `chainRunHeaders` |
 | Logging        | `Logger`, `LogLevel`, `withLogger`, `withSource`, `logDebug` ... `logError`  |
@@ -497,6 +535,7 @@ Every module is exposed and can be imported on its own:
 | `Haskoin.Node.Peer`              | The process that talks to one peer, and data requests       |
 | `Haskoin.Node.Peer.Request`      | State machine for receiving requested blocks and transactions |
 | `Haskoin.Node.Peer.Lock`         | State machine for reserving a peer                          |
+| `Haskoin.Node.Block`             | Whether a block holds the transactions its header commits to |
 | `Haskoin.Node.PeerMgr`           | Finds, connects, ranks and drops peers                      |
 | `Haskoin.Node.PeerMgr.Lifecycle` | State machine for the life of a connection                  |
 | `Haskoin.Node.PeerMgr.Handshake` | State machine for the version handshake                     |
@@ -504,27 +543,49 @@ Every module is exposed and can be imported on its own:
 | `Haskoin.Node.Chain`             | Keeps the header chain in sync                              |
 | `Haskoin.Node.Chain.Sync`        | State machine that decides which peer to ask for headers, and when the chain is synced |
 | `Haskoin.Node.Chain.Database`    | Storage of headers in RocksDB                               |
-| `Haskoin.Node.Address`           | Parsing peer addresses and opening connections              |
+| `Haskoin.Node.Address`           | Parsing peer addresses, network groups and opening connections |
 | `Haskoin.Node.Logger`            | Logging                                                     |
 
 ## Security notes
 
 - Every message header is checked before its payload is read. The payload limit
-  is the `maxPayloadSize` of the command on the network: on Bitcoin Cash, 2 MiB
-  for everything but block messages.
+  is the `maxPayloadSize` of the command on the network: 4,000,000 bytes on
+  Bitcoin, and on Bitcoin Cash 2 MiB for everything but block messages.
+- Reading a payload costs time and memory linear in its size, however small
+  the pieces it arrives in.
 - List messages are refused as soon as their count is over the limit, such as
-  2000 headers, 1000 addresses or 50000 inventory entries.
+  2000 headers, 1000 addresses, 50000 inventory entries or 101 locator hashes.
 - A peer that sends anything invalid is disconnected, with a `PeerException`
   saying why.
+- A peer that sends a block whose transactions are not the ones its header
+  commits to is disconnected (`MutatedBlock`). The check is Bitcoin Core's
+  `IsBlockMutated`: the Merkle root, a tree that repeats transactions
+  (CVE-2012-2459), and, once SegWit is active at the block's height, the
+  witness commitment. The header itself is not marked invalid. When the node
+  does not know the parent of a block, its witness data is not checked.
+- Messages from a peer that has not completed the handshake are not acted on
+  or published, except the handshake messages.
+- On Bitcoin, a peer must offer witness data (`NODE_WITNESS`) as well as the
+  full chain, as Bitcoin Core requires of its outbound peers.
 - A peer that sends a second version or verack, or does not complete the
   handshake within `timeout` seconds even while sending other messages, is
   disconnected.
 - A peer that sends invalid headers, or does not answer a request for headers in
   time, is never asked for headers again before it disconnects.
-- Addresses relayed by peers are only used if they are public unicast
-  addresses, so a peer cannot make the node connect to services on its own host
-  or network. Static peers are not checked.
-- At most 4096 relayed addresses are kept.
+- A syncing peer whose full batch of headers brings nothing new loses its
+  turn. One that is still syncing after 15 minutes plus 1 millisecond for each
+  block expected since the best header is disconnected when another peer can
+  take over, as Bitcoin Core does.
+- Addresses relayed by peers and returned by DNS seeds are only used if they
+  are public unicast addresses, so a peer or a resolver cannot make the node
+  connect to services on its own host or network. Static peers are not checked.
+- Learned addresses are picked at random, and at most one connection is open to
+  each network group (a /16 of IPv4, a /32 of IPv6), so one operator cannot take
+  every slot. Static peers are exempt.
+- At most 4096 relayed addresses and 4096 seed addresses are kept, apart, so
+  gossip cannot crowd out the seeds. When the room for one is full, a new
+  address replaces one that has failed to connect.
+- A connection that does not open within five seconds is given up.
 - An address whose connection fails waits twice as long after each failure
   before it is tried again, up to ten minutes. A relayed address whose peer
   broke the protocol is not tried again for a day. Static peers are never
@@ -532,8 +593,13 @@ Every module is exposed and can be imported on its own:
 - Headers are not reported as synced until they have the minimum chain work of
   the network. Above that work, forks from far below the tip on a chain with
   less work are refused.
-- The node trusts the chain with the most work. It does not validate blocks:
-  check the data you get from peers before relying on it.
+- Below that work, during the initial sync, every valid header is stored. A
+  peer can make the node store a fork of low difficulty, at the cost of its
+  proof of work. Bitcoin Core first checks that a peer's headers reach the
+  minimum work before it stores any; this node does not yet.
+- The node trusts the chain with the most work. It checks that a block holds
+  the transactions its header commits to, but does not validate the block:
+  check the transactions you get from peers before relying on them.
 
 ## Development
 

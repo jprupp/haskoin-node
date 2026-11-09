@@ -2,9 +2,11 @@
 module Haskoin.Node.PeerSpec (spec) where
 
 import Control.Concurrent.Async (ExceptionInLinkedThread (..))
-import Control.Monad (forM_)
+import Conduit (sinkNull, yieldMany)
+import Control.Monad (forM_, forever)
 import Data.ByteString qualified as B
 import Data.Serialize (putWord32le, runPut)
+import Data.Int (Int64)
 import Data.Word (Word32)
 import Haskoin
 import Haskoin.Node
@@ -17,6 +19,7 @@ import Test.Hspec.QuickCheck (prop)
 import Test.QuickCheck (Positive (..), ioProperty)
 import UnliftIO
 import UnliftIO.Concurrent (threadDelay)
+import System.Mem (getAllocationCounter)
 
 data PeerTest = PeerTest
   { peer :: !Peer,
@@ -25,12 +28,28 @@ data PeerTest = PeerTest
     thread :: !(Async ())
   }
 
--- | Run a peer process connected to a remote that the test drives.
+-- | Run a peer process connected to a remote that the test drives. The peer
+-- knows no block headers.
 withPeerTest :: Network -> (PeerTest -> IO a) -> IO a
-withPeerTest net f = do
+withPeerTest net = withPeerTestKnowing net []
+
+-- | Run a peer process that knows blocks with the given hashes at the given
+-- heights, as if the node had stored their headers. Only the height of a
+-- known block matters to the peer, so the header in its node is a stand-in.
+withPeerTestKnowing ::
+  Network -> [(BlockHash, BlockHeight)] -> (PeerTest -> IO a) -> IO a
+withPeerTestKnowing net known f = do
   rv <- newEmptyMVar
   let script r = putMVar rv r >> forever_wait
       forever_wait = threadDelay maxBound >> forever_wait
+      lookup_block h = return (node_at <$> lookup h known)
+      node_at height =
+        BlockNode
+          { header = net.genesisHeader,
+            height = height,
+            work = 0,
+            skip = headerHash net.genesisHeader
+          }
   withTestLogger $ \logger ->
     withPublisher $ \pub ->
       withSubscription pub $ \events -> do
@@ -43,7 +62,8 @@ withPeerTest net f = do
                   net = net,
                   label = "remote",
                   connect = memoryConnection net script,
-                  logger = logger
+                  logger = logger,
+                  lookupBlock = lookup_block
                 }
             p = wrapPeer cfg busy pending mailbox
         withAsync (peer cfg p inbox) $ \thread -> do
@@ -85,6 +105,41 @@ expectRunning t =
     Nothing -> return ()
     Just r -> assertFailure $ "Peer process stopped: " <> show r
 
+-- | Bytes allocated by a peer process to read one message of the given
+-- payload size on Bitcoin, sent in pieces of 1460 bytes, the payload of a
+-- full TCP segment. The counter is read in the thread that reads the
+-- message, before the first piece and once the message has been passed on.
+readAllocation :: Int -> IO Int64
+readAllocation size = do
+  let bs = encodeMessage btc (MOther "zz" (B.replicate size 0))
+      pieces = chunks (repeat 1460) bs
+  _ <- evaluate (sum (map B.length pieces))
+  start <- newEmptyMVar
+  end <- newEmptyMVar
+  let src = do
+        liftIO (getAllocationCounter >>= putMVar start)
+        yieldMany pieces
+        liftIO (getAllocationCounter >>= putMVar end)
+        liftIO (forever (threadDelay maxBound))
+  withTestLogger $ \logger -> withPublisher $ \pub -> do
+    (inbox, mailbox) <- newMailbox
+    busy <- newTVarIO Free
+    pending <- newTVarIO 0
+    let cfg =
+          PeerConfig
+            { pub = pub,
+              net = btc,
+              label = "remote",
+              connect = \f -> f (Conduits src sinkNull),
+              logger = logger,
+              lookupBlock = \_ -> return Nothing
+            }
+    withAsync (peer cfg (wrapPeer cfg busy pending mailbox) inbox) $ \_ -> do
+      counter0 <- within 30 "first piece" (readMVar start)
+      counter1 <- within 30 "message read" (readMVar end)
+      -- the counter goes down as the thread allocates
+      return (counter0 - counter1)
+
 -- | Chop a byte string into pieces of the given sizes.
 chunks :: [Int] -> B.ByteString -> [B.ByteString]
 chunks _ b | B.null b = []
@@ -94,6 +149,21 @@ chunks (n : ns) b = let (x, y) = B.splitAt (max 1 n) b in x : chunks ns y
 -- | Valid message with the payload length field replaced.
 withLength :: Word32 -> B.ByteString -> B.ByteString
 withLength len bs = B.take 16 bs <> runPut (putWord32le len) <> B.drop 20 bs
+
+-- | A version message with a user agent of the given length.
+withUserAgent :: Int -> Version -> Version
+withUserAgent n v =
+  Version
+    { version = v.version,
+      services = v.services,
+      timestamp = v.timestamp,
+      addrRecv = v.addrRecv,
+      addrSend = v.addrSend,
+      nonce = v.nonce,
+      userAgent = VarString (B.replicate n 0x61),
+      startHeight = v.startHeight,
+      relay = v.relay
+    }
 
 spec :: Spec
 spec = do
@@ -105,6 +175,9 @@ spec = do
       bhash b = headerHash b.header
       block_iv :: Block -> InvVector
       block_iv b = InvVector InvWitnessBlock (bhash b).get
+      -- the parent of 'coreSegWitBlock', block 301 of its chain
+      parent302 = "7bd5bfebea6d3194d92f9f292bc57d82c884f72c53bb11f529c8973fb63e52b9"
+      stripped b = b {txs = [tx {witness = []} | tx <- b.txs]}
   describe "peer message framing" $ do
     it "parses messages split across arbitrary chunks" $
       withPeerTest net $ \t -> do
@@ -135,6 +208,29 @@ spec = do
     it "sends messages to the remote" $ withPeerTest net $ \t -> do
       MPing (Ping 9) `sendMessage` t.peer
       remoteReceiveMatch 5 "ping" t.remote Just `shouldReturn` MPing (Ping 9)
+
+  describe "peer reading" $ do
+    it "allocates in proportion to the size of a message sent in 1460-byte pieces" $ do
+      -- Reading should cost memory linear in the size of the message, as in
+      -- Bitcoin Core, which reads into one buffer. Twice the size should then
+      -- cost about twice the allocation; a cost that grows with the square of
+      -- the size would cost about four times. 4,000,000 bytes is the largest
+      -- message Bitcoin allows.
+      small <- readAllocation 2000000
+      large <- readAllocation 4000000
+      fromIntegral large / fromIntegral small `shouldSatisfy` (< (2.5 :: Double))
+
+    it "stops reading a peer that has 16 messages waiting to be handled" $
+      withPeerTest net $ \t -> do
+        -- The node keeps at most 16 messages from a peer waiting.
+        forM_ [1 .. 20] $ \i -> remoteSend t.remote (MPing (Ping i))
+        got <- mapM (const (received t)) [1 .. 16 :: Int]
+        got `shouldBe` [MPing (Ping i) | i <- [1 .. 16]]
+        expectNothingWithin 1 "a 17th message" t.events $ \case
+          PeerMessage _ _ -> Just ()
+          _ -> Nothing
+        peerMessageDone t.peer
+        received t `shouldReturn` MPing (Ping 17)
 
   describe "peer protocol violations" $ do
     it "disconnects on wrong network magic" $ withPeerTest net $ \t -> do
@@ -167,6 +263,59 @@ spec = do
       expectFailure t $ \case
         InvalidPayload MCPing _ -> True
         _ -> False
+
+    it "disconnects a peer that announces a message over 4,000,000 bytes on Bitcoin" $
+      withPeerTest btc $ \t -> do
+        -- Bitcoin Core: MAX_PROTOCOL_MESSAGE_LENGTH = 4,000,000. Only the
+        -- header is sent.
+        let bs = encodeMessage btc (MTx (coinbaseTx 0 0))
+        remoteSendRaw t.remote (B.take 24 (withLength 4000001 bs))
+        expectFailure t $ \case
+          MessageTooLarge MCTx 4000001 -> True
+          _ -> False
+
+    it "disconnects a peer that sends an inventory of 50,001 items" $
+      withPeerTest net $ \t -> do
+        -- Bitcoin Core: MAX_INV_SZ = 50,000
+        remoteSend t.remote (MInv (Inv (replicate 50001 (block_iv b0))))
+        expectFailure t $ \case
+          InvalidPayload MCInv _ -> True
+          _ -> False
+
+    it "accepts an inventory of 50,000 items" $ withPeerTest net $ \t -> do
+      remoteSend t.remote (MInv (Inv (replicate 50000 (block_iv b0))))
+      received t >>= \case
+        MInv (Inv ivs) -> length ivs `shouldBe` 50000
+        m -> assertFailure ("Unexpected message: " <> show (msgType m))
+
+    it "disconnects a peer that sends a locator of 102 hashes" $
+      withPeerTest net $ \t -> do
+        -- Bitcoin Core: MAX_LOCATOR_SZ = 101
+        let gh = GetHeaders {version = 70012, locator = replicate 102 (bhash b0), stop = bhash b0}
+        remoteSend t.remote (MGetHeaders gh)
+        expectFailure t $ \case
+          InvalidPayload MCGetHeaders _ -> True
+          _ -> False
+
+    it "accepts a locator of 101 hashes" $ withPeerTest net $ \t -> do
+      let gh = GetHeaders {version = 70012, locator = replicate 101 (bhash b0), stop = bhash b0}
+      remoteSend t.remote (MGetHeaders gh)
+      received t `shouldReturn` MGetHeaders gh
+
+    it "disconnects a peer whose user agent is 257 bytes long" $
+      withPeerTest net $ \t -> do
+        -- Bitcoin Core: MAX_SUBVERSION_LENGTH = 256
+        v <- remoteVersion net nodeNetwork 1
+        remoteSend t.remote (MVersion (withUserAgent 257 v))
+        expectFailure t $ \case
+          InvalidPayload MCVersion _ -> True
+          _ -> False
+
+    it "accepts a user agent of 256 bytes" $ withPeerTest net $ \t -> do
+      v <- remoteVersion net nodeNetwork 1
+      let v' = withUserAgent 256 v
+      remoteSend t.remote (MVersion v')
+      received t `shouldReturn` MVersion v'
 
     it "disconnects when the remote closes the connection" $
       withPeerTest net $ \t -> do
@@ -227,6 +376,59 @@ spec = do
     it "times out when the peer does not answer" $
       withPeerTest net $ \t ->
         getBlocks net 1 t.peer [bhash b0] `shouldReturn` Nothing
+
+    it "gives nothing and drops a peer whose block does not match its header" $
+      withPeerTest net $ \t -> do
+        let forged = Block {header = b0.header, txs = [coinbaseTx 99 7]}
+            f = \case
+              MGetData _ -> [MBlock forged]
+              m -> pong m
+        serve t f $ getBlocks net 2 t.peer [bhash b0] `shouldReturn` Nothing
+        expectFailure t $ \case
+          MutatedBlock h BadMerkleRoot -> h == bhash b0
+          _ -> False
+
+    it "returns a SegWit block that Bitcoin Core mined, with its witness" $
+      withPeerTestKnowing net [(parent302, 301)] $ \t -> do
+        let f = \case
+              MGetData _ -> [MBlock coreSegWitBlock]
+              m -> pong m
+        serve t f $
+          getBlocks net 5 t.peer [bhash coreSegWitBlock]
+            `shouldReturn` Just [coreSegWitBlock]
+
+    it "gives nothing and drops a peer that stripped the witness of a SegWit block" $
+      withPeerTestKnowing net [(parent302, 301)] $ \t -> do
+        let f = \case
+              MGetData _ -> [MBlock (stripped coreSegWitBlock)]
+              m -> pong m
+        serve t f $ getBlocks net 2 t.peer [bhash coreSegWitBlock] `shouldReturn` Nothing
+        expectFailure t $ \case
+          MutatedBlock _ BadWitnessNonceSize -> True
+          _ -> False
+
+    it "gives nothing and drops a peer that repeats the last transaction of a block" $
+      withPeerTestKnowing net [(parent302, 301)] $ \t -> do
+        -- CVE-2012-2459: the repeated transaction keeps the Merkle root.
+        let b = coreSegWitBlock {txs = coreSegWitBlock.txs <> drop 2 coreSegWitBlock.txs}
+            f = \case
+              MGetData _ -> [MBlock b]
+              m -> pong m
+        serve t f $ getBlocks net 2 t.peer [bhash coreSegWitBlock] `shouldReturn` Nothing
+        expectFailure t $ \case
+          MutatedBlock _ DuplicateTransactions -> True
+          _ -> False
+
+    it "does not check the witness of a block whose parent it does not know" $
+      withPeerTest net $ \t -> do
+        -- Bitcoin Core does not check it either: without the parent, the
+        -- height and so the witness rule are unknown.
+        let f = \case
+              MGetData _ -> [MBlock (stripped coreSegWitBlock)]
+              m -> pong m
+        serve t f $
+          getBlocks net 5 t.peer [bhash coreSegWitBlock]
+            `shouldReturn` Just [stripped coreSegWitBlock]
 
     it "downloads transactions" $ withPeerTest net $ \t -> do
       let txs = concatMap (.txs) blocks

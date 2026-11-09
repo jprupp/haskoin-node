@@ -43,7 +43,7 @@ where
 
 import Data.Bits ((.&.))
 import Data.Word (Word64)
-import Haskoin (Version (..), nodeNetwork)
+import Haskoin (Network (..), Version (..), nodeNetwork, nodeWitness)
 
 -- | How far the handshake with a peer has progressed.
 data Handshake
@@ -81,6 +81,8 @@ data HandshakeError
     DuplicateVerAck
   | -- | the peer does not serve the full block chain
     NotFullNode
+  | -- | the peer does not serve witness data, on a network with SegWit
+    NotWitnessNode
   | -- | the version carries one of our own nonces: we connected to ourselves
     ConnectedToSelf
   deriving stock (Eq, Show)
@@ -128,15 +130,20 @@ hasVerAck = \case
   Established _ -> True
   _ -> False
 
--- | Check the version of a peer before accepting it. Takes the nonces of the
--- version messages that we sent to all our peers.
+-- | Check the version of a peer before accepting it. Takes the network and
+-- the nonces of the version messages that we sent to all our peers.
 --
 -- A peer must serve the full chain ('nodeNetwork'), because the node syncs
--- headers and applications download blocks from it. A version carrying one of
--- our nonces means the node connected to itself, which happens when it learns
--- its own address from gossip.
-checkVersion :: [Word64] -> Version -> Either HandshakeError Version
-checkVersion nonces v
+-- headers and applications download blocks from it. On a network with SegWit
+-- it must also serve witness data ('nodeWitness'), because
+-- 'Haskoin.Node.Peer.getBlocks' and 'Haskoin.Node.Peer.getTxs' ask for
+-- blocks and transactions with their witness. Bitcoin Core
+-- 32.1 requires both of its outbound peers (@GetDesirableServiceFlags@). A
+-- version carrying one of our nonces means the node connected to itself,
+-- which happens when it learns its own address from gossip.
+checkVersion :: Network -> [Word64] -> Version -> Either HandshakeError Version
+checkVersion net nonces v
   | v.services .&. nodeNetwork == 0 = Left NotFullNode
+  | net.segWit && v.services .&. nodeWitness == 0 = Left NotWitnessNode
   | v.nonce `elem` nonces = Left ConnectedToSelf
   | otherwise = Right v

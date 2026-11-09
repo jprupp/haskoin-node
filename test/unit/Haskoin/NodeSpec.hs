@@ -27,7 +27,9 @@ import Database.RocksDB qualified as R
 import Haskoin
 import Haskoin.Node
 import NQE
-import Network.Socket (SockAddr (..), tupleToHostAddress, tupleToHostAddress6)
+import Data.Word (Word32, Word8)
+import Haskoin.Node.Test (eventually)
+import Network.Socket (PortNumber, SockAddr (..), tupleToHostAddress, tupleToHostAddress6)
 import System.Random (randomIO)
 import Test.Hspec
 import UnliftIO
@@ -39,7 +41,9 @@ data TestNode = TestNode
     nodeEvents :: Inbox NodeEvent,
     testDB :: R.DB,
     -- | how many getheaders messages the mock peer has received
-    getHeadersCount :: TVar Int
+    getHeadersCount :: TVar Int,
+    -- | every address the node tried to connect to, newest first
+    attempts :: TVar [SockAddr]
   }
 
 -- | What the mock peer sends back for each message: a message to serialize
@@ -51,7 +55,11 @@ data TestOpts = TestOpts
   { react :: React,
     -- | runs on the database before the node starts
     setup :: R.DB -> IO (),
-    timeout :: NominalDiffTime
+    timeout :: NominalDiffTime,
+    -- | connect to seeds and relayed addresses
+    discover :: Bool,
+    -- | the static peers of the configuration
+    staticPeers :: [String]
   }
 
 defOpts :: [Block] -> TestOpts
@@ -59,7 +67,10 @@ defOpts blocks =
   TestOpts
     { react = map Right . mockPeerReact blocks,
       setup = \_ -> return (),
-      timeout = 120
+      timeout = 120,
+      discover = False,
+      -- IPv4, so that the mock peer is reachable without IPv6
+      staticPeers = ["127.0.0.1:17486"]
     }
 
 -- | Connect to a mock peer that reacts to messages like this.
@@ -155,8 +166,11 @@ spec = do
       -- while every other message is limited to 2 MiB (2097152 bytes).
       let script = B.replicate 3000000 0x6a
           tx = Tx 1 [TxIn nullOutPoint B.empty maxBound] [TxOut 0 script] [] 0
+          -- a header that commits to the transaction, or the node would
+          -- refuse the block as not the one its header names
+          root = either error id (buildMerkleRoot [txHash tx])
           big = case allBlocks of
-            firstBlock : _ -> Block firstBlock.header [tx]
+            firstBlock : _ -> Block firstBlock.header {merkle = root} [tx]
             [] -> error "no test blocks"
       withTestNodeBlocks [big] net "big-block" $ \TestNode {..} -> do
         p <- waitForPeer nodeEvents
@@ -174,7 +188,7 @@ spec = do
   describe "untrusted peers" $ do
     it "imports a full batch of 2000 headers"
       $ withTestNodeOpts
-        (defOpts allBlocks) {react = reactAfterVerAck [Right (manyHeaders net 2000)]}
+        (defOpts allBlocks) {react = reactWhenOnline [Right (manyHeaders net 2000)]}
         net
         "full-batch"
       $ \TestNode {..} -> do
@@ -185,7 +199,7 @@ spec = do
         bn.height `shouldBe` 2000
     it "disconnects a peer that sends more than 2000 headers"
       $ withTestNodeOpts
-        (defOpts allBlocks) {react = reactAfterVerAck [Right (manyHeaders net 2001)]}
+        (defOpts allBlocks) {react = reactWhenOnline [Right (manyHeaders net 2001)]}
         net
         "too-many-headers"
       $ \TestNode {..} -> do
@@ -196,7 +210,7 @@ spec = do
       let na = NetworkAddress 0 (sockToHostAddress (SockAddrInet 8333 0x08080808))
           addrs = MAddr (Addr (replicate 1001 (0, na)))
       withTestNodeOpts
-        (defOpts allBlocks) {react = reactAfterVerAck [Right addrs]}
+        (defOpts allBlocks) {react = reactWhenOnline [Right addrs]}
         net
         "too-many-addrs"
         $ \TestNode {..} -> do
@@ -205,7 +219,7 @@ spec = do
     it "disconnects a peer that sends the wrong network magic" $ do
       let bad = runPut (putMessage btc (MPing (Ping 1)))
       withTestNodeOpts
-        (defOpts allBlocks) {react = reactAfterVerAck [Left bad]}
+        (defOpts allBlocks) {react = reactWhenOnline [Left bad]}
         net
         "wrong-magic"
         $ \TestNode {..} -> do
@@ -219,7 +233,7 @@ spec = do
             runPut . put $
               MessageHeader net.magic MCTx 2097153 (checkSum32 B.empty)
       withTestNodeOpts
-        (defOpts allBlocks) {react = reactAfterVerAck [Left oversized]}
+        (defOpts allBlocks) {react = reactWhenOnline [Left oversized]}
         net
         "oversized-tx"
         $ \TestNode {..} -> do
@@ -227,7 +241,7 @@ spec = do
           waitForDisconnect nodeEvents p
     it "disconnects a peer that sends a second verack"
       $ withTestNodeOpts
-        (defOpts allBlocks) {react = reactAfterVerAck [Right MVerAck]}
+        (defOpts allBlocks) {react = reactWhenOnline [Right MVerAck]}
         net
         "duplicate-verack"
       $ \TestNode {..} -> do
@@ -261,6 +275,68 @@ spec = do
         $ \TestNode {..} -> do
           p <- waitForPeer nodeEvents
           waitForDisconnect nodeEvents p
+    it "publishes no message from a peer that has not completed the handshake" $ do
+      -- The mock peer sends its version, then a message instead of a verack.
+      let react = \case
+            MVersion _ -> [Right (MOther "zz" "early")]
+            _ -> []
+      withTestNodeOpts (defOpts allBlocks) {react = react} net "early-message" $
+        \TestNode {..} -> do
+          -- the version is the handshake itself, and is published
+          receiveMatch nodeEvents $ \case
+            PeerEvent (PeerMessage _ (MVersion _)) -> Just ()
+            _ -> Nothing
+          early <- timeout (2 * 1000 * 1000) . receiveMatch nodeEvents $ \case
+            PeerEvent (PeerMessage _ (MOther "zz" _)) -> Just ()
+            _ -> Nothing
+          early `shouldBe` Nothing
+    it "publishes the messages of a peer that is online" $ do
+      let react = reactWhenOnline [Right (MOther "zz" "late")]
+      withTestNodeOpts (defOpts allBlocks) {react = react} net "late-message" $
+        \TestNode {..} -> do
+          late <- timeout (10 * 1000 * 1000) . receiveMatch nodeEvents $ \case
+            PeerEvent (PeerMessage _ (MOther "zz" payload)) -> Just payload
+            _ -> Nothing
+          late `shouldBe` Just "late"
+    it "does not connect to a private address that an online peer relays" $ do
+      let private = v4At (10, 1, 2, 3) 8333
+          public = v4At (8, 8, 4, 4) 8333
+          relay = MAddr (Addr [relayed private, relayed public])
+      withTestNodeOpts
+        (defOpts allBlocks) {react = reactWhenOnline [Right relay], discover = True}
+        net
+        "relay-private"
+        $ \TestNode {..} -> do
+          -- the public address shows that the relayed addresses were learned
+          eventually 30 "public address tried" $ elem public <$> readTVarIO attempts
+          -- the node tries a new address every 0.1 to 5 seconds
+          threadDelay (6 * 1000 * 1000)
+          readTVarIO attempts >>= (`shouldNotContain` [private])
+    it "connects to at most one relayed address of each network group" $ do
+      let sameGroup = [v4At (45, 1, 2, 3) p | p <- [1000 .. 1015]]
+          others = [v4At (46, 1, 0, 1) 8333, v4At (47, 2, 0, 1) 8333]
+          relay = MAddr (Addr (map relayed (sameGroup <> others)))
+      withTestNodeOpts
+        (defOpts allBlocks) {react = reactWhenOnline [Right relay], discover = True}
+        net
+        "relay-same-group"
+        $ \TestNode {..} -> do
+          eventually 30 "addresses of the other groups tried" $
+            (\tried -> all (`elem` tried) others) <$> readTVarIO attempts
+          threadDelay (6 * 1000 * 1000)
+          tried <- readTVarIO attempts
+          length (filter (`elem` sameGroup) tried) `shouldBe` 1
+    it "does not connect to a DNS seed result that is not routable" $
+      -- The seed of regtest is localhost, which resolves to loopback
+      -- addresses. With no static peers, nothing else could be tried.
+      withTestNodeOpts
+        (defOpts allBlocks) {discover = True, staticPeers = []}
+        net
+        "seed-loopback"
+        $ \TestNode {..} -> do
+          -- the node tries a new address every 0.1 to 5 seconds
+          threadDelay (6 * 1000 * 1000)
+          readTVarIO attempts `shouldReturn` []
     it "does not connect to private addresses that peers relay" $ do
       let v4 a b c d p = SockAddrInet p (tupleToHostAddress (a, b, c, d))
           v6 t p = SockAddrInet6 p 0 (tupleToHostAddress6 t) 0
@@ -362,6 +438,14 @@ spec = do
         forM_ (zip ps hs) $ \(p, h) ->
           headerHash p.header `shouldBe` h
 
+-- | An IPv4 socket address.
+v4At :: (Word8, Word8, Word8, Word8) -> PortNumber -> SockAddr
+v4At a p = SockAddrInet p (tupleToHostAddress a)
+
+-- | An address as a peer relays it in an addr message.
+relayed :: SockAddr -> (Word32, NetworkAddress)
+relayed sa = (0, NetworkAddress nodeNetwork (sockToHostAddress sa))
+
 -- | Wait for the node to disconnect from this peer, failing after a while.
 waitForDisconnect :: Inbox NodeEvent -> Peer -> IO ()
 waitForDisconnect inbox p =
@@ -374,11 +458,16 @@ waitForDisconnect inbox p =
         PeerEvent (PeerDisconnected p') | p == p' -> Just ()
         _ -> Nothing
 
--- | Mock peer that answers the handshake and pings, and sends these right
--- after its version ack.
-reactAfterVerAck :: [Either ByteString Message] -> React
-reactAfterVerAck extra = \case
-  MVersion _ -> Right MVerAck : extra
+-- | Mock peer that answers the handshake and pings, and sends these each
+-- time the node asks it for headers. The chain asks only once the peer is
+-- announced as connected, so the messages cannot overtake the announcement.
+-- Sent right after the verack, they raced with it: a peer that misbehaved at
+-- once could die before the node handled its verack, and was then never
+-- announced.
+reactWhenOnline :: [Either ByteString Message] -> React
+reactWhenOnline extra = \case
+  MVersion _ -> [Right MVerAck]
+  MGetHeaders _ -> extra
   MPing (Ping n) -> [Right (MPong (Pong n))]
   _ -> []
 
@@ -402,11 +491,17 @@ freshHeader net = do
       0
       genesis {version = 4, prev = headerHash genesis, timestamp = now}
 
+-- | Wait for a peer to be announced, failing after a while.
 waitForPeer :: Inbox NodeEvent -> IO Peer
 waitForPeer inbox =
-  receiveMatch inbox $ \case
-    PeerEvent (PeerConnected p) -> Just p
-    _ -> Nothing
+  timeout (30 * 1000 * 1000) connected >>= \case
+    Just p -> return p
+    Nothing -> expectationFailure "no peer connected" >> error "unreachable"
+  where
+    connected =
+      receiveMatch inbox $ \case
+        PeerEvent (PeerConnected p) -> Just p
+        _ -> Nothing
 
 withLifted :: ((a -> IO b) -> IO b) -> (a -> IO b) -> IO b
 withLifted w m = withRunInIO $ \io -> w (io . m)
@@ -428,36 +523,40 @@ withTestNodeOpts opts net str f =
       withSubscription pub $ \sub ->
         withLifted (R.withDBCF w cfg cols) $ \db -> do
           count <- newTVarIO 0
+          tried <- newTVarIO []
           opts.setup db
-          withNode (nodeConfig count pub db) $ \(Node mgr ch) ->
+          withNode (nodeConfig count tried pub db) $ \(Node mgr ch) ->
             f
               TestNode
                 { testMgr = mgr,
                   testChain = ch,
                   nodeEvents = sub,
                   testDB = db,
-                  getHeadersCount = count
+                  getHeadersCount = count,
+                  attempts = tried
                 }
   where
-    nodeConfig count pub db =
+    nodeConfig count tried pub db =
       NodeConfig
         { maxPeers = 20,
           db = db,
           cf = listToMaybe (R.columnFamilies db),
-          -- IPv4, so that the mock peer is reachable without IPv6
-          peers = ["127.0.0.1:17486"],
-          discover = False,
+          peers = opts.staticPeers,
+          discover = opts.discover,
           address = NetworkAddress 0 anywhere,
           net = net,
           pub = pub,
           timeout = opts.timeout,
           maxPeerLife = 48 * 3600,
-          connect =
+          connect = \sa conn -> do
+            atomically $ modifyTVar' tried (sa :)
             dummyPeerConnect
               opts.react
               count
               net
-              (NetworkAddress nodeNetwork anywhere),
+              (NetworkAddress nodeNetwork anywhere)
+              sa
+              conn,
           logger = Logger {level = LevelError, source = "", push = \_ -> return ()}
         }
     anywhere = sockToHostAddress (SockAddrInet 0 0)
