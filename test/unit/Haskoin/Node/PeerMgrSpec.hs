@@ -1,7 +1,8 @@
 -- | Full node connected to scripted remote peers over in-memory connections.
 module Haskoin.Node.PeerMgrSpec (spec) where
 
-import Control.Monad (void, when)
+import Control.Monad (forever, void, when)
+import Data.Time.Clock (diffUTCTime, getCurrentTime)
 import Haskoin
 import Haskoin.Node
 import Haskoin.Node.Test
@@ -9,6 +10,7 @@ import Network.Socket (SockAddr (..))
 import System.Random (randomIO)
 import Test.Hspec
 import UnliftIO
+import UnliftIO.Concurrent (threadDelay)
 
 -- | Node connected to a single remote running the given script. Each
 -- connection attempt runs the script again with the attempt number.
@@ -98,6 +100,30 @@ spec = do
         r <- within 10 "connection" (readMVar remotes)
         eventually 10 "connection closed" (readTVarIO r.closed)
         noPeerConnectedWithin 0.5 t
+
+    it "disconnects a peer that chatters without completing the handshake" $ do
+      remotes <- newEmptyMVar
+      let script _ r = do
+            void (tryPutMVar remotes r)
+            -- never sends a version, but keeps talking
+            forever $ remoteSend r (MPing (Ping 1)) >> threadDelay 200000
+      withScriptedNode net (setTimeout 1) script $ \t -> do
+        r <- within 10 "connection" (readMVar remotes)
+        eventually 10 "connection closed" (readTVarIO r.closed)
+        noPeerConnectedWithin 0.5 t
+
+    it "waits before retrying a peer that failed" $ do
+      times <- newTVarIO []
+      let script _ _ = getCurrentTime >>= \now -> atomically (modifyTVar' times (now :))
+      withScriptedNode net id script $ \_ -> do
+        eventually 20 "two attempts" $ (>= 2) . length <$> readTVarIO times
+        -- the first failure waits two seconds; the connect loop alone could
+        -- retry within a tenth of a second
+        oldestFirst <- reverse <$> readTVarIO times
+        case oldestFirst of
+          first : second : _ ->
+            (second `diffUTCTime` first) `shouldSatisfy` (>= 1.9)
+          _ -> expectationFailure "fewer than two attempts"
 
   describe "node peer maintenance" $ do
     it "answers pings" $ do

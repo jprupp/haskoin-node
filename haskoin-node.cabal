@@ -39,9 +39,12 @@ library
       Haskoin.Node.Logger
       Haskoin.Node.Loop
       Haskoin.Node.Peer
+      Haskoin.Node.Peer.Lock
       Haskoin.Node.Peer.Request
       Haskoin.Node.PeerMgr
+      Haskoin.Node.PeerMgr.Addresses
       Haskoin.Node.PeerMgr.Handshake
+      Haskoin.Node.PeerMgr.Lifecycle
   hs-source-dirs:
       src
   default-extensions:
@@ -117,8 +120,11 @@ test-suite spec
       Haskoin.Node.AddressSpec
       Haskoin.Node.Chain.SyncSpec
       Haskoin.Node.ChainSpec
+      Haskoin.Node.Peer.LockSpec
       Haskoin.Node.Peer.RequestSpec
+      Haskoin.Node.PeerMgr.AddressesSpec
       Haskoin.Node.PeerMgr.HandshakeSpec
+      Haskoin.Node.PeerMgr.LifecycleSpec
       Haskoin.Node.PeerMgrSpec
       Haskoin.Node.PeerSpec
       Haskoin.NodeSpec

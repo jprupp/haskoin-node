@@ -55,11 +55,15 @@ module Haskoin.Node.Chain.Sync
     queuedPeers,
     connectedPeers,
     lastActivity,
+    isSynced,
+    maxTipAge,
   )
 where
 
-import Data.Maybe (listToMaybe)
-import Data.Time.Clock (UTCTime)
+import Data.Maybe (isNothing, listToMaybe)
+import Data.Time.Clock (NominalDiffTime, UTCTime, diffUTCTime)
+import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
+import Haskoin (BlockHeader (..), BlockNode (..), Network (..))
 
 -- | Sync status of a connected peer.
 data PeerStatus
@@ -166,6 +170,27 @@ connectedPeers s = [p | (p, st) <- s.peers, st /= Dropped]
 -- | Last time headers were requested or received, or peers were polled.
 lastActivity :: SyncState p -> UTCTime
 lastActivity s = s.activity
+
+-- | Oldest that the best block may be for the chain to count as synced: two
+-- hours, the most that a block timestamp may be ahead of the network's time.
+maxTipAge :: NominalDiffTime
+maxTipAge = 7200
+
+-- | Whether the header chain counts as synced at the given time: the best
+-- block is at most 'maxTipAge' old, it has the 'minimumChainWork' of the
+-- network, and no peer is being synced against or waiting to be.
+--
+-- Recent headers alone do not prove much: a peer can feed a cheap chain with
+-- fresh timestamps. Bitcoin Core requires the same work before it leaves
+-- initial block download. And while peers are still queued, a better chain may
+-- be about to arrive.
+isSynced :: Network -> UTCTime -> BlockNode -> SyncState p -> Bool
+isSynced net now best s = recent && enough && idle
+  where
+    tipTime = posixSecondsToUTCTime (fromIntegral best.header.timestamp)
+    recent = now `diffUTCTime` tipTime <= maxTipAge
+    enough = best.work >= net.minimumChainWork
+    idle = isNothing (syncingPeer s) && null (queuedPeers s)
 
 setStatus :: (Eq p) => p -> PeerStatus -> SyncState p -> SyncState p
 setStatus p st s = s {peers = map set s.peers}

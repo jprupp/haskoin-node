@@ -11,10 +11,17 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - `chainBlocksAnnounced`: the node passes blocks announced in inventory
   messages to the chain, which asks the peer for headers if it does not know
   them.
-- Pure state machines for the version handshake
-  (`Haskoin.Node.PeerMgr.Handshake`), for choosing which peer to ask for
-  headers (`Haskoin.Node.Chain.Sync`) and for receiving requested blocks and
-  transactions (`Haskoin.Node.Peer.Request`), each with property tests.
+- Pure state machines, each with property tests: the life of a connection
+  (`Haskoin.Node.PeerMgr.Lifecycle`) and its version handshake
+  (`Haskoin.Node.PeerMgr.Handshake`), the address book
+  (`Haskoin.Node.PeerMgr.Addresses`), reserving a peer
+  (`Haskoin.Node.Peer.Lock`), choosing which peer to ask for headers
+  (`Haskoin.Node.Chain.Sync`), and receiving requested blocks and transactions
+  (`Haskoin.Node.Peer.Request`).
+- `isSynced` says whether the header chain counts as synced, as a pure
+  function.
+- `newOwner`, `reservePeer`, `releasePeer` and `peerHolder` reserve a peer for
+  an owner, so that only that owner can release it.
 - `PeerException` says why a peer connection ended, instead of an `error`
   message.
 - `Haskoin.Node.Address` and `Haskoin.Node.Chain.Database` hold code split
@@ -37,10 +44,25 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   the header chain can last.
 - The chain checks for timeouts at intervals of at most a quarter of
   `timeout`, between 0.1 and 20 seconds, instead of every 2 to 20 seconds.
-- Breaking: `OnlinePeer` holds the state of the handshake in a `handshake`
-  field instead of the `verack`, `online` and `version` fields. These are still
-  available as computed fields, so `o.version` and `o.online` keep working, but
-  code that builds or pattern matches `OnlinePeer` records must change.
+- Breaking: `OnlinePeer` holds the state of the connection in a `state` field
+  instead of the `verack`, `online`, `version`, `ping`, `pings`, `connected`
+  and `tickled` fields. These are still available as computed fields, so
+  `o.version` and `o.online` keep working, but code that builds or pattern
+  matches `OnlinePeer` records must change.
+- Breaking: the busy flag of a `Peer` is a lock held by an owner, so `wrapPeer`
+  takes a `TVar (Lock Owner)`. `setBusy` and `setFree` are deprecated: they act
+  for a single owner shared by all their callers, and `setFree` no longer
+  releases a peer that another owner reserved. The chain reserves peers as its
+  own owner.
+- A peer told to disconnect is no longer returned by `getPeers`, and its
+  messages are no longer routed, even before its connection closes.
+- A peer that does not complete the handshake within `timeout` seconds is
+  disconnected, even if it keeps sending other messages.
+- An address whose connection fails waits before it is tried again, twice as
+  long after each failure up to ten minutes, and a relayed address whose peer
+  broke the protocol waits a day. Before, failing addresses were retried
+  within seconds forever. The configured peers and seeds are resolved again at
+  most every five minutes.
 - Breaking: `ChainT` and `runChainT` are removed, along with the
   `BlockHeaders` instances for `ReaderT Chain m` and `ReaderT ChainConfig m`.
   Use `chainRunHeaders` instead. The package no longer uses monad
@@ -58,6 +80,9 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Peers were ranked by the newest ping and the ten fastest ever measured,
+  instead of the last eleven: slow recent pings were dropped. A peer that
+  became slow kept ranking as fast.
 - The header chain stopped following the network when a peer announced new
   blocks with an inventory message instead of headers, which peers do when
   many blocks are found at once. The chain stayed at the old height until the

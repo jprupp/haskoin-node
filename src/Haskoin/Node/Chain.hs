@@ -79,14 +79,14 @@ where
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async (link, withAsync)
 import Control.Concurrent.STM
-import Control.Monad (filterM, unless, when)
+import Control.Monad (filterM, unless, void, when)
 import Data.Function (on)
 import Data.Functor ((<&>))
 import Data.Maybe (isNothing)
 import Data.String.Conversions (cs)
 import Data.Text (Text)
 import Data.Time.Clock
-import Data.Time.Clock.POSIX (posixSecondsToUTCTime, utcTimeToPOSIXSeconds)
+import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
 import Database.RocksDB (ColumnFamily, DB)
 import Haskoin
 import Haskoin.Node.Chain.Database (ChainDB (..), initChainDB, runHeaders)
@@ -148,7 +148,9 @@ data Chain = Chain
     -- | mailbox of the chain process
     mailbox :: !(Mailbox ChainMessage),
     -- | syncing state
-    state :: !(TVar ChainState)
+    state :: !(TVar ChainState),
+    -- | reserves the peer that headers are requested from
+    owner :: !Owner
   }
 
 instance Eq Chain where
@@ -190,7 +192,8 @@ withChain cfg action = do
   (inbox, mailbox) <- newMailbox
   now <- getCurrentTime
   st <- newTVarIO ChainState {sync = emptySync now, beenInSync = False}
-  let ch = Chain {config = cfg, mailbox = mailbox, state = st}
+  owner <- newOwner "Chain"
+  let ch = Chain {config = cfg, mailbox = mailbox, state = st, owner = owner}
   initChainDB cfg.net (configDB cfg)
   withAsync (withClock cfg.timeout mailbox (run ch inbox)) $ \a ->
     link a >> action ch
@@ -317,7 +320,7 @@ checkSync ch = do
       | otherwise -> return ()
 
 -- | Unless a peer is being synced against already, start with the first queued
--- peer that 'setBusy' can reserve. Check whether the chain is synced if there
+-- peer that 'reservePeer' can reserve. Check whether the chain is synced if there
 -- is nobody to sync against.
 syncNext :: Chain -> IO ()
 syncNext ch = do
@@ -326,7 +329,7 @@ syncNext ch = do
   where
     go [] = syncNotif ch
     go (p : ps) =
-      setBusy p >>= \case
+      reservePeer ch.owner p >>= \case
         True -> do
           logDebug ch.config.logger ("Syncing against peer " <> p.label)
           now <- getCurrentTime
@@ -363,7 +366,7 @@ finish ch p = do
   logDebug ch.config.logger ("Releasing syncing peer " <> p.label)
   MSendHeaders `sendMessage` p
   update ch (finishSync p)
-  setFree p
+  void (releasePeer ch.owner p)
   syncNext ch
 
 -- | Disconnect a peer that sent invalid headers or timed out, and move on
@@ -380,7 +383,7 @@ misbehaving ch p why = do
 releaseIfSyncing :: Chain -> Peer -> IO ()
 releaseIfSyncing ch p = do
   syncing <- isSyncing ch p
-  when syncing $ setFree p
+  when syncing . void $ releasePeer ch.owner p
 
 -- | Apply a transition to the sync state.
 update :: Chain -> (SyncState Peer -> SyncState Peer) -> IO ()
@@ -415,28 +418,18 @@ importHeaders ch hs = do
         chainEvent ch (ChainBestBlock after)
       return (Right lst)
 
--- | Publish a 'ChainSynced' event the first time the chain is synced: the best
--- block is less than two hours old, has the 'minimumChainWork' of the network,
--- and no peer is being synced against or waiting to be.
---
--- Bitcoin Core requires the same work before it leaves initial block
--- download. A chain with less work is not the real one, however recent its
--- last block is.
+-- | Publish a 'ChainSynced' event the first time the chain is synced (see
+-- 'isSynced').
 syncNotif :: Chain -> IO ()
 syncNotif ch = do
   best <- withDB ch getBestBlockHeader
   now <- getCurrentTime
-  let recent = now `diffUTCTime` blockTime best <= 7200
-      enough = best.work >= ch.config.net.minimumChainWork
   notify <- atomically $ do
     s <- readTVar ch.state
-    let idle = isNothing (syncingPeer s.sync) && null (queuedPeers s.sync)
-    if recent && enough && idle && not s.beenInSync
+    if isSynced ch.config.net now best s.sync && not s.beenInSync
       then writeTVar ch.state s {beenInSync = True} >> return True
       else return False
   when notify $ chainEvent ch (ChainSynced best)
-  where
-    blockTime = posixSecondsToUTCTime . fromIntegral . (.header.timestamp)
 
 -- | Run a loop in the background that sends a 'ChainPing' to the chain
 -- process at random intervals. They are at most a quarter of the timeout, so

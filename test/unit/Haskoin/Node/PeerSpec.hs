@@ -8,6 +8,7 @@ import Data.Serialize (putWord32le, runPut)
 import Data.Word (Word32)
 import Haskoin
 import Haskoin.Node
+import Haskoin.Node.Peer.Lock (Lock (..))
 import Haskoin.Node.Test
 import NQE
 import Test.HUnit (assertFailure)
@@ -34,7 +35,7 @@ withPeerTest net f = do
     withPublisher $ \pub ->
       withSubscription pub $ \events -> do
         (inbox, mailbox) <- newMailbox
-        busy <- newTVarIO False
+        busy <- newTVarIO Free
         pending <- newTVarIO 0
         let cfg =
               PeerConfig

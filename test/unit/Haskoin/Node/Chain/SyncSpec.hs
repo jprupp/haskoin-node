@@ -4,6 +4,8 @@ import Data.List (nub)
 import Data.Maybe (isNothing)
 import Data.Time.Calendar (fromGregorian)
 import Data.Time.Clock (UTCTime (..), addUTCTime)
+import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
+import Haskoin (BlockHeader (..), BlockNode (..), Network (..), btcRegTest, headerHash)
 import Haskoin.Node.Chain.Sync
 import Test.Hspec
 import Test.Hspec.QuickCheck (prop)
@@ -107,6 +109,28 @@ spec = describe "header sync state" $ do
     lastActivity (run [Connect 1, Start 1]) `shouldBe` at 1
     lastActivity (run [Connect 1, Start 1, Refresh 1]) `shouldBe` at 2
     lastActivity (touchSync (at 9) (emptySync t0) :: SyncState Int) `shouldBe` at 9
+
+  describe "synced" $ do
+    let net = btcRegTest
+        tipAt t w =
+          BlockNode
+            { header = net.genesisHeader {timestamp = t},
+              height = 1,
+              work = w,
+              skip = headerHash net.genesisHeader
+            }
+        now = at 0
+        recent = tipAt (floor (utcTimeToPOSIXSeconds now) - 60) 1
+        idle = run [Connect 1, Start 1, Finish 1]
+    it "is synced with a recent tip, enough work and nothing to do" $
+      isSynced net now recent idle `shouldBe` True
+    it "is not synced with an old tip" $
+      isSynced net (maxTipAge `addUTCTime` now) recent idle `shouldBe` False
+    it "is not synced below the minimum chain work" $
+      isSynced net {minimumChainWork = 2} now recent idle `shouldBe` False
+    it "is not synced while a peer is queued or syncing" $ do
+      isSynced net now recent (run [Connect 1]) `shouldBe` False
+      isSynced net now recent (run [Connect 1, Start 1]) `shouldBe` False
 
   prop "never syncs against more than one peer" $ \ops ->
     all ((<= 1) . length . filter isSyncingStatus . statuses) (states ops)

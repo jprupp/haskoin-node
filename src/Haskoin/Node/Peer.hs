@@ -46,6 +46,12 @@ module Haskoin.Node.Peer
     getTxs,
     getData,
     pingPeer,
+    Owner,
+    newOwner,
+    ownerName,
+    reservePeer,
+    releasePeer,
+    peerHolder,
     getBusy,
     setBusy,
     setFree,
@@ -71,6 +77,7 @@ import Data.Word (Word32)
 import Haskoin
 import Haskoin.Node.Logger
 import Haskoin.Node.Loop (loopForever)
+import Haskoin.Node.Peer.Lock
 import Haskoin.Node.Peer.Request
 import NQE
 import System.Random
@@ -144,8 +151,9 @@ data Peer = Peer
     pub :: !(Publisher PeerEvent),
     -- | name of the peer in logs, usually its address
     label :: !Text,
-    -- | whether the peer is reserved for a task; see 'setBusy'
-    busy :: !(TVar Bool),
+    -- | who has reserved the peer for a long conversation; see
+    -- 'reservePeer'
+    busy :: !(TVar (Lock Owner)),
     -- | messages from this peer that the node has not finished handling
     pending :: !(TVar Int)
   }
@@ -163,11 +171,11 @@ data PeerMessage
   | -- | send a network message to the peer
     SendMessage !Message
 
--- | Build a 'Peer' handle from its configuration, its busy flag, its counter of
--- pending messages, and the mailbox of its process.
+-- | Build a 'Peer' handle from its configuration, its lock (which starts
+-- 'Free'), its counter of pending messages, and the mailbox of its process.
 wrapPeer ::
   PeerConfig ->
-  TVar Bool ->
+  TVar (Lock Owner) ->
   TVar Int ->
   Mailbox PeerMessage ->
   Peer
@@ -299,26 +307,48 @@ killPeer p = KillPeer `send` p.mailbox
 sendMessage :: Message -> Peer -> IO ()
 sendMessage m p = SendMessage m `send` p.mailbox
 
--- | Check whether a peer is reserved for a task.
-getBusy :: Peer -> IO Bool
-getBusy p = readTVarIO p.busy
-
--- | Try to reserve a peer for a task, such as syncing headers. Returns 'True' if
--- the peer was free and is now reserved, or 'False' if it was already busy.
+-- | Try to reserve a peer for a long conversation, such as syncing headers
+-- or downloading blocks. Returns 'True' if the peer was free and the owner now
+-- holds it, or 'False' if anyone holds it, including the same owner.
 --
--- Reservation exists because some conversations with a peer span many
--- messages, like downloading a long run of headers. Two tasks using the same peer
--- for such a conversation at once would confuse each other's replies.
-setBusy :: Peer -> IO Bool
-setBusy p =
-  atomically $ do
-    b <- readTVar p.busy
-    unless b $ writeTVar p.busy True
-    return $ not b
+-- Two tasks holding such a conversation with the same peer at once would
+-- confuse each other's replies. "Haskoin.Node.Peer.Lock" has the rules.
+reservePeer :: Owner -> Peer -> IO Bool
+reservePeer o p = atomically $ do
+  lock <- readTVar p.busy
+  case acquire o lock of
+    Just lock' -> writeTVar p.busy lock' >> return True
+    Nothing -> return False
 
--- | Release a peer reserved with 'setBusy'.
+-- | Release a peer. Returns 'False', and changes nothing, if the owner does not
+-- hold it, so that a task cannot free a peer in the middle of another task's
+-- conversation.
+releasePeer :: Owner -> Peer -> IO Bool
+releasePeer o p = atomically $ do
+  lock <- readTVar p.busy
+  case release o lock of
+    Just lock' -> writeTVar p.busy lock' >> return True
+    Nothing -> return False
+
+-- | Who holds a peer, if anyone.
+peerHolder :: Peer -> IO (Maybe Owner)
+peerHolder p = holder <$> readTVarIO p.busy
+
+-- | Check whether a peer is reserved by anyone.
+getBusy :: Peer -> IO Bool
+getBusy p = isJust <$> peerHolder p
+
+-- | Reserve a peer on behalf of a single owner shared by every caller of this
+-- function. Use 'reservePeer' with an owner from 'newOwner' instead.
+setBusy :: Peer -> IO Bool
+setBusy = reservePeer legacyOwner
+{-# DEPRECATED setBusy "Use reservePeer with an owner from newOwner" #-}
+
+-- | Release a peer reserved with 'setBusy'. Peers reserved through
+-- 'reservePeer' by another owner are left alone.
 setFree :: Peer -> IO ()
-setFree p = atomically $ writeTVar p.busy False
+setFree = void . releasePeer legacyOwner
+{-# DEPRECATED setFree "Use releasePeer with the owner that reserved the peer" #-}
 
 -- | Request full blocks from peer. Will return 'Nothing' if the list of blocks
 -- returned by the peer is incomplete, comes out of order, or a timeout is

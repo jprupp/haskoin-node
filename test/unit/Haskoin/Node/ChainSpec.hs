@@ -1,3 +1,5 @@
+{-# OPTIONS_GHC -Wno-deprecations #-}
+
 -- | Header chain process driven by fake peers.
 module Haskoin.Node.ChainSpec (spec) where
 
@@ -7,6 +9,7 @@ import Data.Time.Clock (NominalDiffTime)
 import Database.RocksDB (DB)
 import Haskoin
 import Haskoin.Node
+import Haskoin.Node.Peer.Lock (Lock (..))
 import Haskoin.Node.Test
 import NQE
 import Test.HUnit (assertFailure)
@@ -42,7 +45,7 @@ withChainOn net to db f =
 newFakePeer :: ChainTest -> Text -> IO FakePeer
 newFakePeer ct label = do
   (inbox, mailbox) <- newMailbox
-  busy <- newTVarIO False
+  busy <- newTVarIO Free
   pending <- newTVarIO 0
   return
     FakePeer
@@ -350,13 +353,26 @@ spec = forM_ [btcRegTest, bchRegTest] $ \net ->
           _ <- waitHeight ct 20
           expectNoRequest 1 a
 
-      it "waits for a busy peer to become free" $ fast $ \ct -> do
+      it "waits for a peer reserved by someone else" $ fast $ \ct -> do
+        other <- newOwner "other"
         a <- newFakePeer ct "a"
-        True <- setBusy a.peer
+        True <- reservePeer other a.peer
         chainPeerConnected ct.chain a.peer
         expectNoRequest 1 a
-        setFree a.peer
+        True <- releasePeer other a.peer
         void $ answer ct a short
+
+      it "keeps its reservation when others try to release the peer" $
+        slow $ \ct -> do
+          other <- newOwner "other"
+          a <- connectPeer ct "a"
+          _ <- expectGetHeaders a
+          False <- releasePeer other a.peer
+          setFree a.peer
+          fmap ownerName <$> peerHolder a.peer `shouldReturn` Just "Chain"
+          False <- reservePeer other a.peer
+          sendHeaders ct a []
+          eventually 10 "peer released" $ (== Nothing) . fmap ownerName <$> peerHolder a.peer
 
     describe "stall recovery" $ do
       it "asks peers for headers when nothing happens for a while" $

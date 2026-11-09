@@ -138,7 +138,6 @@ import Haskoin.Node.Logger
 import Haskoin.Node.Loop (loopForever)
 import Haskoin.Node.Peer
 import Haskoin.Node.PeerMgr
-import Haskoin.Node.PeerMgr.Handshake (isEstablished)
 import NQE
 import Network.Socket (SockAddr)
 
@@ -210,7 +209,8 @@ chainEvents mgr input output = loopForever $ do
 -- peer is handled to completion before the peer may send another one past its
 -- small allowance of pending messages (see 'maxPendingMessages'), so that the
 -- node's queues cannot grow faster than it can work. Address, header and
--- inventory messages are only taken from peers that completed the handshake.
+-- inventory messages are only taken from peers that are online: the handshake
+-- is complete and the peer is not being disconnected.
 -- Inventory with blocks goes to the chain, which asks for headers if it does
 -- not know them.
 peerEvents ::
@@ -246,7 +246,7 @@ peerEvents ch mgr input output = loopForever $ do
   where
     whenOnline p act =
       getOnlinePeer mgr p >>= \case
-        Just o | isEstablished o.handshake -> act
+        Just o | o.online -> act
         _ -> return ()
     isBlock iv = iv.invType `elem` [InvBlock, InvWitnessBlock]
 
