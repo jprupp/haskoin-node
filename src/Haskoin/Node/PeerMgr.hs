@@ -1,16 +1,3 @@
-{-# LANGUAGE ConstraintKinds #-}
-{-# LANGUAGE DuplicateRecordFields #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE ImportQualifiedPost #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE MultiWayIf #-}
-{-# LANGUAGE OverloadedRecordDot #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE TupleSections #-}
-{-# LANGUAGE NoFieldSelectors #-}
-
 -- |
 -- Module      : Haskoin.Node.PeerMgr
 -- Copyright   : (c) Haskoin Developers
@@ -21,8 +8,8 @@
 --
 -- The peer manager keeps the node connected to the network.
 --
--- It maintains a pool of known peer addresses, filled from the static peers in
--- the configuration, from the DNS seeds of the network when discovery is on, and
+-- It keeps a book of peer addresses, filled from the static peers in the
+-- configuration, from the DNS seeds of the network when discovery is on, and
 -- from addresses relayed by connected peers. A background loop connects to new
 -- peers while there are fewer than 'maxPeers' of them.
 --
@@ -31,13 +18,25 @@
 -- with a 'PeerConnected' event. Peers are pinged periodically to measure their
 -- latency, and the list returned by 'getPeers' is sorted by median ping time, so
 -- that the fastest peers come first. A peer is disconnected if it stops
--- responding, does not answer a ping in time, or has been connected for longer
--- than 'maxPeerLife'. A 'PeerDisconnected' event is published when an online
--- peer goes away.
+-- responding, does not answer a ping in time, does not complete the handshake
+-- in time, or has been connected for longer than 'maxPeerLife'. A
+-- 'PeerDisconnected' event is published when an announced peer goes away.
 --
 -- Most of the @peerMgr*@ functions are used by "Haskoin.Node" to feed messages
 -- received from peers to the peer manager; applications rarely need to call
 -- them directly.
+--
+-- = State machines
+--
+-- The rules live in pure modules, and this one stores their state and carries
+-- out what they decide:
+--
+-- * "Haskoin.Node.PeerMgr.Lifecycle": the life of each connection, from the
+--   handshake ("Haskoin.Node.PeerMgr.Handshake") through pings to its
+--   disconnection, with a reason.
+--
+-- * "Haskoin.Node.PeerMgr.Addresses": which address to try next, and how long
+--   to wait before trying an address again after its connection ended.
 --
 -- = Why it works this way
 --
@@ -54,6 +53,14 @@
 --   longer than 'timeout' is dropped. Waiting for a peer that has gone away
 --   would stall whatever was waiting on it.
 --
+-- * __A dropped peer is gone at once.__ A peer told to disconnect is no longer
+--   offered by 'getPeers' and its messages are no longer routed, even before
+--   its connection closes.
+--
+-- * __Bad addresses wait.__ An address that fails is tried again later each
+--   time, and one whose peer broke the protocol is not tried again for a long
+--   time, so the node does not hammer dead peers or return to bad ones.
+--
 -- * __Relayed addresses are untrusted.__ Peers gossip addresses, and a
 --   malicious peer could gossip private or loopback addresses to make the node
 --   probe its own network. Only public addresses are accepted, and only a
@@ -62,6 +69,9 @@ module Haskoin.Node.PeerMgr
   ( PeerMgrConfig (..),
     PeerEvent (..),
     OnlinePeer (..),
+    PeerState (..),
+    Stage (..),
+    DisconnectReason (..),
     PeerMgr,
     withPeerMgr,
     peerMgrBest,
@@ -83,27 +93,31 @@ module Haskoin.Node.PeerMgr
 where
 
 import Control.Applicative ((<|>))
-import Control.Arrow
-import Control.Monad
-import Data.Bits ((.&.))
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (Async, ExceptionInLinkedThread (..), link, withAsync)
+import Control.Concurrent.STM
+import Control.Exception (SomeException, fromException)
+import Control.Monad (forM_, when, (<=<))
 import Data.Function (on)
-import Data.List (dropWhileEnd, elemIndex, find, nub, sort)
-import Data.Maybe
-import Data.Set (Set)
-import Data.Set qualified as Set
+import Data.List (find, sort)
+import Data.Maybe (fromMaybe)
 import Data.String.Conversions (cs)
 import Data.Time.Clock
 import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
-import Data.Word (Word32, Word64, Word8)
+import Data.Word (Word32, Word64)
+import GHC.Records (HasField (..))
 import Haskoin
+import Haskoin.Node.Address (isRoutable, toHostService, toSockAddr)
 import Haskoin.Node.Logger
 import Haskoin.Node.Loop (loopForever)
 import Haskoin.Node.Peer
+import Haskoin.Node.Peer.Lock (Lock (..))
+import Haskoin.Node.PeerMgr.Addresses
+import Haskoin.Node.PeerMgr.Handshake
+import Haskoin.Node.PeerMgr.Lifecycle
 import NQE
-import Network.Socket
+import Network.Socket (SockAddr)
 import System.Random (randomIO, randomRIO)
-import UnliftIO
-import UnliftIO.Concurrent
 
 -- | Configuration of the peer manager. "Haskoin.Node" builds it from the
 -- 'Haskoin.Node.NodeConfig'.
@@ -143,9 +157,9 @@ data PeerMgr = PeerMgr
     mailbox :: !(Mailbox PeerMgrMessage),
     -- | height of the best block, sent to peers in version messages
     best :: !(TVar BlockHeight),
-    -- | known addresses not yet connected to, at most 'maxKnownAddresses'
-    addresses :: !(TVar (Set SockAddr)),
-    -- | peers being connected to or online, fastest first
+    -- | addresses to connect to
+    addresses :: !(TVar (AddressBook SockAddr)),
+    -- | open connections, fastest peers first
     peers :: !(TVar [OnlinePeer])
   }
 
@@ -153,10 +167,10 @@ data PeerMgr = PeerMgr
 data PeerMgrMessage
   = -- | connect to a peer address
     Connect !SockAddr
-  | -- | check whether a peer timed out or must be pinged
+  | -- | check the timers of a peer
     CheckPeer !Peer
-  | -- | a peer process stopped
-    PeerDied !Child
+  | -- | a peer process stopped, with the exception that stopped it
+    PeerDied !Child !(Maybe SomeException)
   | -- | the height of the best block changed
     ManagerBest !BlockHeight
   | -- | a peer acknowledged our version
@@ -172,47 +186,69 @@ data PeerMgrMessage
   | -- | reply once every previous message has been handled
     Sync !(Listen ())
 
--- | Data structure representing an online peer.
+-- | A connection to a peer.
 --
 -- Peers are compared for equality by their 'Peer' handle, and ordered by the
 -- median of their recent ping times, so that sorting a list puts the fastest
 -- peers first. Peers without any ping measurement sort as if their median ping
 -- were 60 seconds.
+--
+-- The fields @version@, @online@, @verack@, @ping@, @pings@, @connected@ and
+-- @tickled@ of earlier releases are now computed from 'state', so record dot
+-- syntax such as @o.version@ keeps working. They cannot be set or pattern
+-- matched.
 data OnlinePeer = OnlinePeer
   { -- | network address of the peer
     address :: !SockAddr,
-    -- | whether the peer acknowledged our version
-    verack :: !Bool,
-    -- | whether the handshake is complete: both version and verack received
-    online :: !Bool,
-    -- | version message sent by the peer, if received
-    version :: !(Maybe Version),
+    -- | stage of the connection and its timers; see
+    -- "Haskoin.Node.PeerMgr.Lifecycle"
+    state :: !PeerState,
     -- | thread running the peer process
     async :: !(Async ()),
     -- | handle to talk to the peer
     mailbox :: !Peer,
     -- | nonce of the version message we sent, used to detect connections to
     -- ourselves
-    nonce :: !Word64,
-    -- | time and nonce of the ping awaiting an answer, if any
-    ping :: !(Maybe (UTCTime, Word64)),
-    -- | round-trip times of the last eleven pings, sorted
-    pings :: ![NominalDiffTime],
-    -- | when the connection was made
-    connected :: !UTCTime,
-    -- | when the peer last sent a message
-    tickled :: !UTCTime
+    nonce :: !Word64
   }
 
 instance Eq OnlinePeer where
-  (==) = (==) `on` f
-    where
-      f OnlinePeer {mailbox = p} = p
+  (==) = (==) `on` (.mailbox)
 
 instance Ord OnlinePeer where
-  compare = compare `on` f
-    where
-      f OnlinePeer {pings = pings} = fromMaybe 60 (median pings)
+  compare = compare `on` \o -> fromMaybe 60 (median o.state.pings)
+
+-- | Version message sent by the peer, if received.
+instance HasField "version" OnlinePeer (Maybe Version) where
+  getField o = stageVersion o.state
+
+-- | Whether the peer is online: the handshake is complete and the peer is not
+-- being disconnected.
+instance HasField "online" OnlinePeer Bool where
+  getField o = isOnline o.state
+
+-- | Whether the peer acknowledged our version.
+instance HasField "verack" OnlinePeer Bool where
+  getField o = case o.state.stage of
+    Handshaking h -> hasVerAck h
+    Online _ _ -> True
+    Disconnecting _ -> False
+
+-- | Time and nonce of the ping awaiting an answer, if any.
+instance HasField "ping" OnlinePeer (Maybe (UTCTime, Word64)) where
+  getField o = pendingPing o.state
+
+-- | Round-trip times of the last eleven pings, sorted.
+instance HasField "pings" OnlinePeer [NominalDiffTime] where
+  getField o = sort o.state.pings
+
+-- | When the connection was opened.
+instance HasField "connected" OnlinePeer UTCTime where
+  getField o = o.state.connected
+
+-- | When the peer last sent a message.
+instance HasField "tickled" OnlinePeer UTCTime where
+  getField o = o.state.lastHeard
 
 -- | Start a peer manager and pass it to the given action. The peer manager and
 -- all its peers are stopped when the action returns.
@@ -220,133 +256,107 @@ instance Ord OnlinePeer where
 -- The peer manager does not connect to any peer until it learns the height of
 -- the best block through 'peerMgrBest'. "Haskoin.Node" does this as soon as the
 -- chain is loaded.
-withPeerMgr ::
-  (MonadUnliftIO m) =>
-  PeerMgrConfig ->
-  (PeerMgr -> m a) ->
-  m a
+withPeerMgr :: PeerMgrConfig -> (PeerMgr -> IO a) -> IO a
 withPeerMgr cfg action = do
-  ibx <- newInbox
-  withSupervisor (Notify (death ibx)) $ \sup -> do
-    bb <- newTVarIO 0
-    kp <- newTVarIO Set.empty
-    ob <- newTVarIO []
+  inbox <- newInbox
+  let died (a, e) = PeerDied a e `sendSTM` inbox
+  withSupervisor (Notify died) $ \sup -> do
+    best <- newTVarIO 0
+    addresses <- newTVarIO emptyBook
+    peers <- newTVarIO []
     let mgr =
           PeerMgr
             { config = cfg,
               supervisor = sup,
-              mailbox = inboxToMailbox ibx,
-              best = bb,
-              addresses = kp,
-              peers = ob
+              mailbox = inboxToMailbox inbox,
+              best = best,
+              addresses = addresses,
+              peers = peers
             }
-    go mgr ibx
-  where
-    death ibx (a, _e) = PeerDied a `sendSTM` ibx
-    go mgr ibx = withAsync (peerManager mgr ibx) $ \a ->
+    withAsync (peerManager mgr inbox) $ \a ->
       withConnectLoop mgr (link a >> action mgr)
 
 -- | Main loop of the peer manager process. Waits for the best block height, then
 -- handles messages forever.
-peerManager ::
-  (MonadUnliftIO m) => PeerMgr -> Inbox PeerMgrMessage -> m ()
-peerManager mgr ibx = do
+peerManager :: PeerMgr -> Inbox PeerMgrMessage -> IO ()
+peerManager mgr inbox = do
   logDebug mgr.config.logger "Getting best block..."
-  putBestBlock mgr <=< receiveMatch ibx $ \case
+  (atomically . writeTVar mgr.best) <=< receiveMatch inbox $ \case
     ManagerBest b -> Just b
     _ -> Nothing
   loopForever $ do
     logDebug mgr.config.logger "Awaiting event..."
-    dispatch mgr =<< receive ibx
+    dispatch mgr =<< receive inbox
 
--- | Store the height of the best block.
-putBestBlock :: (MonadIO m) => PeerMgr -> BlockHeight -> m ()
-putBestBlock mgr bb = atomically $ writeTVar mgr.best bb
-
--- | Read the height of the best block.
-getBestBlock :: (MonadIO m) => PeerMgr -> m BlockHeight
-getBestBlock mgr = readTVarIO mgr.best
-
--- | Network constants of the peer manager.
-getNetwork :: PeerMgr -> Network
-getNetwork mgr = mgr.config.net
-
--- | Add the static peers and, if discovery is on, the network seeds to the known addresses.
-loadPeers :: (MonadIO m) => PeerMgr -> m ()
-loadPeers mgr = do
-  loadStaticPeers mgr
-  loadNetSeeds mgr
-
--- | Resolve the static peers in the configuration and add them to the known addresses.
-loadStaticPeers :: (MonadIO m) => PeerMgr -> m ()
-loadStaticPeers mgr =
-  mapM_ (newPeer mgr) . concat
-    =<< mapM (liftIO . toSockAddr mgr.config.net) mgr.config.peers
-
--- | If discovery is on, resolve the DNS seeds of the network and add them to the known addresses.
-loadNetSeeds :: (MonadIO m) => PeerMgr -> m ()
-loadNetSeeds mgr =
-  when mgr.config.discover $ do
-    ss <-
-      concat
-        <$> mapM (liftIO . toSockAddr mgr.config.net) mgr.config.net.seeds
-    mapM_ (newPeer mgr) ss
-
--- | Log how many peers are online out of the maximum.
-logConnectedPeers :: (MonadIO m) => PeerMgr -> m ()
-logConnectedPeers mgr = do
-  let m = mgr.config.maxPeers
-  l <- length <$> getConnectedPeers mgr
-  logInfo
-    mgr.config.logger
-    ("Peers connected: " <> cs (show l) <> "/" <> cs (show m))
-
--- | All peers being connected to or online, fastest first.
-getOnlinePeers :: (MonadIO m) => PeerMgr -> m [OnlinePeer]
-getOnlinePeers mgr = readTVarIO mgr.peers
-
--- | Peers that completed the handshake, fastest first.
-getConnectedPeers :: (MonadIO m) => PeerMgr -> m [OnlinePeer]
-getConnectedPeers mgr = filter (.online) <$> getOnlinePeers mgr
-
--- | Publish a peer event.
-managerEvent :: (MonadIO m) => PeerMgr -> PeerEvent -> m ()
-managerEvent mgr e = publish e mgr.config.pub
+-- | Time limits of connections.
+limits :: PeerMgr -> Limits
+limits mgr = Limits {timeout = mgr.config.timeout, maxLife = mgr.config.maxPeerLife}
 
 -- | Handle a message sent to the peer manager.
-dispatch ::
-  (MonadUnliftIO m) => PeerMgr -> PeerMgrMessage -> m ()
-dispatch mgr (PeerVersion p v) = do
-  logDebug
-    mgr.config.logger
-    ("Received peer " <> p.label <> " version " <> cs (show v))
-  let b = mgr.peers
-  atomically (setPeerVersion b p v) >>= \case
-    Just o -> do
-      when o.online (announcePeer mgr p)
-      logDebug
-        mgr.config.logger
-        ("Sending version ack to peer " <> p.label)
-      MVerAck `sendMessage` p
-    Nothing -> do
-      logWarn
-        mgr.config.logger
-        ("Version rejected for peer " <> p.label)
-      killPeer p
-dispatch mgr (PeerVerAck p) = do
-  atomically (setPeerVerAck mgr.peers p) >>= \case
-    Just o -> do
-      logDebug mgr.config.logger ("Received version ack from peer " <> p.label)
-      when o.online (announcePeer mgr p)
-    Nothing -> do
-      logWarn
-        mgr.config.logger
-        ("Verack rejected for peer " <> p.label)
-      killPeer p
-dispatch mgr (PeerAddrs p nas)
+dispatch :: PeerMgr -> PeerMgrMessage -> IO ()
+dispatch mgr = \case
+  PeerVersion p v -> do
+    logDebug mgr.config.logger ("Received version from peer " <> p.label)
+    nonces <- map (.nonce) <$> readTVarIO mgr.peers
+    peerInput mgr p $ either Refused (GotHandshake . GotVersion) (checkVersion nonces v)
+  PeerVerAck p -> do
+    logDebug mgr.config.logger ("Received version ack from peer " <> p.label)
+    peerInput mgr p (GotHandshake GotVerAck)
+  PeerPong p n -> do
+    now <- getCurrentTime
+    peerInput mgr p (GotPong now n)
+  CheckPeer p -> do
+    now <- getCurrentTime
+    nonce <- randomIO
+    peerInput mgr p (Tick now nonce)
+  PeerPing p n -> MPong (Pong n) `sendMessage` p
+  PeerAddrs p nas -> relayedAddresses mgr p nas
+  ManagerBest h -> atomically $ writeTVar mgr.best h
+  Connect sa -> connectPeer mgr sa
+  PeerDied a e -> peerDied mgr a e
+  Sync r -> atomically (r ())
+
+-- | Apply an input to the state of a connection and carry out the resulting
+-- actions. Inputs for connections that are gone are ignored.
+peerInput :: PeerMgr -> Peer -> PeerInput -> IO ()
+peerInput mgr p input = do
+  result <- atomically $ do
+    ops <- readTVar mgr.peers
+    case find ((== p) . (.mailbox)) ops of
+      Nothing -> return Nothing
+      Just o -> do
+        let (st, actions) = stepPeer (limits mgr) input o.state
+            o' = o {state = st}
+        writeTVar mgr.peers (sort (o' : filter (/= o) ops))
+        return (Just (o', actions))
+  forM_ result $ \(o, actions) -> forM_ actions (perform o)
+  where
+    perform o = \case
+      ReplyVerAck -> MVerAck `sendMessage` p
+      Announce -> do
+        atomically $ modifyTVar' mgr.addresses (markConnected o.address)
+        logInfo mgr.config.logger ("Connected to peer " <> p.label)
+        publish (PeerConnected p) mgr.config.pub
+        logConnectedPeers mgr
+      SendPing n -> MPing (Ping n) `sendMessage` p
+      Disconnect r -> do
+        logWarn
+          mgr.config.logger
+          ("Disconnecting peer " <> p.label <> ": " <> cs (show r))
+        killPeer p
+
+-- | Record that a peer just sent a message, so that it is not disconnected for
+-- being idle. "Haskoin.Node" calls this for every message received.
+ticklePeer :: PeerMgr -> Peer -> IO ()
+ticklePeer mgr p = getCurrentTime >>= peerInput mgr p . Heard
+
+-- | Learn the routable addresses that an online peer relayed, if discovery is
+-- on.
+relayedAddresses :: PeerMgr -> Peer -> [NetworkAddress] -> IO ()
+relayedAddresses mgr p nas
   | mgr.config.discover =
       getOnlinePeer mgr p >>= \case
-        Just OnlinePeer {online = True} -> do
+        Just o | isOnline o.state -> do
           let sas = filter isRoutable $ map (hostToSockAddr . (.address)) nas
           logDebug
             mgr.config.logger
@@ -358,451 +368,212 @@ dispatch mgr (PeerAddrs p nas)
                 <> cs (show (length sas))
                 <> " routable"
             )
-          forM_ sas (newPeer mgr)
+          atomically . modifyTVar' mgr.addresses $ \book ->
+            foldr (addAddress Discovered) book sas
         _ ->
           logDebug
             mgr.config.logger
-            ("Ignoring addresses from peer before handshake " <> p.label)
+            ("Ignoring addresses from peer that is not online " <> p.label)
   | otherwise =
       logDebug mgr.config.logger ("Ignoring addresses from peer " <> p.label)
-dispatch _ (Sync r) =
-  atomically (r ())
-dispatch mgr (PeerPong p n) = do
-  logDebug
-    mgr.config.logger
-    ("Received pong " <> cs (show n) <> " from peer " <> p.label)
-  now <- liftIO getCurrentTime
-  atomically (gotPong mgr.peers n now p)
-dispatch mgr (PeerPing p n) = do
-  logDebug
-    mgr.config.logger
-    ("Responding to ping " <> cs (show n) <> " from peer " <> p.label)
-  MPong (Pong n) `sendMessage` p
-dispatch mgr (ManagerBest h) = do
-  logDebug mgr.config.logger ("Setting best block to " <> cs (show h))
-  putBestBlock mgr h
-dispatch mgr (Connect sa) = do
-  connectPeer mgr sa
-dispatch mgr (PeerDied a) = do
-  processPeerOffline mgr a
-dispatch mgr (CheckPeer p) = do
-  logDebug mgr.config.logger ("Housekeeping for peer " <> p.label)
-  checkPeer mgr p
 
--- | Record that a peer just sent a message, so that it is not disconnected for
--- being idle. "Haskoin.Node" calls this for every message received.
-ticklePeer :: (MonadIO m) => PeerMgr -> Peer -> m ()
-ticklePeer mgr p = do
-  logDebug mgr.config.logger ("Tickling peer " <> p.label)
-  t <- liftIO getCurrentTime
-  atomically (modifyPeer mgr.peers p (\o -> o {tickled = t}))
-
--- | Disconnect a peer that has been connected for too long, has been idle for
--- too long, or did not answer a ping in time. Otherwise ping it if no ping is
--- pending.
-checkPeer :: (MonadIO m) => PeerMgr -> Peer -> m ()
-checkPeer mgr p =
-  atomically (mgr.peers `findPeer` p) >>= \case
-    Just o -> do
-      now <- liftIO getCurrentTime
-      let expired = mgr.config.maxPeerLife `addUTCTime` o.connected
-          deadline = mgr.config.timeout `addUTCTime` o.tickled
-          -- Other traffic must not keep a peer that ignores our ping.
-          pingDeadline = (\(t, _) -> mgr.config.timeout `addUTCTime` t) <$> o.ping
-      if
-        | now > expired -> do
-            logError mgr.config.logger ("Peer " <> p.label <> " is too old")
-            killPeer p
-        | now > deadline -> do
-            logError mgr.config.logger ("Peer " <> p.label <> " timed out")
-            killPeer p
-        | maybe False (now >) pingDeadline -> do
-            logError mgr.config.logger ("Peer " <> p.label <> " did not answer ping")
-            killPeer p
-        | isNothing o.ping -> sendPing mgr p
-        | otherwise -> return ()
-    Nothing -> do
-      logError mgr.config.logger ("Peer " <> p.label <> " is offline")
-
--- | Send a ping with a random nonce to an online peer and remember when it was sent.
-sendPing :: (MonadIO m) => PeerMgr -> Peer -> m ()
-sendPing mgr p = do
-  atomically (mgr.peers `findPeer` p) >>= \case
-    Nothing ->
-      logWarn mgr.config.logger ("Will not ping unknown peer " <> p.label)
-    Just o
-      | o.online -> do
-          n <- randomIO
-          now <- liftIO getCurrentTime
-          atomically (setPeerPing mgr.peers n now p)
-          logDebug
-            mgr.config.logger
-            ("Sending ping " <> cs (show n) <> " to peer " <> p.label)
-          MPing (Ping n) `sendMessage` p
-      | otherwise ->
-          logDebug
-            mgr.config.logger
-            ("Will not ping offline peer " <> p.label)
-
--- | Clean up after a peer process stops, and publish a disconnection event if the peer was online.
-processPeerOffline :: (MonadIO m) => PeerMgr -> Child -> m ()
-processPeerOffline mgr a = do
-  atomically (findPeerAsync mgr.peers a) >>= \case
-    Nothing -> logError mgr.config.logger "Disconnected unknown peer"
-    Just o -> do
-      if o.online
-        then do
-          logError
-            mgr.config.logger
-            ("Disconnected peer " <> o.mailbox.label)
-          managerEvent mgr (PeerDisconnected o.mailbox)
-        else
-          logError
-            mgr.config.logger
-            ("Could not connect to peer " <> o.mailbox.label)
-      atomically (removePeer mgr.peers o.mailbox)
+-- | Forget a connection whose process stopped, decide when to try its address
+-- again, and publish its disconnection if it had been announced.
+peerDied :: PeerMgr -> Child -> Maybe SomeException -> IO ()
+peerDied mgr a e = do
+  now <- getCurrentTime
+  gone <- atomically $ do
+    ops <- readTVar mgr.peers
+    case find ((== a) . (.async)) ops of
+      Nothing -> return Nothing
+      Just o -> do
+        let outcome = connectionOutcome o.state e
+        writeTVar mgr.peers (filter (/= o) ops)
+        modifyTVar' mgr.addresses (finishAddress now outcome o.address)
+        return (Just (o, outcome))
+  case gone of
+    Nothing -> logError mgr.config.logger "Unknown peer process stopped"
+    Just (o, outcome) -> do
+      logInfo mgr.config.logger $
+        "Connection to peer "
+          <> o.mailbox.label
+          <> " ended: "
+          <> cs (show outcome)
+          <> maybe "" (\x -> " (" <> cs (show x) <> ")") e
+      when o.state.announced $
+        publish (PeerDisconnected o.mailbox) mgr.config.pub
       logConnectedPeers mgr
 
--- | Publish a connection event for a peer that just completed the handshake.
-announcePeer :: (MonadIO m) => PeerMgr -> Peer -> m ()
-announcePeer mgr p = do
-  atomically (findPeer mgr.peers p) >>= \case
-    Just OnlinePeer {online = True} -> do
-      logInfo mgr.config.logger ("Connected to peer " <> p.label)
-      managerEvent mgr (PeerConnected p)
-      logConnectedPeers mgr
-    Just OnlinePeer {online = False} ->
-      return ()
-    Nothing ->
-      logWarn mgr.config.logger ("Not announcing disconnected peer " <> p.label)
-
--- | Take an address from the known addresses. If there are none, reload the static peers and seeds first.
-getNewPeer :: (MonadIO m) => PeerMgr -> m (Maybe SockAddr)
-getNewPeer mgr =
-  g >>= \case
-    Nothing -> loadPeers mgr >> g
-    Just a -> return (Just a)
+-- | How a connection ended, from its last state and the exception that stopped
+-- its process, if any.
+--
+-- A peer process only stops without an exception when told to disconnect. If
+-- the peer manager did not do that, another process did, such as the chain
+-- after invalid headers, so the address waits as after a failure.
+connectionOutcome :: PeerState -> Maybe SomeException -> Outcome
+connectionOutcome st e =
+  case (st.stage, peerException =<< e) of
+    (Disconnecting TooOld, _) -> Disconnected
+    (Disconnecting (Rejected _), _) -> Misbehaved
+    (Disconnecting _, _) -> Failed
+    (_, Just ConnectionClosed)
+      | st.announced -> Disconnected
+      | otherwise -> Failed
+    (_, Just _) -> Misbehaved
+    (_, Nothing) -> Failed
   where
-    g =
-      atomically $
-        stateTVar
-          mgr.addresses
-          (first (listToMaybe . Set.elems) . Set.splitAt 1)
+    peerException x =
+      fromException x
+        <|> (fromException x >>= \(ExceptionInLinkedThread _ inner) -> fromException inner)
 
--- | Start a peer process for an address and send it our version, unless there
--- are no free slots or the address is already connected.
-connectPeer :: (MonadUnliftIO m) => PeerMgr -> SockAddr -> m ()
+-- | Log how many peers are online out of the maximum.
+logConnectedPeers :: PeerMgr -> IO ()
+logConnectedPeers mgr = do
+  l <- length <$> getPeers mgr
+  logInfo
+    mgr.config.logger
+    ("Peers connected: " <> cs (show l) <> "/" <> cs (show mgr.config.maxPeers))
+
+-- | Next address to connect to. The configured peers and, if discovery is on,
+-- the seeds are loaded when there is nothing to try and they were not loaded
+-- recently.
+getNewPeer :: PeerMgr -> IO (Maybe SockAddr)
+getNewPeer mgr = do
+  now <- getCurrentTime
+  reload <- needsReload now <$> readTVarIO mgr.addresses
+  when reload $ loadPeers mgr now
+  atomically . stateTVar mgr.addresses $ \book ->
+    case takeAddress now book of
+      Just (sa, book') -> (Just sa, book')
+      Nothing -> (Nothing, book)
+
+-- | Resolve the configured peers and, if discovery is on, the seeds of the
+-- network, and add them to the address book.
+loadPeers :: PeerMgr -> UTCTime -> IO ()
+loadPeers mgr now = do
+  let net = mgr.config.net
+      resolve = fmap concat . mapM (toSockAddr net)
+  configured <- resolve mgr.config.peers
+  seeds <- if mgr.config.discover then resolve net.seeds else return []
+  atomically . modifyTVar' mgr.addresses $ \book ->
+    markLoaded now $
+      foldr (addAddress Discovered) (foldr (addAddress Configured) book configured) seeds
+
+-- | Start a peer process for an address taken from the address book and send
+-- it our version, unless there are no free slots or the address is connected
+-- already, in which case the address is given back.
+connectPeer :: PeerMgr -> SockAddr -> IO ()
 connectPeer mgr sa = do
-  n <- length <$> getOnlinePeers mgr
-  atomically (findPeerAddress mgr.peers sa) >>= \case
-    _
-      | n >= mgr.config.maxPeers ->
-          -- The connect loop may have queued this before the last free slot
-          -- was taken.
-          logDebug
-            mgr.config.logger
-            ("Not connecting to peer " <> cs (show sa) <> ": no free slots")
-    Just _ ->
-      logWarn mgr.config.logger ("Duplicate connection to peer " <> cs (show sa))
-    Nothing -> do
-      logInfo mgr.config.logger ("Connecting to peer " <> cs (show sa))
-      nonce <- randomIO
-      bb <- getBestBlock mgr
-      now <- liftIO getCurrentTime
-      let rmt = NetworkAddress (srv mgr.config.net) (sockToHostAddress sa)
-          unix = floor (utcTimeToPOSIXSeconds now)
-          ver = buildVersion mgr.config.net nonce bb mgr.config.address rmt unix
-          text = cs (show sa)
-      (inbox, mailbox) <- newMailbox
-      let pc =
-            PeerConfig
-              { pub = mgr.config.pub,
-                net = mgr.config.net,
-                label = text,
-                connect = mgr.config.connect sa,
-                logger = withSource "Peer" mgr.config.logger
+  ops <- readTVarIO mgr.peers
+  if
+    | length ops >= mgr.config.maxPeers -> giveBack "no free slots"
+    | any ((== sa) . (.address)) ops -> giveBack "already connected"
+    | otherwise -> do
+        logInfo mgr.config.logger ("Connecting to peer " <> cs (show sa))
+        nonce <- randomIO
+        height <- readTVarIO mgr.best
+        now <- getCurrentTime
+        let net = mgr.config.net
+            services = if net.segWit then 8 else 0
+            rmt = NetworkAddress services (sockToHostAddress sa)
+            unix = floor (utcTimeToPOSIXSeconds now)
+            ver = buildVersion net nonce height mgr.config.address rmt unix
+            pc =
+              PeerConfig
+                { pub = mgr.config.pub,
+                  net = net,
+                  label = cs (show sa),
+                  connect = mgr.config.connect sa,
+                  logger = withSource "Peer" mgr.config.logger
+                }
+        (inbox, mailbox) <- newMailbox
+        busy <- newTVarIO Free
+        pending <- newTVarIO 0
+        let p = wrapPeer pc busy pending mailbox
+        -- The peer manager handles messages one at a time, so the peer cannot
+        -- die before it is in the list.
+        a <- mgr.supervisor `addChild` withHousekeeping mgr p (peer pc p inbox)
+        MVersion ver `sendMessage` p
+        atomically . modifyTVar' mgr.peers $ \x ->
+          sort $
+            OnlinePeer
+              { address = sa,
+                state = newPeerState now,
+                async = a,
+                mailbox = p,
+                nonce = nonce
               }
-      busy <- newTVarIO False
-      pending <- newTVarIO 0
-      let p = wrapPeer pc busy pending mailbox
-      a <- withRunInIO $ \io ->
-        mgr.supervisor `addChild` io (launch pc inbox p)
-      MVersion ver `sendMessage` p
-      atomically $
-        insertPeer
-          mgr.peers
-          OnlinePeer
-            { address = sa,
-              verack = False,
-              online = False,
-              version = Nothing,
-              async = a,
-              mailbox = p,
-              nonce = nonce,
-              pings = [],
-              ping = Nothing,
-              connected = now,
-              tickled = now
-            }
+              : x
   where
-    srv net
-      | net.segWit = 8
-      | otherwise = 0
-    launch pc inbox p =
-      withPeerLoop mgr p (\a -> link a >> peer pc p inbox)
+    giveBack why = do
+      logDebug
+        mgr.config.logger
+        ("Not connecting to peer " <> cs (show sa) <> ": " <> why)
+      atomically $ modifyTVar' mgr.addresses (returnAddress sa)
 
--- | Run a loop in the background that asks the peer manager to check a peer at
--- random intervals between a quarter and a half of the timeout.
-withPeerLoop :: (MonadUnliftIO m) => PeerMgr -> Peer -> (Async a -> m a) -> m a
-withPeerLoop mgr p =
-  withAsync . loopForever $ do
-    let timeout = mgr.config.timeout
-        ms = floor (timeout * 1000 * 1000)
-    r <- randomRIO (ms `div` 4, ms `div` 2)
-    threadDelay r
-    managerCheck mgr p
+-- | Run a peer process along with a loop that asks the peer manager to check
+-- the peer's timers at random intervals between a quarter and a half of the
+-- timeout.
+withHousekeeping :: PeerMgr -> Peer -> IO () -> IO ()
+withHousekeeping mgr p go =
+  withAsync checks $ \a -> link a >> go
+  where
+    micros = floor (mgr.config.timeout * 1000000) :: Int
+    checks = loopForever $ do
+      threadDelay =<< randomRIO (micros `div` 4, micros `div` 2)
+      CheckPeer p `send` mgr.mailbox
 
 -- | Run a loop in the background that connects to a new peer every 0.1 to 5
 -- seconds while there are free slots.
-withConnectLoop :: (MonadUnliftIO m) => PeerMgr -> m a -> m a
+withConnectLoop :: PeerMgr -> IO a -> IO a
 withConnectLoop mgr act =
   withAsync go $ \a -> link a >> act
   where
     go = loopForever $ do
-      l <- length <$> getOnlinePeers mgr
-      when
-        (l < mgr.config.maxPeers)
-        (getNewPeer mgr >>= mapM_ (managerConnect mgr))
-      threadDelay =<< randomRIO (10 ^ 5, 5 * 10 ^ 6)
+      n <- length <$> readTVarIO mgr.peers
+      when (n < mgr.config.maxPeers) $
+        getNewPeer mgr >>= mapM_ (\sa -> Connect sa `send` mgr.mailbox)
+      threadDelay =<< randomRIO (100000 :: Int, 5000000)
 
--- | Upper bound on addresses remembered for future connections. Peers keep
--- relaying addresses for as long as the node runs, and with every connection
--- slot in use nothing ever removes them, so the pool must be bounded.
-maxKnownAddresses :: Int
-maxKnownAddresses = 4096
+-- | Peers that are online, sorted so that those with the lowest median ping
+-- come first. Peers in the handshake or being disconnected are left out.
+getPeers :: PeerMgr -> IO [OnlinePeer]
+getPeers mgr = filter (isOnline . (.state)) <$> readTVarIO mgr.peers
 
--- | Add an address to the known addresses, unless it is connected already or the pool is full.
-newPeer :: (MonadIO m) => PeerMgr -> SockAddr -> m ()
-newPeer mgr sa =
-  atomically $
-    findPeerAddress mgr.peers sa >>= \case
-      Just _ -> return ()
-      Nothing -> modifyTVar' mgr.addresses $ \known ->
-        if Set.size known >= maxKnownAddresses
-          then known
-          else Set.insert sa known
-
--- | Record the round-trip time of a ping if the nonce matches the pending one.
-gotPong :: TVar [OnlinePeer] -> Word64 -> UTCTime -> Peer -> STM ()
-gotPong b nonce now p =
-  findPeer b p >>= \case
-    Just o@OnlinePeer {ping = Just (time, nonce')} | nonce' == nonce -> do
-      let d = now `diffUTCTime` time
-          o' = o {ping = Nothing, pings = sort (take 11 (d : o.pings))}
-      insertPeer b o'
-    _ -> return ()
-
--- | Remember the time and nonce of a ping sent to a peer.
-setPeerPing :: TVar [OnlinePeer] -> Word64 -> UTCTime -> Peer -> STM ()
-setPeerPing b nonce now p =
-  modifyPeer b p $ \o -> o {ping = Just (now, nonce)}
-
--- | Store the version of a peer. Returns 'Nothing' to reject it if the peer does
--- not serve the full chain, is ourselves, is unknown, or already sent a version.
---
--- A peer must offer the full chain ('nodeNetwork') to be useful for syncing, and
--- a version whose nonce matches one of ours means the node has connected to
--- itself, which happens when it learns its own address from gossip.
-setPeerVersion :: TVar [OnlinePeer] -> Peer -> Version -> STM (Maybe OnlinePeer)
-setPeerVersion b p v
-  | v.services .&. nodeNetwork == 0 = return Nothing
-  | otherwise =
-      readTVar b >>= \ops ->
-        if any (\o -> v.nonce == o.nonce) ops
-          then return Nothing -- peer is myself
-          else
-            findPeer b p >>= \case
-              Nothing -> return Nothing -- peer not found
-              Just OnlinePeer {version = Just _} ->
-                return Nothing -- duplicate version
-              Just o -> do
-                let n = o {version = Just v, online = o.verack}
-                insertPeer b n
-                return (Just n)
-
--- | Record that a peer acknowledged our version. Returns 'Nothing' if the peer is
--- unknown or already sent one.
-setPeerVerAck :: TVar [OnlinePeer] -> Peer -> STM (Maybe OnlinePeer)
-setPeerVerAck b p =
-  findPeer b p >>= \case
-    Just OnlinePeer {verack = True} -> return Nothing -- duplicate verack
-    Just o -> do
-      let o' = o {verack = True, online = isJust o.version}
-      insertPeer b o'
-      return (Just o')
-    Nothing -> return Nothing
-
--- | Find a peer in the list.
-findPeer :: TVar [OnlinePeer] -> Peer -> STM (Maybe OnlinePeer)
-findPeer b p =
-  find ((== p) . (.mailbox))
-    <$> readTVar b
-
--- | Add or replace a peer in the list, keeping it sorted.
-insertPeer :: TVar [OnlinePeer] -> OnlinePeer -> STM ()
-insertPeer b o =
-  modifyTVar b $ \x -> sort . nub $ o : x
-
--- | Change a peer in the list, if it is there.
-modifyPeer :: TVar [OnlinePeer] -> Peer -> (OnlinePeer -> OnlinePeer) -> STM ()
-modifyPeer b p f =
-  findPeer b p >>= \case
-    Nothing -> return ()
-    Just o -> insertPeer b $ f o
-
--- | Remove a peer from the list.
-removePeer :: TVar [OnlinePeer] -> Peer -> STM ()
-removePeer b p = modifyTVar b (filter ((/= p) . (.mailbox)))
-
--- | Find a peer by the thread that runs it.
-findPeerAsync :: TVar [OnlinePeer] -> Async () -> STM (Maybe OnlinePeer)
-findPeerAsync b a = find ((== a) . (.async)) <$> readTVar b
-
--- | Find a peer by its address.
-findPeerAddress :: TVar [OnlinePeer] -> SockAddr -> STM (Maybe OnlinePeer)
-findPeerAddress b a = find ((== a) . (.address)) <$> readTVar b
-
--- | Peers that completed the handshake, sorted so that those with the lowest
--- median ping come first.
-getPeers :: (MonadIO m) => PeerMgr -> m [OnlinePeer]
-getPeers = getConnectedPeers
-
--- | Information about a peer, or 'Nothing' if the peer manager does not know it.
--- The peer may still be in the middle of the handshake; check 'online'.
-getOnlinePeer :: (MonadIO m) => PeerMgr -> Peer -> m (Maybe OnlinePeer)
-getOnlinePeer mgr p = atomically (mgr.peers `findPeer` p)
-
--- | Ask the peer manager to check a peer.
-managerCheck :: (MonadIO m) => PeerMgr -> Peer -> m ()
-managerCheck mgr p = CheckPeer p `send` mgr.mailbox
-
--- | Ask the peer manager to connect to an address.
-managerConnect :: (MonadIO m) => PeerMgr -> SockAddr -> m ()
-managerConnect mgr sa = Connect sa `send` mgr.mailbox
+-- | Information about a connection, or 'Nothing' if the peer manager does not
+-- know it. The peer may still be in the handshake, or being disconnected;
+-- check its 'state'.
+getOnlinePeer :: PeerMgr -> Peer -> IO (Maybe OnlinePeer)
+getOnlinePeer mgr p = find ((== p) . (.mailbox)) <$> readTVarIO mgr.peers
 
 -- | Tell the peer manager the height of the best block.
-peerMgrBest :: (MonadIO m) => PeerMgr -> BlockHeight -> m ()
+peerMgrBest :: PeerMgr -> BlockHeight -> IO ()
 peerMgrBest mgr bh = ManagerBest bh `send` mgr.mailbox
 
 -- | Tell the peer manager that a peer acknowledged our version.
-peerMgrVerAck :: (MonadIO m) => PeerMgr -> Peer -> m ()
+peerMgrVerAck :: PeerMgr -> Peer -> IO ()
 peerMgrVerAck mgr p = PeerVerAck p `send` mgr.mailbox
 
 -- | Tell the peer manager that a peer sent its version.
-peerMgrVersion :: (MonadIO m) => PeerMgr -> Peer -> Version -> m ()
+peerMgrVersion :: PeerMgr -> Peer -> Version -> IO ()
 peerMgrVersion mgr p ver = PeerVersion p ver `send` mgr.mailbox
 
 -- | Tell the peer manager that a peer sent a ping, so that it answers with a pong.
-peerMgrPing :: (MonadIO m) => PeerMgr -> Peer -> Word64 -> m ()
+peerMgrPing :: PeerMgr -> Peer -> Word64 -> IO ()
 peerMgrPing mgr p nonce = PeerPing p nonce `send` mgr.mailbox
 
 -- | Tell the peer manager that a peer answered a ping.
-peerMgrPong :: (MonadIO m) => PeerMgr -> Peer -> Word64 -> m ()
+peerMgrPong :: PeerMgr -> Peer -> Word64 -> IO ()
 peerMgrPong mgr p nonce = PeerPong p nonce `send` mgr.mailbox
 
 -- | Tell the peer manager about addresses relayed by a peer. They are added to
 -- the known addresses if discovery is on and they are routable.
-peerMgrAddrs :: (MonadIO m) => PeerMgr -> Peer -> [NetworkAddress] -> m ()
+peerMgrAddrs :: PeerMgr -> Peer -> [NetworkAddress] -> IO ()
 peerMgrAddrs mgr p addrs = PeerAddrs p addrs `send` mgr.mailbox
 
 -- | Wait until the peer manager has handled every message sent to it before.
-peerMgrSync :: (MonadIO m) => PeerMgr -> m ()
+peerMgrSync :: PeerMgr -> IO ()
 peerMgrSync mgr = Sync `query` mgr.mailbox
-
--- | Whether an address that a peer relayed is worth connecting to: a public
--- unicast address with a port. Loopback, private, link-local, shared,
--- documentation, multicast and reserved ranges are refused, so that a peer
--- cannot make the node connect to services on its own host or network.
--- Static peers in the configuration are not checked.
-isRoutable :: SockAddr -> Bool
-isRoutable (SockAddrInet port h) =
-  port /= 0 && routable4 (hostAddressToTuple h)
-isRoutable (SockAddrInet6 port _ h _) =
-  port /= 0 && case hostAddress6ToTuple h of
-    (0, 0, 0, 0, 0, 0xffff, hi, lo) ->
-      routable4
-        ( fromIntegral (hi `div` 256),
-          fromIntegral (hi `mod` 256),
-          fromIntegral (lo `div` 256),
-          fromIntegral (lo `mod` 256)
-        )
-    (a, b, _, _, _, _, _, _)
-      | a == 0 -> False -- unspecified, loopback, IPv4-compatible
-      | a .&. 0xfe00 == 0xfc00 -> False -- unique local
-      | a .&. 0xffc0 == 0xfe80 -> False -- link-local
-      | a .&. 0xffc0 == 0xfec0 -> False -- site-local
-      | a .&. 0xff00 == 0xff00 -> False -- multicast
-      | a == 0x2001 && b == 0x0db8 -> False -- documentation
-      | otherwise -> True
-isRoutable _ = False
-
--- | Whether an IPv4 address is public unicast.
-routable4 :: (Word8, Word8, Word8, Word8) -> Bool
-routable4 (a, b, c, _)
-  | a == 0 = False -- this network
-  | a == 10 = False -- private
-  | a == 100 && b .&. 0xc0 == 64 = False -- shared address space
-  | a == 127 = False -- loopback
-  | a == 169 && b == 254 = False -- link-local
-  | a == 172 && b .&. 0xf0 == 16 = False -- private
-  | a == 192 && b == 0 && c == 0 = False -- protocol assignments
-  | a == 192 && b == 0 && c == 2 = False -- documentation
-  | a == 192 && b == 168 = False -- private
-  | a == 198 && b .&. 0xfe == 18 = False -- benchmarking
-  | a == 198 && b == 51 && c == 100 = False -- documentation
-  | a == 203 && b == 0 && c == 113 = False -- documentation
-  | a >= 224 = False -- multicast and reserved
-  | otherwise = True
-
--- | Split a peer address into host and port. Accepts @host@, @host:port@,
--- @[ipv6]@ and @[ipv6]:port@. Either part is 'Nothing' if missing.
-toHostService :: String -> (Maybe String, Maybe String)
-toHostService str =
-  let host = case m6 of
-        Just (x, _) -> Just x
-        Nothing -> case takeWhile (/= ':') str of
-          [] -> Nothing
-          xs -> Just xs
-      srv = case m6 of
-        Just (_, y) -> s y
-        Nothing -> s str
-      s xs =
-        case dropWhile (/= ':') xs of
-          [] -> Nothing
-          _ : ys -> Just ys
-      m6 = case str of
-        (x : xs)
-          | x == '[' -> do
-              i <- elemIndex ']' xs
-              return $ second (drop 1) $ splitAt i xs
-          | x == ':' -> do
-              return (str, "")
-        _ -> Nothing
-   in (host, srv)
-
--- | Resolve a peer address given as in 'toHostService' into socket addresses,
--- using the default port of the network if none is given. Returns an empty list
--- if it cannot be resolved.
-toSockAddr :: Network -> String -> IO [SockAddr]
-toSockAddr net str =
-  go `catch` e
-  where
-    go = fmap (map addrAddress) $ getAddrInfo Nothing host srv
-    (host, srv) =
-      second (<|> Just (show net.defaultPort)) $
-        toHostService str
-    e :: (Monad m) => SomeException -> m [SockAddr]
-    e _ = return []
 
 -- | Median of a list, or 'Nothing' if it is empty.
 median :: (Ord a, Fractional a) => [a] -> Maybe a

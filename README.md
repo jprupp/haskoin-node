@@ -70,6 +70,18 @@ a full node.
 - **Small, isolated components.** The peer manager, the header chain and each
   connection are separate [NQE](https://github.com/jprupp/nqe) processes with
   their own state. One misbehaving peer dies alone.
+- **Explicit protocol states.** What the node expects from each peer, during the
+  handshake, while syncing headers and while receiving requested data, is
+  written down as a pure state machine. A message that does not fit the current
+  state is refused instead of handled by accident, and every rule is tested
+  without a network.
+- **Plain `IO`.** Every function runs in `IO`, with no monad transformers and
+  no `MonadIO` or `MonadUnliftIO` constraints. Types say exactly what runs, GHC
+  has nothing to specialise, and long-running loops cannot leak through an
+  unspecialised dictionary. From your own monad, call the node with `liftIO`.
+- **Never stuck.** Every hint that a peer has blocks the node lacks makes it ask
+  for headers, and a quiet period makes it ask every peer, so a missed
+  announcement cannot leave the chain behind.
 
 ## Features
 
@@ -77,11 +89,11 @@ a full node.
 | --------------- | ---------------------------------------------------------------------------------------------- |
 | Networks        | Every network of haskoin-core: Bitcoin and Bitcoin Cash mainnet, testnets and regtest           |
 | Peer discovery  | DNS seeds and addresses relayed by peers, or a static list of peers                             |
-| Peer management | Version handshake, ping-based latency, peers sorted by median ping, rotation after a maximum age |
-| Header sync     | Headers downloaded from one peer at a time, connected to the chain with the most work, stored in RocksDB |
+| Peer management | Version handshake, ping-based latency, peers sorted by median ping, rotation after a maximum age, retry backoff and bans for bad addresses |
+| Header sync     | Headers downloaded from one peer at a time, connected to the chain with the most work, stored in RocksDB; new blocks followed whether peers announce them with headers or inventory, and peers polled after a quiet period |
 | Events          | Best header changes, sync completion, peer connections and every message received              |
 | Data requests   | Fetch blocks and transactions from a peer, with a timeout                                       |
-| Protection      | Strict parsing, per-command size limits, back-pressure, bounded address pool                    |
+| Protection      | Strict parsing, per-command size limits, back-pressure, bounded address pool, explicit handshake states |
 
 ### What is not included
 
@@ -150,7 +162,7 @@ add it and its dependencies to `stack.yaml`:
 
 ```yaml
 extra-deps:
-  - haskoin-node-2.3.1
+  - haskoin-node-2.4.0
   - haskoin-core-1.6.1
   - secp256k1-haskell-2.0.1
   - base16-2.0
@@ -312,10 +324,27 @@ only twenty lines because none of that is its concern.
 
 - The **peer manager** (`Haskoin.Node.PeerMgr`) finds peer addresses, connects
   to them, does the version handshake, pings them, and drops those that are slow,
-  silent, misbehaving or too old.
+  silent, misbehaving or too old. An address whose connection failed is tried
+  again later each time, and one whose peer misbehaved waits a day.
 - The **chain** (`Haskoin.Node.Chain`) asks one peer at a time for headers,
   connects them to the headers it has, follows the chain with the most work, and
-  stores the headers in RocksDB.
+  stores the headers in RocksDB. It asks a peer for headers whenever the peer
+  announces blocks it does not know, with headers or with inventory, and asks
+  every peer when it has heard nothing for `timeout` seconds.
+
+The rules for talking to peers are pure state machines, each in its own module:
+
+| Module                           | Rules                                                          |
+| -------------------------------- | -------------------------------------------------------------- |
+| `Haskoin.Node.PeerMgr.Lifecycle` | Life of a connection: handshake, pings, timers, disconnection  |
+| `Haskoin.Node.PeerMgr.Handshake` | The version handshake, the first stage of a connection         |
+| `Haskoin.Node.PeerMgr.Addresses` | Which address to try next, and when to retry one               |
+| `Haskoin.Node.Chain.Sync`        | Which peer to ask for headers, and when headers count as synced |
+| `Haskoin.Node.Peer.Request`      | Receiving requested blocks and transactions                    |
+| `Haskoin.Node.Peer.Lock`         | Who may hold a peer for a long conversation                    |
+
+The processes store the state and carry out what a transition says. Time is an
+input to the transitions, so every timing rule is tested without waiting.
 
 Each peer connection is its own process (`Haskoin.Node.Peer`), run by a
 supervisor inside the peer manager.
@@ -353,7 +382,8 @@ Headers are stored in the column family you configure, or the default one:
 | `0x92`     | data version                  |
 
 You can keep your own data in the same database, as Haskoin Store does, as long
-as your keys do not start with these bytes.
+as your keys do not start with these bytes. `Haskoin.Node.Chain.Database` has
+the code.
 
 ## Usage guide
 
@@ -371,8 +401,27 @@ case ps of
 ```
 
 `getBlocks`, `getTxs` and `getData` return `Nothing` if the peer does not send
-everything, in order, before the timeout in seconds. `pingPeer` measures a round
-trip.
+everything, in order, before the timeout in seconds. Unrelated messages that the
+peer sends in between are ignored. `pingPeer` measures a round trip.
+
+`getPeers` leaves out peers that are being disconnected, even before their
+connection closes.
+
+For a conversation that spans many messages, such as downloading a long run of
+blocks, reserve the peer first so that no other task uses it at the same time.
+The header chain does the same while it syncs. Only the owner that reserved a
+peer can release it:
+
+```haskell
+owner <- newOwner "downloader"
+reserved <- reservePeer owner p
+when reserved $ do
+  -- ... long conversation with p ...
+  void (releasePeer owner p)
+```
+
+`setBusy` and `setFree` still work, but are deprecated: they act for a single
+owner shared by all their callers.
 
 ### Querying headers
 
@@ -385,7 +434,7 @@ parents <- chainGetParents node.chain height top
 synced <- chainIsSynced node.chain
 ```
 
-`runChainT` runs the header functions of haskoin-core, such as `getAncestor`,
+`chainRunHeaders` runs the header functions of haskoin-core, such as `getAncestor`,
 against the database of the chain.
 
 ### Static peers
@@ -420,25 +469,42 @@ own `push` function to log elsewhere.
 | `address`     | This node's address, sent in version messages                             |
 | `net`         | Network constants from haskoin-core (`btc`, `bch`, `btcTest`, ...)        |
 | `pub`         | Publisher that receives every `NodeEvent`                                 |
-| `timeout`     | Seconds of silence, or without a pong, before a peer is dropped           |
+| `timeout`     | Seconds of silence, without a pong, or without completing the handshake, before a peer is dropped; also how long the syncing peer may take to send headers, and the quiet period after which every peer is asked for headers |
 | `maxPeerLife` | Seconds after which a peer is dropped, so that connections rotate         |
 | `connect`     | How to open a connection; usually `withConnection`                        |
 | `logger`      | Where to log; see `withLogger`                                            |
 
 ## Module overview
 
-`Haskoin.Node` is the only exposed module. It re-exports:
+`Haskoin.Node` re-exports everything a program needs:
 
 | Part           | Contents                                                                    |
 | -------------- | --------------------------------------------------------------------------- |
 | Node           | `NodeConfig`, `NodeEvent`, `Node`, `withNode`, `withConnection`              |
-| Peers          | `Peer`, `PeerEvent`, `sendMessage`, `getBlocks`, `getTxs`, `getData`, `pingPeer`, `killPeer` |
-| Peer manager   | `PeerMgr`, `OnlinePeer`, `getPeers`, `getOnlinePeer`, `toSockAddr`, `isRoutable` |
-| Chain          | `Chain`, `ChainEvent`, `chainGetBest`, `chainGetBlock`, `chainGetAncestor`, `chainGetParents`, `chainGetSplitBlock`, `chainBlockMain`, `chainIsSynced`, `runChainT` |
+| Peers          | `Peer`, `PeerEvent`, `PeerException`, `sendMessage`, `getBlocks`, `getTxs`, `getData`, `pingPeer`, `killPeer`, `newOwner`, `reservePeer`, `releasePeer` |
+| Peer manager   | `PeerMgr`, `OnlinePeer`, `PeerState`, `Stage`, `DisconnectReason`, `getPeers`, `getOnlinePeer`, `toSockAddr`, `isRoutable` |
+| Chain          | `Chain`, `ChainEvent`, `chainGetBest`, `chainGetBlock`, `chainGetAncestor`, `chainGetParents`, `chainGetSplitBlock`, `chainBlockMain`, `chainIsSynced`, `chainRunHeaders` |
 | Logging        | `Logger`, `LogLevel`, `withLogger`, `withSource`, `logDebug` ... `logError`  |
 
 The lower-level functions that feed messages to the peer manager and the chain
 are exported too, for programs that wire the components themselves.
+
+Every module is exposed and can be imported on its own:
+
+| Module                           | Purpose                                                     |
+| -------------------------------- | ----------------------------------------------------------- |
+| `Haskoin.Node.Peer`              | The process that talks to one peer, and data requests       |
+| `Haskoin.Node.Peer.Request`      | State machine for receiving requested blocks and transactions |
+| `Haskoin.Node.Peer.Lock`         | State machine for reserving a peer                          |
+| `Haskoin.Node.PeerMgr`           | Finds, connects, ranks and drops peers                      |
+| `Haskoin.Node.PeerMgr.Lifecycle` | State machine for the life of a connection                  |
+| `Haskoin.Node.PeerMgr.Handshake` | State machine for the version handshake                     |
+| `Haskoin.Node.PeerMgr.Addresses` | State machine for the address book                          |
+| `Haskoin.Node.Chain`             | Keeps the header chain in sync                              |
+| `Haskoin.Node.Chain.Sync`        | State machine that decides which peer to ask for headers, and when the chain is synced |
+| `Haskoin.Node.Chain.Database`    | Storage of headers in RocksDB                               |
+| `Haskoin.Node.Address`           | Parsing peer addresses and opening connections              |
+| `Haskoin.Node.Logger`            | Logging                                                     |
 
 ## Security notes
 
@@ -447,11 +513,21 @@ are exported too, for programs that wire the components themselves.
   for everything but block messages.
 - List messages are refused as soon as their count is over the limit, such as
   2000 headers, 1000 addresses or 50000 inventory entries.
-- A peer that sends anything invalid is disconnected.
+- A peer that sends anything invalid is disconnected, with a `PeerException`
+  saying why.
+- A peer that sends a second version or verack, or does not complete the
+  handshake within `timeout` seconds even while sending other messages, is
+  disconnected.
+- A peer that sends invalid headers, or does not answer a request for headers in
+  time, is never asked for headers again before it disconnects.
 - Addresses relayed by peers are only used if they are public unicast
   addresses, so a peer cannot make the node connect to services on its own host
   or network. Static peers are not checked.
 - At most 4096 relayed addresses are kept.
+- An address whose connection fails waits twice as long after each failure
+  before it is tried again, up to ten minutes. A relayed address whose peer
+  broke the protocol is not tried again for a day. Static peers are never
+  banned, and wait at most ten minutes.
 - Headers are not reported as synced until they have the minimum chain work of
   the network. Above that work, forks from far below the tip on a chain with
   less work are refused.
@@ -475,9 +551,34 @@ RocksDB and libsecp256k1.
 `package.yaml` is the source of the package description. Change it rather than
 `haskoin-node.cabal`, which [hpack](https://github.com/sol/hpack) generates.
 
-The tests are in `test/` and use [hspec](https://hspec.github.io/). They run
-against mock peers on the Bitcoin Cash regression test network, so they need no
-Internet access.
+The package also builds with [Cabal](https://www.haskell.org/cabal)
+(`cabal build`, `cabal test`).
+
+There are two test suites, using [hspec](https://hspec.github.io/) and
+[QuickCheck](https://hackage.haskell.org/package/QuickCheck):
+
+- `spec` (`test/unit`) tests the state machines with properties, and runs the
+  peer, peer manager, chain and node against in-memory mock peers. It needs no
+  Internet access.
+
+  ```sh
+  stack test haskoin-node:spec
+  ```
+
+- `regtest` (`test/regtest`) runs the node against
+  [Bitcoin Core](https://bitcoincore.org) and
+  [Bitcoin Cash Node](https://bitcoincashnode.org) in regression test mode. The
+  nodes run in a [Podman](https://podman.io) container built from
+  `test/regtest/Containerfile`, which installs the official release binaries on
+  Ubuntu after checking their SHA-256 hashes. The image is built the first time
+  the suite runs. Nodes use random ports, so runs do not collide. The suite is
+  skipped if Podman is missing or `HASKOIN_NODE_SKIP_REGTEST` is set.
+
+  ```sh
+  stack test haskoin-node:regtest
+  ```
+
+Set `HASKOIN_TEST_LOG` to see the node's logs while tests run.
 
 ### Contributing
 

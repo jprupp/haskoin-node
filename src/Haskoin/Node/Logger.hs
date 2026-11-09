@@ -1,11 +1,5 @@
-{-# LANGUAGE ImportQualifiedPost #-}
-{-# LANGUAGE NamedFieldPuns #-}
-{-# LANGUAGE OverloadedRecordDot #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE NoFieldSelectors #-}
-
 -- | Logging to standard error. A 'Logger' is a plain value carried in
--- configuration records, so code that logs only needs 'MonadIO'.
+-- configuration records, so code that logs only needs 'IO'.
 --
 -- The node used to log through a logging monad transformer. That forced every
 -- function into that monad, and made polymorphic loops leak memory when GHC did
@@ -24,6 +18,7 @@ module Haskoin.Node.Logger
   )
 where
 
+import Control.Exception (bracket)
 import Control.Monad (when)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -34,7 +29,6 @@ import System.Log.FastLogger
     newFastLogger1,
     toLogStr,
   )
-import UnliftIO (MonadIO, bracket, liftIO)
 
 -- | Severity of a log message, from least to most severe.
 data LogLevel
@@ -74,9 +68,9 @@ withSource source logger = logger {source}
 
 -- | Log a message at a level, if the level is at least that of the 'Logger'.
 -- Lines look like monad-logger's: @[Info#Chain] message@.
-logAt :: (MonadIO m) => LogLevel -> Logger -> Text -> m ()
+logAt :: LogLevel -> Logger -> Text -> IO ()
 logAt l logger msg =
-  when (l >= logger.level) . liftIO . logger.push $
+  when (l >= logger.level) . logger.push $
     "[" <> toLogStr (drop 5 (show l)) <> tag <> "] " <> toLogStr msg <> "\n"
   where
     tag
@@ -84,7 +78,7 @@ logAt l logger msg =
       | otherwise = "#" <> toLogStr logger.source
 
 -- | Log at 'LevelDebug', 'LevelInfo', 'LevelWarn' or 'LevelError'.
-logDebug, logInfo, logWarn, logError :: (MonadIO m) => Logger -> Text -> m ()
+logDebug, logInfo, logWarn, logError :: Logger -> Text -> IO ()
 logDebug = logAt LevelDebug
 logInfo = logAt LevelInfo
 logWarn = logAt LevelWarn

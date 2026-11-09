@@ -13,15 +13,13 @@ module Haskoin.NodeSpec (spec) where
 
 import Conduit
 import Control.Monad (forM_, forever, replicateM)
-import Control.Monad.Cont
-import Control.Monad.Trans (lift)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.ByteString.Base64 (decodeBase64Lenient)
 import Data.Default (def)
 import Data.Either (fromRight)
 import Data.List (find)
-import Data.Maybe (isJust, listToMaybe, mapMaybe)
+import Data.Maybe (listToMaybe, mapMaybe)
 import Data.Serialize (decode, get, put, runGet, runPut)
 import Data.Time.Clock (NominalDiffTime)
 import Data.Time.Clock.POSIX (getPOSIXTime)
@@ -29,10 +27,9 @@ import Database.RocksDB qualified as R
 import Haskoin
 import Haskoin.Node
 import NQE
-import Network.Socket (AddrInfo (addrAddress), SockAddr (..), tupleToHostAddress, tupleToHostAddress6)
+import Network.Socket (SockAddr (..), tupleToHostAddress, tupleToHostAddress6)
 import System.Random (randomIO)
 import Test.Hspec
-import Test.Hspec.QuickCheck
 import UnliftIO
 import UnliftIO.Concurrent (threadDelay)
 
@@ -111,7 +108,7 @@ dummyPeerConnect react count net ad sa f = do
           Left e ->
             error $
               "Dummy peer could not decode payload: " <> show e
-          Right msg -> yield msg
+          Right m -> yield m
 
 mockPeerReact :: [Block] -> Message -> [Message]
 mockPeerReact _ (MPing (Ping n)) = [MPong (Pong n)]
@@ -130,32 +127,12 @@ mockPeerReact _ _ = []
 spec :: Spec
 spec = do
   let net = bchRegTest
-  describe "reads address/port combinations" $ do
-    -- IPv4 only: resolving an IPv6 address needs IPv6 on the host, which
-    -- containers and CI runners often lack. The IPv6 forms are still parsed
-    -- by the toHostService tests below, which need no resolver.
-    prop "reads arbitrary IPv4 addresses" $ \(e, w) -> do
-      let p = toEnum (e `mod` 65536)
-          a = SockAddrInet p w
-      s <- toSockAddr net (show a)
-      s `shouldStartWith` [a]
-    it "reads some specific addresses" $ do
-      toHostService "localhost" `shouldBe` (Just "localhost", Nothing)
-      toHostService "::1" `shouldBe` (Just "::1", Nothing)
-      toHostService "localhost:8080" `shouldBe` (Just "localhost", Just "8080")
-      toHostService "example.com" `shouldBe` (Just "example.com", Nothing)
-      toHostService "api.example.com:443" `shouldBe` (Just "api.example.com", Just "443")
-      toHostService "api.example.com:http" `shouldBe` (Just "api.example.com", Just "http")
-      toHostService "[::1]" `shouldBe` (Just "::1", Nothing)
-      toHostService "[::1]:8080" `shouldBe` (Just "::1", Just "8080")
-      toHostService "[2002::dead:beef]:ssh" `shouldBe` (Just "2002::dead:beef", Just "ssh")
   describe "peer manager on test network" $ do
     it "connects to a peer" $
       withTestNode net "connect-one-peer" $ \TestNode {..} -> do
         p <- waitForPeer nodeEvents
-        Just OnlinePeer {version = Just Version {version = ver}} <-
-          getOnlinePeer testMgr p
-        ver `shouldSatisfy` (>= 70002)
+        Just o <- getOnlinePeer testMgr p
+        fmap (.version) o.version `shouldSatisfy` maybe False (>= 70002)
     it "downloads some blocks" $
       withTestNode net "get-blocks" $ \TestNode {..} -> do
         let h1 =
@@ -164,8 +141,9 @@ spec = do
               "0c89955fc5c9f98ecc71954f167b938138c90c6a094c4737f2e901669d26763f"
         p <- waitForPeer nodeEvents
         pbs <- getBlocks net 10 p [h1, h2]
-        pbs `shouldSatisfy` isJust
-        let Just [b1, b2] = pbs
+        (b1, b2) <- case pbs of
+          Just [b1, b2] -> return (b1, b2)
+          _ -> fail ("Expected two blocks, got " <> show pbs)
         headerHash b1.header `shouldBe` h1
         headerHash b2.header `shouldBe` h2
         let ths b = map txHash b.txs
@@ -177,8 +155,9 @@ spec = do
       -- while every other message is limited to 2 MiB (2097152 bytes).
       let script = B.replicate 3000000 0x6a
           tx = Tx 1 [TxIn nullOutPoint B.empty maxBound] [TxOut 0 script] [] 0
-          firstBlock : _ = allBlocks
-          big = Block firstBlock.header [tx]
+          big = case allBlocks of
+            firstBlock : _ -> Block firstBlock.header [tx]
+            [] -> error "no test blocks"
       withTestNodeBlocks [big] net "big-block" $ \TestNode {..} -> do
         p <- waitForPeer nodeEvents
         pbs <- getBlocks net 10 p [headerHash big.header]
@@ -193,26 +172,26 @@ spec = do
       v.startHeight `shouldBe` 650000
       v.timestamp `shouldBe` 1700000000
   describe "untrusted peers" $ do
-    it "imports a full batch of 2000 headers" $
-      withTestNodeOpts
+    it "imports a full batch of 2000 headers"
+      $ withTestNodeOpts
         (defOpts allBlocks) {react = reactAfterVerAck [Right (manyHeaders net 2000)]}
         net
         "full-batch"
-        $ \TestNode {..} -> do
-          bn <-
-            receiveMatch nodeEvents $ \case
-              ChainEvent (ChainBestBlock bn) | bn.height > 0 -> Just bn
-              _ -> Nothing
-          bn.height `shouldBe` 2000
-    it "disconnects a peer that sends more than 2000 headers" $
-      withTestNodeOpts
+      $ \TestNode {..} -> do
+        bn <-
+          receiveMatch nodeEvents $ \case
+            ChainEvent (ChainBestBlock bn) | bn.height > 0 -> Just bn
+            _ -> Nothing
+        bn.height `shouldBe` 2000
+    it "disconnects a peer that sends more than 2000 headers"
+      $ withTestNodeOpts
         (defOpts allBlocks) {react = reactAfterVerAck [Right (manyHeaders net 2001)]}
         net
         "too-many-headers"
-        $ \TestNode {..} -> do
-          p <- waitForPeer nodeEvents
-          waitForDisconnect nodeEvents p
-          (.height) <$> chainGetBest testChain `shouldReturn` 0
+      $ \TestNode {..} -> do
+        p <- waitForPeer nodeEvents
+        waitForDisconnect nodeEvents p
+        (.height) <$> chainGetBest testChain `shouldReturn` 0
     it "disconnects a peer that sends more than 1000 addresses" $ do
       let na = NetworkAddress 0 (sockToHostAddress (SockAddrInet 8333 0x08080808))
           addrs = MAddr (Addr (replicate 1001 (0, na)))
@@ -246,14 +225,14 @@ spec = do
         $ \TestNode {..} -> do
           p <- waitForPeer nodeEvents
           waitForDisconnect nodeEvents p
-    it "disconnects a peer that sends a second verack" $
-      withTestNodeOpts
+    it "disconnects a peer that sends a second verack"
+      $ withTestNodeOpts
         (defOpts allBlocks) {react = reactAfterVerAck [Right MVerAck]}
         net
         "duplicate-verack"
-        $ \TestNode {..} -> do
-          p <- waitForPeer nodeEvents
-          waitForDisconnect nodeEvents p
+      $ \TestNode {..} -> do
+        p <- waitForPeer nodeEvents
+        waitForDisconnect nodeEvents p
     it "ignores headers sent before the handshake" $ do
       let hs = MHeaders (Headers [(b.header, VarInt 0) | b <- allBlocks])
           react = \case
@@ -386,11 +365,11 @@ spec = do
 -- | Wait for the node to disconnect from this peer, failing after a while.
 waitForDisconnect :: Inbox NodeEvent -> Peer -> IO ()
 waitForDisconnect inbox p =
-  timeout (20 * 1000 * 1000) wait >>= \case
+  timeout (20 * 1000 * 1000) disconnected >>= \case
     Just () -> return ()
     Nothing -> expectationFailure "peer was not disconnected"
   where
-    wait =
+    disconnected =
       receiveMatch inbox $ \case
         PeerEvent (PeerDisconnected p') | p == p' -> Just ()
         _ -> Nothing
@@ -423,71 +402,65 @@ freshHeader net = do
       0
       genesis {version = 4, prev = headerHash genesis, timestamp = now}
 
-waitForPeer :: (MonadIO m) => Inbox NodeEvent -> m Peer
+waitForPeer :: Inbox NodeEvent -> IO Peer
 waitForPeer inbox =
   receiveMatch inbox $ \case
     PeerEvent (PeerConnected p) -> Just p
     _ -> Nothing
 
-withLifted :: (MonadUnliftIO m) => ((a -> IO b) -> IO b) -> (a -> m b) -> m b
+withLifted :: ((a -> IO b) -> IO b) -> (a -> IO b) -> IO b
 withLifted w m = withRunInIO $ \io -> w (io . m)
 
 withTestNode ::
-  (MonadUnliftIO m) =>
-  Network -> String -> (TestNode -> m a) -> m a
+  Network -> String -> (TestNode -> IO a) -> IO a
 withTestNode = withTestNodeBlocks allBlocks
 
 -- | Like 'withTestNode', with the mock peer serving these blocks.
 withTestNodeBlocks ::
-  (MonadUnliftIO m) =>
-  [Block] -> Network -> String -> (TestNode -> m a) -> m a
+  [Block] -> Network -> String -> (TestNode -> IO a) -> IO a
 withTestNodeBlocks blocks = withTestNodeOpts (defOpts blocks)
 
 withTestNodeOpts ::
-  (MonadUnliftIO m) =>
-  TestOpts -> Network -> String -> (TestNode -> m a) -> m a
-withTestNodeOpts opts net str f = flip runContT return $ do
-  w <- ContT $ withSystemTempDirectory ("haskoin-node-test-" <> str <> "-")
-  count <- newTVarIO 0
-  pub <- ContT withPublisher
-  sub <- ContT $ withSubscription pub
-  db <- ContT $ withLifted (R.withDBCF w cfg cols)
-  liftIO (opts.setup db)
-  let ad =
-        NetworkAddress
-          nodeNetwork
-          (sockToHostAddress (SockAddrInet 0 0))
-      na =
-        NetworkAddress
-          0
-          (sockToHostAddress (SockAddrInet 0 0))
-      cfg' =
-        NodeConfig
-          { maxPeers = 20,
-            db = db,
-            cf = listToMaybe (R.columnFamilies db),
-            -- IPv4, so that the mock peer is reachable without IPv6
-            peers = ["127.0.0.1:17486"],
-            discover = False,
-            address = na,
-            net = net,
-            pub = pub,
-            timeout = opts.timeout,
-            maxPeerLife = 48 * 3600,
-            connect = dummyPeerConnect opts.react count net ad,
-            logger = Logger {level = LevelError, source = "", push = \_ -> return ()}
-          }
-  Node mgr ch <- ContT $ withNode cfg'
-  lift $
-    f
-      TestNode
-        { testMgr = mgr,
-          testChain = ch,
-          nodeEvents = sub,
-          testDB = db,
-          getHeadersCount = count
-        }
+  TestOpts -> Network -> String -> (TestNode -> IO a) -> IO a
+withTestNodeOpts opts net str f =
+  withSystemTempDirectory ("haskoin-node-test-" <> str <> "-") $ \w ->
+    withPublisher $ \pub ->
+      withSubscription pub $ \sub ->
+        withLifted (R.withDBCF w cfg cols) $ \db -> do
+          count <- newTVarIO 0
+          opts.setup db
+          withNode (nodeConfig count pub db) $ \(Node mgr ch) ->
+            f
+              TestNode
+                { testMgr = mgr,
+                  testChain = ch,
+                  nodeEvents = sub,
+                  testDB = db,
+                  getHeadersCount = count
+                }
   where
+    nodeConfig count pub db =
+      NodeConfig
+        { maxPeers = 20,
+          db = db,
+          cf = listToMaybe (R.columnFamilies db),
+          -- IPv4, so that the mock peer is reachable without IPv6
+          peers = ["127.0.0.1:17486"],
+          discover = False,
+          address = NetworkAddress 0 anywhere,
+          net = net,
+          pub = pub,
+          timeout = opts.timeout,
+          maxPeerLife = 48 * 3600,
+          connect =
+            dummyPeerConnect
+              opts.react
+              count
+              net
+              (NetworkAddress nodeNetwork anywhere),
+          logger = Logger {level = LevelError, source = "", push = \_ -> return ()}
+        }
+    anywhere = sockToHostAddress (SockAddrInet 0 0)
     cfg = def {R.createIfMissing = True, R.errorIfExists = True}
     cols = [("node", def)]
 

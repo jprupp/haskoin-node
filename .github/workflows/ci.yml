@@ -8,6 +8,9 @@ name: CI
 #   stack.yaml come from nixpkgs, as on NixOS or with "stack --nix" locally.
 #
 # Both jobs also build the Haddock documentation, so broken markup fails CI.
+# They skip the regtest suite, which the regtest job runs: it starts Bitcoin
+# Core and Bitcoin Cash Node in Podman, which takes longer and needs to
+# download the node binaries.
 
 on:
   push:
@@ -54,6 +57,8 @@ jobs:
           restore-keys: stack-os-${{ runner.os }}-
 
       - name: Build, test and build the documentation
+        env:
+          HASKOIN_NODE_SKIP_REGTEST: "1"
         run: stack --no-nix build --install-ghc --test --haddock --no-haddock-deps
 
   nix:
@@ -95,5 +100,47 @@ jobs:
           key: stack-nix-${{ runner.os }}-${{ hashFiles('stack.yaml', 'stack.yaml.lock', '**/package.yaml') }}
           restore-keys: stack-nix-${{ runner.os }}-
 
+      # Stack names its compiled Setup programs by Cabal and GHC version
+      # only. A cache from an older nixos-unstable can hold one linked against
+      # Nix store paths that this runner does not have, and running it fails
+      # with "posix_spawnp: does not exist". Rebuilding them takes seconds.
+      - name: Drop cached Setup programs
+        run: rm -rf ~/.stack/setup-exe-cache
+
       - name: Build, test and build the documentation
+        env:
+          HASKOIN_NODE_SKIP_REGTEST: "1"
         run: stack --nix build --test --haddock --no-haddock-deps
+
+  regtest:
+    name: Regtest against Bitcoin Core and Bitcoin Cash Node
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y librocksdb-dev libsecp256k1-dev pkg-config zlib1g-dev podman
+
+      - name: Set up Stack
+        uses: haskell-actions/setup@v2
+        with:
+          enable-stack: true
+          stack-version: latest
+          stack-no-global: true
+
+      - name: Cache Stack
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.stack
+            .stack-work
+          key: stack-os-${{ runner.os }}-${{ hashFiles('stack.yaml', 'stack.yaml.lock', '**/package.yaml') }}
+          restore-keys: stack-os-${{ runner.os }}-
+
+      # The suite builds the image from test/regtest/Containerfile, which
+      # downloads the official binaries and checks their hashes.
+      - name: Run the regtest suite
+        run: stack --no-nix test --install-ghc haskoin-node:regtest
