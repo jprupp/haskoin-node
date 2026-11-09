@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   breaks, so the generated cabal file has shorter lines.
 - The instructions for contributors and for Claude ask for lines of code
   shorter than 120 columns and for scripts in their own files.
+- The README shows a badge with the status of CI on `master`.
 
 ## [2.4.0] - 2026-11-09
 

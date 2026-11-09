@@ -1,5 +1,6 @@
 # Haskoin Node
 
+[![CI](https://github.com/jprupp/haskoin-node/actions/workflows/ci.yml/badge.svg)](https://github.com/jprupp/haskoin-node/actions/workflows/ci.yml)
 [![Hackage](https://img.shields.io/hackage/v/haskoin-node.svg)](https://hackage.haskell.org/package/haskoin-node)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/jprupp/haskoin-node/blob/master/LICENSE)
 
