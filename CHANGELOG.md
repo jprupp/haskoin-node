@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- The CI workflow's shell steps moved into `scripts/check-local-deps.sh` and
+  `scripts/install-system-libraries.sh`, and the regtest Containerfile's
+  install step into `test/regtest/install-nodes.sh`, so each can be read and
+  run on its own. The package description in `package.yaml` keeps its line
+  breaks, so the generated cabal file has shorter lines.
+- The instructions for contributors and for Claude ask for lines of code
+  shorter than 120 columns and for scripts in their own files.
+
 ## [2.4.0] - 2026-11-09
 
 ### Added

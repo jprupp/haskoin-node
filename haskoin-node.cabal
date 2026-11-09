@@ -7,7 +7,10 @@ cabal-version: 1.18
 name:           haskoin-node
 version:        2.4.0
 synopsis:       P2P library for Bitcoin and Bitcoin Cash
-description:    Connect to Bitcoin (BTC) and Bitcoin Cash (BCH) peers, keep them healthy, and sync block headers into a RocksDB database. Blocks and transactions can be downloaded from connected peers. See the README on GitHub at <https://github.com/jprupp/haskoin-node#readme>.
+description:    Connect to Bitcoin (BTC) and Bitcoin Cash (BCH) peers, keep them healthy, and
+                sync block headers into a RocksDB database. Blocks and transactions can be
+                downloaded from connected peers. See the README on GitHub at
+                <https://github.com/jprupp/haskoin-node#readme>.
 category:       Bitcoin, Finance, Network
 homepage:       https://github.com/jprupp/haskoin-node#readme
 bug-reports:    https://github.com/jprupp/haskoin-node/issues
@@ -21,6 +24,7 @@ tested-with:
     GHC == 9.12.4
 extra-source-files:
     test/regtest/Containerfile
+    test/regtest/install-nodes.sh
 extra-doc-files:
     README.md
     CHANGELOG.md

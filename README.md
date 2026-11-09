@@ -569,8 +569,9 @@ There are two test suites, using [hspec](https://hspec.github.io/) and
   [Bitcoin Core](https://bitcoincore.org) and
   [Bitcoin Cash Node](https://bitcoincashnode.org) in regression test mode. The
   nodes run in a [Podman](https://podman.io) container built from
-  `test/regtest/Containerfile`, which installs the official release binaries on
-  Ubuntu after checking their SHA-256 hashes. The image is built the first time
+  `test/regtest/Containerfile`, whose script `test/regtest/install-nodes.sh`
+  installs the official release binaries on Ubuntu after checking their SHA-256
+  hashes. The image is built the first time
   the suite runs. Nodes use random ports, so runs do not collide. The suite is
   skipped if Podman is missing or `HASKOIN_NODE_SKIP_REGTEST` is set.
 
@@ -580,12 +581,22 @@ There are two test suites, using [hspec](https://hspec.github.io/) and
 
 Set `HASKOIN_TEST_LOG` to see the node's logs while tests run.
 
+CI builds and tests every change with the OS libraries, with `stack --nix`,
+and against the regtest nodes. Its steps call the scripts in `scripts/`, which
+you can also run locally: `scripts/check-local-deps.sh` fails if `stack.yaml`
+points at a package outside the repository, which CI cannot build, and
+`scripts/install-system-libraries.sh` installs the C libraries on Ubuntu.
+
 ### Contributing
 
 Pull requests are welcome.
 
 - Format the code with [Ormolu](https://github.com/tweag/ormolu).
 - Add tests for the behaviour you change.
+- Keep lines of code, including scripts, workflows and the examples in the
+  documentation, shorter than 120 columns.
+- Put multi-line scripts in their own files rather than embedding them in a
+  workflow or a Containerfile.
 - Describe the change under a new version in `CHANGELOG.md`. The file follows
   [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and versions follow
   [Semantic Versioning](https://semver.org/).

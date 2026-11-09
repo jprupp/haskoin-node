@@ -63,7 +63,8 @@ maxNodes = 3
 image :: String
 image = "localhost/haskoin-node-regtest:latest"
 
--- | Directory with the Containerfile, relative to the package root.
+-- | Build context of the image: the directory with the Containerfile and the
+-- @install-nodes.sh@ script it runs, relative to the package root.
 imageDir :: FilePath
 imageDir = "test/regtest"
 

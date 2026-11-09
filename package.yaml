@@ -1,7 +1,8 @@
 name: haskoin-node
 version: 2.4.0
 synopsis: P2P library for Bitcoin and Bitcoin Cash
-description: >-
+# A literal block, so that hpack keeps the line breaks in the cabal file.
+description: |
   Connect to Bitcoin (BTC) and Bitcoin Cash (BCH) peers, keep them healthy, and
   sync block headers into a RocksDB database. Blocks and transactions can be
   downloaded from connected peers. See the README on GitHub at
@@ -19,6 +20,7 @@ extra-doc-files:
   - CHANGELOG.md
 extra-source-files:
   - test/regtest/Containerfile
+  - test/regtest/install-nodes.sh
 
 language: GHC2024
 default-extensions:
@@ -28,6 +30,8 @@ default-extensions:
   - OverloadedRecordDot
   - OverloadedStrings
 
+# hpack joins these options onto one line of the generated cabal file, which
+# is longer than 120 columns. hpack has no way to break it, so it stays long.
 ghc-options:
   - -Wall
   - -Wcompat
