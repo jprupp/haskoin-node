@@ -158,7 +158,7 @@ add it and its dependencies to `stack.yaml`:
 
 ```yaml
 extra-deps:
-  - haskoin-node-2.3.1
+  - haskoin-node-2.4.0
   - haskoin-core-1.6.1
   - secp256k1-haskell-2.0.1
   - base16-2.0
