@@ -1,0 +1,49 @@
+# Regtest image with official Bitcoin Core and Bitcoin Cash Node binaries.
+#
+# Build with:
+#   podman build -t haskoin-node-regtest regtest
+#
+# Hashes come from the official SHA256SUMS files published by each project:
+#   https://bitcoincore.org/bin/bitcoin-core-32.1/SHA256SUMS
+#   https://gitlab.com/bitcoin-cash-node/announcements/-/tree/master/release-sigs/29.2.0
+FROM docker.io/library/ubuntu:26.04
+
+ARG TARGETARCH
+ARG CORE_VERSION=32.1
+ARG CORE_SHA256_amd64=61545c17c3120fb7412f896d248b11993af04ec8817aad3649c55b2afb044963
+ARG CORE_SHA256_arm64=7ed37c7373eb6aa3e3f72842596a1afeba1b223717033cade9842b25773e1922
+ARG BCHN_VERSION=29.2.0
+ARG BCHN_SHA256_amd64=23bbe9ff749136a9b832a2a59023ce76a5391322c1ea2f4f24b5b91f035081bc
+ARG BCHN_SHA256_arm64=27e177e5a07dc78c2c0d18798ea2e3925111955509ecdc476e828e7ce8f46383
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl libatomic1 \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN set -eu; \
+    arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+    case "$arch" in \
+      amd64) triple=x86_64-linux-gnu; core_sha="$CORE_SHA256_amd64"; bchn_sha="$BCHN_SHA256_amd64" ;; \
+      arm64) triple=aarch64-linux-gnu; core_sha="$CORE_SHA256_arm64"; bchn_sha="$BCHN_SHA256_arm64" ;; \
+      *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
+    esac; \
+    cd /tmp; \
+    core="bitcoin-${CORE_VERSION}-${triple}.tar.gz"; \
+    curl -fsSLO "https://bitcoincore.org/bin/bitcoin-core-${CORE_VERSION}/${core}"; \
+    echo "${core_sha}  ${core}" | sha256sum -c -; \
+    mkdir -p /opt/bitcoin-core; \
+    tar -xzf "$core" -C /opt/bitcoin-core --strip-components=1; \
+    bchn="bitcoin-cash-node-${BCHN_VERSION}-${triple}.tar.gz"; \
+    curl -fsSLO "https://github.com/bitcoin-cash-node/bitcoin-cash-node/releases/download/v${BCHN_VERSION}/${bchn}"; \
+    echo "${bchn_sha}  ${bchn}" | sha256sum -c -; \
+    mkdir -p /opt/bchn; \
+    tar -xzf "$bchn" -C /opt/bchn --strip-components=1; \
+    rm -f /tmp/*.tar.gz; \
+    /opt/bitcoin-core/bin/bitcoind -version | head -1; \
+    /opt/bchn/bin/bitcoind -version | head -1
+
+# Peer-to-peer ports for up to three nodes per container.
+EXPOSE 18444 18445 18446
+
+# Nodes are started with "podman exec" by the test suite.
+CMD ["sleep", "infinity"]

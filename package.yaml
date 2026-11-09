@@ -1,57 +1,120 @@
 name: haskoin-node
 version: 2.3.1
 synopsis: P2P library for Bitcoin and Bitcoin Cash
-description: Please see the README on GitHub at <https://github.com/jprupp/haskoin-node#readme>
+description: >-
+  Connect to Bitcoin (BTC) and Bitcoin Cash (BCH) peers, keep them healthy, and
+  sync block headers into a RocksDB database. Blocks and transactions can be
+  downloaded from connected peers. See the README on GitHub at
+  <https://github.com/jprupp/haskoin-node#readme>.
 category: Bitcoin, Finance, Network
 author: JP Rupp
 maintainer: jprupp@protonmail.ch
+copyright: 2020 Haskoin Developers
 license: MIT
 license-file: LICENSE
-github: jprupp/haskoin-node.git
-homepage: http://github.com/jprupp/haskoin-node#readme
-bug-reports: http://github.com/jprupp/haskoin-node/issues
-extra-source-files:
+github: jprupp/haskoin-node
+tested-with: GHC == 9.12.4
+extra-doc-files:
   - README.md
   - CHANGELOG.md
+extra-source-files:
+  - test/regtest/Containerfile
+
+language: GHC2024
+default-extensions:
+  - DuplicateRecordFields
+  - MultiWayIf
+  - NoFieldSelectors
+  - OverloadedRecordDot
+  - OverloadedStrings
+
+ghc-options:
+  - -Wall
+  - -Wcompat
+  - -Widentities
+  - -Wincomplete-record-updates
+  - -Wincomplete-uni-patterns
+  - -Wpartial-fields
+  - -Wredundant-constraints
+  - -Wunused-packages
+
 dependencies:
-  - base >=4.9 && <5
-  - async
-  - bytestring
-  - cereal
-  - conduit
-  - conduit-extra
-  - containers
-  - data-default
-  - fast-logger
-  - hashable
-  - haskoin-core >= 1.6.0
-  - mtl
-  - network
-  - nqe >= 0.6.3
-  - random
-  - rocksdb-haskell-jprupp >= 2.3.0
-  - rocksdb-query >= 0.6.0
-  - stm
-  - string-conversions
-  - text
-  - transformers
-  - time
-  - unliftio
-  - unordered-containers
+  - base >= 4.20 && < 5
+
 library:
   source-dirs: src
-  exposed-modules:
-    - Haskoin.Node
+  dependencies:
+    - bytestring >= 0.11 && < 0.13
+    - cereal >= 0.5 && < 0.6
+    - conduit >= 1.3 && < 1.4
+    - conduit-extra >= 1.3 && < 1.4
+    - containers >= 0.6 && < 0.8
+    - fast-logger >= 3.2 && < 3.3
+    - haskoin-core >= 1.6.1 && < 1.7
+    - network >= 3.1 && < 3.3
+    - nqe >= 0.6.9 && < 0.7
+    - random >= 1.2 && < 1.4
+    - rocksdb-haskell-jprupp >= 2.6.1 && < 2.7
+    - rocksdb-query >= 0.6.1 && < 0.7
+    - string-conversions >= 0.4 && < 0.5
+    - text >= 2.0 && < 2.2
+    - time >= 1.12 && < 1.15
+    - transformers >= 0.6 && < 0.7
+    - unliftio >= 0.2 && < 0.3
+  when:
+    - condition: false
+      other-modules: Paths_haskoin_node
+
 tests:
   spec:
     main: Spec.hs
-    source-dirs: test
-    verbatim:
-      build-tool-depends:
-          hspec-discover:hspec-discover
+    source-dirs:
+      - test/unit
+      - test/common
+    ghc-options: -threaded -rtsopts -with-rtsopts=-N
+    build-tools:
+      - hspec-discover
     dependencies:
+      - async
       - base64
-      - hspec
+      - bytestring
+      - cereal
+      - conduit
+      - data-default
+      - haskoin-core
       - haskoin-node
+      - hspec >= 2.10
       - HUnit
-      - safe
+      - network
+      - nqe
+      - QuickCheck >= 2.14
+      - random
+      - rocksdb-haskell-jprupp
+      - text
+      - time
+      - transformers
+      - unliftio
+  regtest:
+    main: Main.hs
+    source-dirs:
+      - test/regtest
+      - test/common
+    ghc-options: -threaded -rtsopts -with-rtsopts=-N
+    dependencies:
+      - bytestring
+      - cereal
+      - conduit
+      - data-default
+      - directory
+      - haskoin-core
+      - haskoin-node
+      - hspec >= 2.10
+      - HUnit
+      - network
+      - nqe
+      - process
+      - random
+      - rocksdb-haskell-jprupp
+      - time
+      - transformers
+      - unliftio

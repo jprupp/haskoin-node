@@ -6,10 +6,59 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- `chainBlocksAnnounced`: the node passes blocks announced in inventory
+  messages to the chain, which asks the peer for headers if it does not know
+  them.
+- Pure state machines for the version handshake
+  (`Haskoin.Node.PeerMgr.Handshake`), for choosing which peer to ask for
+  headers (`Haskoin.Node.Chain.Sync`) and for receiving requested blocks and
+  transactions (`Haskoin.Node.Peer.Request`), each with property tests.
+- `PeerException` says why a peer connection ended, instead of an `error`
+  message.
+- `Haskoin.Node.Address` and `Haskoin.Node.Chain.Database` hold code split
+  out of the peer manager, the node and the chain, which still re-export it.
+  Every module is exposed, and `PeerMessage` is exported.
+- Unit tests of the chain, peer and peer manager processes against in-memory
+  mock peers.
+- A regtest suite that runs the node against Bitcoin Core 32.1 and Bitcoin Cash
+  Node 29.2.0 in Podman, from official binaries with checked hashes, and a CI
+  job that runs it.
+- `cabal.project`, so the package builds with Cabal too.
+
 ### Changed
 
+- If no headers are requested or received for `timeout` seconds, every
+  connected peer is asked for headers again. This bounds how long any stall of
+  the header chain can last.
+- The chain checks for timeouts at intervals of at most a quarter of
+  `timeout`, between 0.1 and 20 seconds, instead of every 2 to 20 seconds.
+- Breaking: `OnlinePeer` holds the state of the handshake in a `handshake`
+  field instead of the `verack`, `online` and `version` fields. These are still
+  available as computed fields, so `o.version` and `o.online` keep working, but
+  code that builds or pattern matches `OnlinePeer` records must change.
+- The package uses the GHC2024 language edition, strict warnings and upper
+  bounds on its dependencies. `Setup.hs`, `hie.yaml` and `.hindent.yaml` were
+  removed.
 - `stack.yaml` builds against secp256k1-haskell 2.0.1. The README's Stack
-  example names the same version. The package itself is unchanged.
+  example names the same version.
+
+### Fixed
+
+- The header chain stopped following the network when a peer announced new
+  blocks with an inventory message instead of headers, which peers do when
+  many blocks are found at once. The chain stayed at the old height until the
+  peer reconnected.
+- A peer that announced headers that did not connect to the chain was
+  disconnected. It is now asked for headers.
+- A syncing peer that timed out kept the chain waiting until its disconnection
+  arrived. The chain now moves on at once.
+- A full batch of headers from a peer that was not being synced against was
+  not followed up.
+- `getData`, `getBlocks` and `getTxs` failed when the peer sent an unrelated
+  message, or a notfound message for items that were not requested, before all
+  the requested items arrived.
 
 ## [2.3.1] - 2026-11-07
 

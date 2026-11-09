@@ -1,16 +1,3 @@
-{-# LANGUAGE ConstraintKinds #-}
-{-# LANGUAGE DuplicateRecordFields #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE ImportQualifiedPost #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE NamedFieldPuns #-}
-{-# LANGUAGE OverloadedRecordDot #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE TypeFamilies #-}
-{-# LANGUAGE NoFieldSelectors #-}
-
 -- |
 -- Module      : Haskoin.Node.Peer
 -- Copyright   : (c) Haskoin Developers
@@ -37,17 +24,20 @@
 --   the payload read, so a peer cannot make the node buffer a huge message it
 --   would refuse anyway.
 --
--- * Anything that does not parse closes the connection. There is no attempt to
---   recover, because a peer that sends garbage once is not worth the risk.
+-- * Anything that does not parse closes the connection with a
+--   'PeerException' saying why. There is no attempt to recover, because a
+--   peer that sends garbage once is not worth the risk.
 --
 -- * Reading pauses when the node falls behind ('maxPendingMessages'), so the
 --   speed of the node, not the speed of the peer, sets the pace.
 module Haskoin.Node.Peer
   ( PeerConfig (..),
     PeerEvent (..),
+    PeerException (..),
     Conduits (..),
     WithConnection,
     Peer (..),
+    PeerMessage (..),
     peer,
     wrapPeer,
     sendMessage,
@@ -65,14 +55,11 @@ module Haskoin.Node.Peer
 where
 
 import Conduit
-import Control.Exception
 import Control.Monad
-import Control.Monad.Trans.Maybe
 import Data.Bool (bool)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.Function (on)
-import Data.List (union)
 import Data.Maybe (isJust)
 import Data.Serialize (decode, runGet, runPut)
 import Data.String.Conversions (cs)
@@ -81,6 +68,7 @@ import Data.Word (Word32)
 import Haskoin
 import Haskoin.Node.Logger
 import Haskoin.Node.Loop (loopForever)
+import Haskoin.Node.Peer.Request
 import NQE
 import System.Random
 import UnliftIO
@@ -123,6 +111,26 @@ data PeerEvent
   | -- | the peer sent a message
     PeerMessage !Peer !Message
   deriving (Eq)
+
+-- | Why a peer process stopped with an error. The peer manager logs it and
+-- forgets the peer.
+--
+-- These used to be calls to 'error' with a message. A type lets callers and
+-- tests tell the reasons apart without parsing text.
+data PeerException
+  = -- | the peer closed the connection in the middle of a message
+    ConnectionClosed
+  | -- | the 24-byte message header could not be parsed
+    InvalidMessageHeader
+  | -- | the message is for another network; holds its magic bytes
+    WrongNetwork !Word32
+  | -- | the payload is larger than allowed for the command; holds its size
+    MessageTooLarge !MessageCommand !Word32
+  | -- | the payload could not be parsed; holds the reason
+    InvalidPayload !MessageCommand !String
+  deriving stock (Show)
+
+instance Exception PeerException
 
 -- | Mailbox for a peer. Peers are compared by their mailbox, and shown by their
 -- label.
@@ -194,13 +202,13 @@ peer ::
   Peer ->
   Inbox PeerMessage ->
   m ()
-peer cfg@PeerConfig {label, net, connect, pub, logger} p inbox =
-  withRunInIO $ \run -> connect (run . peer_session)
+peer cfg@PeerConfig {label, net, pub, logger} p inbox =
+  withRunInIO $ \run -> cfg.connect (run . peer_session)
   where
     go = do
       logDebug logger $ label <> " awaiting event..."
-      msg <- receive inbox
-      dispatchMessage cfg msg >>= bool (return ()) go
+      m <- receive inbox
+      dispatchMessage cfg m >>= bool (return ()) go
     peer_session ad = do
       let ins = transPipe liftIO ad.inboundConduit
           ons = transPipe liftIO ad.outboundConduit
@@ -214,12 +222,12 @@ peer cfg@PeerConfig {label, net, connect, pub, logger} p inbox =
         link as
         runConduit (go .| snk)
     -- Wait until the node has room for another message from this peer.
-    send_msg msg = do
+    send_msg m = do
       atomically $ do
         n <- readTVar p.pending
         checkSTM (n < maxPendingMessages)
         writeTVar p.pending (n + 1)
-      publish (PeerMessage p msg) pub
+      publish (PeerMessage p m) pub
 
 -- | Internal function to dispatch peer messages.
 dispatchMessage ::
@@ -227,9 +235,9 @@ dispatchMessage ::
   PeerConfig ->
   PeerMessage ->
   ConduitT i Message m Bool
-dispatchMessage PeerConfig {label, logger} (SendMessage msg) = do
-  logDebug logger (label <> " sending cmd " <> cs (show (msgType msg)))
-  yield msg
+dispatchMessage PeerConfig {label, logger} (SendMessage m) = do
+  logDebug logger (label <> " sending cmd " <> cs (show (msgType m)))
+  yield m
   return True
 dispatchMessage PeerConfig {label, logger} KillPeer = do
   logInfo logger (label <> " disconnecting")
@@ -248,44 +256,28 @@ inPeerConduit ::
   (MonadIO m) => PeerConfig -> ConduitT ByteString Message m ()
 inPeerConduit PeerConfig {label, net, logger} = loopForever $ do
   logDebug logger (label <> " awaiting message...")
-  x <- takeCE 24 .| foldC
-  when (B.null x) $ do
-    logError logger (label <> " sent empty message header")
-    error "Peer sent empty message header"
+  x <- takeExactly 24
   MessageHeader mgc cmd len _ <- case decode x of
-    Left _ -> bad "invalid message header"
+    Left _ -> bad InvalidMessageHeader
     Right h -> return h
-  when (mgc /= net.magic) $
-    bad ("wrong network magic " <> cs (show mgc))
-  when (len > maxPayloadSize net cmd) $
-    bad
-      ( "too large payload of "
-          <> cs (show len)
-          <> " bytes for cmd "
-          <> cs (show cmd)
-      )
+  when (mgc /= net.magic) $ bad (WrongNetwork mgc)
+  when (len > maxPayloadSize net cmd) $ bad (MessageTooLarge cmd len)
   logDebug logger (label <> " sent cmd " <> cs (show cmd))
-  y <- takeCE (fromIntegral len) .| foldC
-  when (B.length y /= fromIntegral len) $
-    bad ("truncated payload for cmd " <> cs (show cmd))
+  y <- takeExactly (fromIntegral len)
   case runGet (getMessage net) $ x `B.append` y of
-    Left e ->
-      bad
-        ( "invalid payload for cmd "
-            <> cs (show cmd)
-            <> ": "
-            <> cs (firstLine e)
-        )
-    Right msg -> do
-      logDebug
-        logger
-        (label <> " sent payload for cmd " <> cs (show cmd))
-      yield msg
+    Left e -> bad (InvalidPayload cmd (firstLine e))
+    Right m -> do
+      logDebug logger (label <> " sent payload for cmd " <> cs (show cmd))
+      yield m
   where
-    bad :: (MonadIO m) => Text -> m a
+    takeExactly n = do
+      bs <- takeCE n .| foldC
+      when (B.length bs /= n) $ bad ConnectionClosed
+      return bs
+    bad :: (MonadIO m) => PeerException -> m a
     bad e = do
-      logError logger (label <> " sent " <> e)
-      error ("Peer sent " <> cs e)
+      logError logger (label <> ": " <> cs (show e))
+      throwIO e
     -- The reason is on the first line of the parser's error text. The lines
     -- after it are call stack noise.
     firstLine = takeWhile (/= '\n')
@@ -301,7 +293,7 @@ killPeer p = KillPeer `send` p.mailbox
 
 -- | Send a network message to peer. Returns as soon as the message is queued.
 sendMessage :: (MonadIO m) => Message -> Peer -> m ()
-sendMessage msg p = SendMessage msg `send` p.mailbox
+sendMessage m p = SendMessage m `send` p.mailbox
 
 -- | Check whether a peer is reserved for a task.
 getBusy :: (MonadIO m) => Peer -> m Bool
@@ -338,10 +330,9 @@ getBlocks ::
   [BlockHash] ->
   m (Maybe [Block])
 getBlocks net time p bhs =
-  runMaybeT $ mapM f =<< MaybeT (getData time p (GetData ivs))
+  (>>= traverse block) <$> getData time p (GetData ivs)
   where
-    f (Right b) = return b
-    f (Left _) = MaybeT $ return Nothing
+    block = either (const Nothing) Just
     c
       | net.segWit = InvWitnessBlock
       | otherwise = InvBlock
@@ -361,10 +352,9 @@ getTxs ::
   [TxHash] ->
   m (Maybe [Tx])
 getTxs net time p ths =
-  runMaybeT $ mapM f =<< MaybeT (getData time p (GetData ivs))
+  (>>= traverse tx) <$> getData time p (GetData ivs)
   where
-    f (Right _) = MaybeT $ return Nothing
-    f (Left t) = return t
+    tx = either Just (const Nothing)
     c
       | net.segWit = InvWitnessTx
       | otherwise = InvTx
@@ -376,8 +366,10 @@ getTxs net time p ths =
 --
 -- The first argument is the timeout in seconds. A ping is sent right after the
 -- request; since peers answer in order, receiving the matching pong before all
--- items means that the peer will not send the rest. Transactions are returned
--- as 'Left' and blocks as 'Right', in the order they were requested.
+-- items means that the peer will not send the rest. Unrelated messages that
+-- arrive meanwhile are ignored. Transactions are returned as 'Left' and blocks
+-- as 'Right', in the order they were requested. "Haskoin.Node.Peer.Request"
+-- has the rules.
 getData ::
   (MonadUnliftIO m) => Int -> Peer -> GetData -> m (Maybe [Either Tx Block])
 getData seconds p gd@(GetData ivs) =
@@ -385,38 +377,12 @@ getData seconds p gd@(GetData ivs) =
     r <- randomIO
     MGetData gd `sendMessage` p
     MPing (Ping r) `sendMessage` p
-    fmap join
-      . timeout (seconds * 1000 * 1000)
-      . runMaybeT
-      $ get_thing inb r [] ivs
+    join <$> timeout (seconds * 1000 * 1000) (step inb (newRequest r ivs))
   where
-    get_thing _inb _r acc [] =
-      return $ reverse acc
-    get_thing inb r acc hss@(InvVector t h : hs) =
-      lift (filterReceive p inb) >>= \case
-        MTx tx
-          | is_tx t && (txHash tx).get == h ->
-              get_thing inb r (Left tx : acc) hs
-        MBlock b@(Block bh _)
-          | is_block t && (headerHash bh).get == h ->
-              get_thing inb r (Right b : acc) hs
-        MNotFound (NotFound nvs)
-          | not (null (nvs `union` hs)) ->
-              MaybeT $ return Nothing
-        MPong (Pong r')
-          | r == r' ->
-              MaybeT $ return Nothing
-        _
-          | null acc ->
-              get_thing inb r acc hss
-          | otherwise ->
-              MaybeT $ return Nothing
-    is_tx InvWitnessTx = True
-    is_tx InvTx = True
-    is_tx _ = False
-    is_block InvWitnessBlock = True
-    is_block InvBlock = True
-    is_block _ = False
+    step inb = \case
+      Complete items -> return (Just items)
+      Failed _ -> return Nothing
+      Continue req -> filterReceive p inb >>= step inb . stepRequest req
 
 -- | Ping a peer and await response. Return 'False' if response not received
 -- before timeout. The first argument is the timeout in seconds.
@@ -435,5 +401,5 @@ pingPeer time p =
 filterReceive :: (MonadIO m) => Peer -> Inbox PeerEvent -> m Message
 filterReceive p inb =
   receive inb >>= \case
-    PeerMessage p' msg | p == p' -> return msg
+    PeerMessage p' m | p == p' -> return m
     _ -> filterReceive p inb

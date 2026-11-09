@@ -1,13 +1,3 @@
-{-# LANGUAGE DuplicateRecordFields #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE GADTs #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE OverloadedRecordDot #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RecordWildCards #-}
-{-# LANGUAGE NoFieldSelectors #-}
-
 -- |
 -- Module      : Haskoin.Node
 -- Copyright   : (c) Haskoin Developers
@@ -32,7 +22,9 @@
 --   too long.
 --
 -- * The chain ("Haskoin.Node.Chain") downloads block headers from peers,
---   connects them to the best chain, and stores them in the database.
+--   connects them to the best chain, and stores them in the database. It
+--   follows the announcements of new blocks, whether they come as headers or
+--   as inventory, and polls peers when it has heard nothing for a while.
 --
 -- Everything that happens is published as a 'NodeEvent' to the 'Publisher'
 -- given in 'NodeConfig'. Subscribe to it to learn about new best blocks, peers
@@ -114,32 +106,35 @@ module Haskoin.Node
     Node (..),
     withNode,
     withConnection,
+
     -- * Peers
     module Haskoin.Node.Peer,
+
     -- * Peer manager
     module Haskoin.Node.PeerMgr,
+
     -- * Chain
     module Haskoin.Node.Chain,
+
     -- * Logging
     module Haskoin.Node.Logger,
   )
 where
 
-import Control.Monad.Cont (ContT (..), MonadCont (callCC), cont, runCont, runContT)
-import Control.Monad.Trans (lift)
-import Data.Conduit.Network
-import Data.String.Conversions (cs)
+import Control.Monad.Trans.Class (lift)
+import Control.Monad.Trans.Cont (ContT (..), evalContT)
 import Data.Time.Clock (NominalDiffTime)
 import Database.RocksDB (ColumnFamily, DB)
 import Haskoin
+import Haskoin.Node.Address (withConnection)
 import Haskoin.Node.Chain
 import Haskoin.Node.Logger
 import Haskoin.Node.Loop (loopForever)
 import Haskoin.Node.Peer
 import Haskoin.Node.PeerMgr
+import Haskoin.Node.PeerMgr.Handshake (isEstablished)
 import NQE
-import Network.Socket
-import Text.Read (readMaybe)
+import Network.Socket (SockAddr)
 import UnliftIO
 
 -- | General node configuration. Passed to 'withNode'.
@@ -192,33 +187,7 @@ data NodeEvent
     ChainEvent !ChainEvent
   | -- | a peer connected, disconnected or sent a message
     PeerEvent !PeerEvent
-  deriving (Eq)
-
--- | Open a TCP connection to a peer address and pass its conduits to a
--- function. The connection is closed when the function returns. Calls 'error'
--- if the address cannot be converted into a host and port.
-withConnection :: SockAddr -> WithConnection
-withConnection na f =
-  fromSockAddr na >>= \case
-    Nothing -> error $ "Invalid address " ++ show na
-    Just cset ->
-      runTCPClient cset $ \ad ->
-        f (Conduits (appSource ad) (appSink ad))
-
--- | Turn a socket address into client settings for a TCP connection, or
--- 'Nothing' if it cannot be converted.
-fromSockAddr :: (MonadUnliftIO m) => SockAddr -> m (Maybe ClientSettings)
-fromSockAddr sa = go `catch` e
-  where
-    go = do
-      (maybe_host, maybe_port) <- liftIO $ getNameInfo flags True True sa
-      return $
-        clientSettings
-          <$> (readMaybe =<< maybe_port)
-          <*> (cs <$> maybe_host)
-    flags = [NI_NUMERICHOST, NI_NUMERICSERV]
-    e :: (Monad m) => SomeException -> m (Maybe a)
-    e _ = return Nothing
+  deriving stock (Eq)
 
 -- | Forward events from the chain to the node publisher, telling the peer
 -- manager about every new best block height so that it can tell peers apart
@@ -235,8 +204,10 @@ chainEvents mgr input output = loopForever $ do
 -- | Route events from peers to the peer manager and chain. A message from a
 -- peer is handled to completion before the peer may send another one past its
 -- small allowance of pending messages (see 'maxPendingMessages'), so that the
--- node's queues cannot grow faster than it can work. Address and header
--- messages are only taken from peers that completed the handshake.
+-- node's queues cannot grow faster than it can work. Address, header and
+-- inventory messages are only taken from peers that completed the handshake.
+-- Inventory with blocks goes to the chain, which asks for headers if it does
+-- not know them.
 peerEvents ::
   (MonadIO m) =>
   Chain -> PeerMgr -> Inbox PeerEvent -> Publisher NodeEvent -> m ()
@@ -247,8 +218,8 @@ peerEvents ch mgr input output = loopForever $ do
       chainPeerConnected ch p
     PeerDisconnected p ->
       chainPeerDisconnected ch p
-    PeerMessage p msg -> do
-      case msg of
+    PeerMessage p m -> do
+      case m of
         MVersion v ->
           peerMgrVersion mgr p v >> peerMgrSync mgr
         MVerAck ->
@@ -261,6 +232,9 @@ peerEvents ch mgr input output = loopForever $ do
           whenOnline p $ peerMgrAddrs mgr p (map snd ns) >> peerMgrSync mgr
         MHeaders (Headers hs) ->
           whenOnline p $ chainHeaders ch p (map fst hs) >> chainSync ch
+        MInv (Inv ivs) -> case [BlockHash iv.invHash | iv <- ivs, isBlock iv] of
+          [] -> return ()
+          bhs -> whenOnline p $ chainBlocksAnnounced ch p bhs >> chainSync ch
         _ -> return ()
       ticklePeer mgr p
       peerMessageDone p
@@ -268,8 +242,9 @@ peerEvents ch mgr input output = loopForever $ do
   where
     whenOnline p act =
       getOnlinePeer mgr p >>= \case
-        Just OnlinePeer {online = True} -> act
+        Just o | isEstablished o.handshake -> act
         _ -> return ()
+    isBlock iv = iv.invType `elem` [InvBlock, InvWitnessBlock]
 
 -- | Launch node process in the foreground.
 --
@@ -278,17 +253,35 @@ peerEvents ch mgr input output = loopForever $ do
 -- any component fails, the exception is re-thrown in the calling thread.
 withNode ::
   (MonadUnliftIO m) => NodeConfig -> (Node -> m a) -> m a
-withNode NodeConfig {..} action = flip runContT return $ do
+withNode cfg action = evalContT $ do
   peerPub <- ContT withPublisher
   peerSub <- ContT (withSubscription peerPub)
   chainPub <- ContT withPublisher
   chainSub <- ContT (withSubscription chainPub)
-  let peerMgrCfg =
-        PeerMgrConfig {pub = peerPub, logger = withSource "PeerMgr" logger, ..}
-  let chainCfg =
-        ChainConfig {pub = chainPub, logger = withSource "Chain" logger, ..}
-  chain <- ContT (withChain chainCfg)
-  peerMgr <- ContT $ withPeerMgr peerMgrCfg
-  link =<< ContT (withAsync $ chainEvents peerMgr chainSub pub)
-  link =<< ContT (withAsync $ peerEvents chain peerMgr peerSub pub)
-  lift $ action Node {..}
+  chain <-
+    ContT . withChain $
+      ChainConfig
+        { db = cfg.db,
+          cf = cfg.cf,
+          net = cfg.net,
+          pub = chainPub,
+          timeout = cfg.timeout,
+          logger = withSource "Chain" cfg.logger
+        }
+  peerMgr <-
+    ContT . withPeerMgr $
+      PeerMgrConfig
+        { maxPeers = cfg.maxPeers,
+          peers = cfg.peers,
+          discover = cfg.discover,
+          address = cfg.address,
+          net = cfg.net,
+          pub = peerPub,
+          timeout = cfg.timeout,
+          maxPeerLife = cfg.maxPeerLife,
+          connect = cfg.connect,
+          logger = withSource "PeerMgr" cfg.logger
+        }
+  link =<< ContT (withAsync $ chainEvents peerMgr chainSub cfg.pub)
+  link =<< ContT (withAsync $ peerEvents chain peerMgr peerSub cfg.pub)
+  lift $ action Node {peerMgr = peerMgr, chain = chain}

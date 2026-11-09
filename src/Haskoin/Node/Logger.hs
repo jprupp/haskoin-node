@@ -1,9 +1,3 @@
-{-# LANGUAGE ImportQualifiedPost #-}
-{-# LANGUAGE NamedFieldPuns #-}
-{-# LANGUAGE OverloadedRecordDot #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE NoFieldSelectors #-}
-
 -- | Logging to standard error. A 'Logger' is a plain value carried in
 -- configuration records, so code that logs only needs 'MonadIO'.
 --

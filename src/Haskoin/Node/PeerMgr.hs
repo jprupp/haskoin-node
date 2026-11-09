@@ -1,16 +1,3 @@
-{-# LANGUAGE ConstraintKinds #-}
-{-# LANGUAGE DuplicateRecordFields #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE ImportQualifiedPost #-}
-{-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE MultiParamTypeClasses #-}
-{-# LANGUAGE MultiWayIf #-}
-{-# LANGUAGE OverloadedRecordDot #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE TupleSections #-}
-{-# LANGUAGE NoFieldSelectors #-}
-
 -- |
 -- Module      : Haskoin.Node.PeerMgr
 -- Copyright   : (c) Haskoin Developers
@@ -28,7 +15,10 @@
 --
 -- For each connection, the peer manager sends a version message, waits for the
 -- peer's version and acknowledgement, and then announces the peer as connected
--- with a 'PeerConnected' event. Peers are pinged periodically to measure their
+-- with a 'PeerConnected' event. The handshake is the state machine in
+-- "Haskoin.Node.PeerMgr.Handshake": each peer's progress is a 'Handshake'
+-- value, and a message that does not fit the current state disconnects the
+-- peer. Peers are pinged periodically to measure their
 -- latency, and the list returned by 'getPeers' is sorted by median ping time, so
 -- that the fastest peers come first. A peer is disconnected if it stops
 -- responding, does not answer a ping in time, or has been connected for longer
@@ -62,6 +52,7 @@ module Haskoin.Node.PeerMgr
   ( PeerMgrConfig (..),
     PeerEvent (..),
     OnlinePeer (..),
+    Handshake (..),
     PeerMgr,
     withPeerMgr,
     peerMgrBest,
@@ -82,23 +73,24 @@ module Haskoin.Node.PeerMgr
   )
 where
 
-import Control.Applicative ((<|>))
-import Control.Arrow
+import Control.Arrow (first)
 import Control.Monad
-import Data.Bits ((.&.))
 import Data.Function (on)
-import Data.List (dropWhileEnd, elemIndex, find, nub, sort)
+import Data.List (find, nub, sort)
 import Data.Maybe
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.String.Conversions (cs)
 import Data.Time.Clock
 import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
-import Data.Word (Word32, Word64, Word8)
+import Data.Word (Word32, Word64)
+import GHC.Records (HasField (..))
 import Haskoin
+import Haskoin.Node.Address (isRoutable, toHostService, toSockAddr)
 import Haskoin.Node.Logger
 import Haskoin.Node.Loop (loopForever)
 import Haskoin.Node.Peer
+import Haskoin.Node.PeerMgr.Handshake
 import NQE
 import Network.Socket
 import System.Random (randomIO, randomRIO)
@@ -178,15 +170,15 @@ data PeerMgrMessage
 -- median of their recent ping times, so that sorting a list puts the fastest
 -- peers first. Peers without any ping measurement sort as if their median ping
 -- were 60 seconds.
+--
+-- The fields @version@, @online@ and @verack@ of earlier releases are now
+-- computed from 'handshake', so @o.version@ and @o.online@ keep working with
+-- record dot syntax. They cannot be set or pattern matched.
 data OnlinePeer = OnlinePeer
   { -- | network address of the peer
     address :: !SockAddr,
-    -- | whether the peer acknowledged our version
-    verack :: !Bool,
-    -- | whether the handshake is complete: both version and verack received
-    online :: !Bool,
-    -- | version message sent by the peer, if received
-    version :: !(Maybe Version),
+    -- | progress of the version handshake
+    handshake :: !Handshake,
     -- | thread running the peer process
     async :: !(Async ()),
     -- | handle to talk to the peer
@@ -208,6 +200,18 @@ instance Eq OnlinePeer where
   (==) = (==) `on` f
     where
       f OnlinePeer {mailbox = p} = p
+
+-- | Version message sent by the peer, if received.
+instance HasField "version" OnlinePeer (Maybe Version) where
+  getField o = handshakeVersion o.handshake
+
+-- | Whether the handshake is complete: both version and verack received.
+instance HasField "online" OnlinePeer Bool where
+  getField o = isEstablished o.handshake
+
+-- | Whether the peer acknowledged our version.
+instance HasField "verack" OnlinePeer Bool where
+  getField o = hasVerAck o.handshake
 
 instance Ord OnlinePeer where
   compare = compare `on` f
@@ -267,10 +271,6 @@ putBestBlock mgr bb = atomically $ writeTVar mgr.best bb
 getBestBlock :: (MonadIO m) => PeerMgr -> m BlockHeight
 getBestBlock mgr = readTVarIO mgr.best
 
--- | Network constants of the peer manager.
-getNetwork :: PeerMgr -> Network
-getNetwork mgr = mgr.config.net
-
 -- | Add the static peers and, if discovery is on, the network seeds to the known addresses.
 loadPeers :: (MonadIO m) => PeerMgr -> m ()
 loadPeers mgr = do
@@ -307,7 +307,7 @@ getOnlinePeers mgr = readTVarIO mgr.peers
 
 -- | Peers that completed the handshake, fastest first.
 getConnectedPeers :: (MonadIO m) => PeerMgr -> m [OnlinePeer]
-getConnectedPeers mgr = filter (.online) <$> getOnlinePeers mgr
+getConnectedPeers mgr = filter (isEstablished . (.handshake)) <$> getOnlinePeers mgr
 
 -- | Publish a peer event.
 managerEvent :: (MonadIO m) => PeerMgr -> PeerEvent -> m ()
@@ -320,33 +320,14 @@ dispatch mgr (PeerVersion p v) = do
   logDebug
     mgr.config.logger
     ("Received peer " <> p.label <> " version " <> cs (show v))
-  let b = mgr.peers
-  atomically (setPeerVersion b p v) >>= \case
-    Just o -> do
-      when o.online (announcePeer mgr p)
-      logDebug
-        mgr.config.logger
-        ("Sending version ack to peer " <> p.label)
-      MVerAck `sendMessage` p
-    Nothing -> do
-      logWarn
-        mgr.config.logger
-        ("Version rejected for peer " <> p.label)
-      killPeer p
+  handshakeEvent mgr p (GotVersion v)
 dispatch mgr (PeerVerAck p) = do
-  atomically (setPeerVerAck mgr.peers p) >>= \case
-    Just o -> do
-      logDebug mgr.config.logger ("Received version ack from peer " <> p.label)
-      when o.online (announcePeer mgr p)
-    Nothing -> do
-      logWarn
-        mgr.config.logger
-        ("Verack rejected for peer " <> p.label)
-      killPeer p
+  logDebug mgr.config.logger ("Received version ack from peer " <> p.label)
+  handshakeEvent mgr p GotVerAck
 dispatch mgr (PeerAddrs p nas)
   | mgr.config.discover =
       getOnlinePeer mgr p >>= \case
-        Just OnlinePeer {online = True} -> do
+        Just o | isEstablished o.handshake -> do
           let sas = filter isRoutable $ map (hostToSockAddr . (.address)) nas
           logDebug
             mgr.config.logger
@@ -388,6 +369,39 @@ dispatch mgr (PeerDied a) = do
 dispatch mgr (CheckPeer p) = do
   logDebug mgr.config.logger ("Housekeeping for peer " <> p.label)
   checkPeer mgr p
+
+-- | Advance the handshake of a peer with a message it sent, and carry out the
+-- resulting actions. A message that does not fit the state of the handshake,
+-- or a version that 'checkVersion' rejects, disconnects the peer.
+handshakeEvent :: (MonadIO m) => PeerMgr -> Peer -> HandshakeEvent -> m ()
+handshakeEvent mgr p event = do
+  result <- atomically $ do
+    ops <- readTVar mgr.peers
+    case find ((== p) . (.mailbox)) ops of
+      Nothing -> return Nothing
+      Just o -> do
+        let valid = case event of
+              GotVersion v -> void (checkVersion (map (.nonce) ops) v)
+              GotVerAck -> Right ()
+            step = valid >> stepHandshake o.handshake event
+        forM_ step $ \(h, _) -> insertPeer mgr.peers o {handshake = h}
+        return (Just (snd <$> step))
+  case result of
+    Nothing -> do
+      logWarn
+        mgr.config.logger
+        ("Handshake message from unknown peer " <> p.label)
+      killPeer p
+    Just (Left e) -> do
+      logWarn
+        mgr.config.logger
+        ("Rejecting peer " <> p.label <> ": " <> cs (show e))
+      killPeer p
+    Just (Right actions) -> forM_ actions $ \case
+      SendVerAck -> do
+        logDebug mgr.config.logger ("Sending version ack to peer " <> p.label)
+        MVerAck `sendMessage` p
+      AnnounceConnected -> announcePeer mgr p
 
 -- | Record that a peer just sent a message, so that it is not disconnected for
 -- being idle. "Haskoin.Node" calls this for every message received.
@@ -431,7 +445,7 @@ sendPing mgr p = do
     Nothing ->
       logWarn mgr.config.logger ("Will not ping unknown peer " <> p.label)
     Just o
-      | o.online -> do
+      | isEstablished o.handshake -> do
           n <- randomIO
           now <- liftIO getCurrentTime
           atomically (setPeerPing mgr.peers n now p)
@@ -450,7 +464,7 @@ processPeerOffline mgr a = do
   atomically (findPeerAsync mgr.peers a) >>= \case
     Nothing -> logError mgr.config.logger "Disconnected unknown peer"
     Just o -> do
-      if o.online
+      if isEstablished o.handshake
         then do
           logError
             mgr.config.logger
@@ -466,15 +480,9 @@ processPeerOffline mgr a = do
 -- | Publish a connection event for a peer that just completed the handshake.
 announcePeer :: (MonadIO m) => PeerMgr -> Peer -> m ()
 announcePeer mgr p = do
-  atomically (findPeer mgr.peers p) >>= \case
-    Just OnlinePeer {online = True} -> do
-      logInfo mgr.config.logger ("Connected to peer " <> p.label)
-      managerEvent mgr (PeerConnected p)
-      logConnectedPeers mgr
-    Just OnlinePeer {online = False} ->
-      return ()
-    Nothing ->
-      logWarn mgr.config.logger ("Not announcing disconnected peer " <> p.label)
+  logInfo mgr.config.logger ("Connected to peer " <> p.label)
+  managerEvent mgr (PeerConnected p)
+  logConnectedPeers mgr
 
 -- | Take an address from the known addresses. If there are none, reload the static peers and seeds first.
 getNewPeer :: (MonadIO m) => PeerMgr -> m (Maybe SockAddr)
@@ -533,9 +541,7 @@ connectPeer mgr sa = do
           mgr.peers
           OnlinePeer
             { address = sa,
-              verack = False,
-              online = False,
-              version = Nothing,
+              handshake = AwaitingBoth,
               async = a,
               mailbox = p,
               nonce = nonce,
@@ -556,8 +562,7 @@ connectPeer mgr sa = do
 withPeerLoop :: (MonadUnliftIO m) => PeerMgr -> Peer -> (Async a -> m a) -> m a
 withPeerLoop mgr p =
   withAsync . loopForever $ do
-    let timeout = mgr.config.timeout
-        ms = floor (timeout * 1000 * 1000)
+    let ms = floor (mgr.config.timeout * 1000 * 1000)
     r <- randomRIO (ms `div` 4, ms `div` 2)
     threadDelay r
     managerCheck mgr p
@@ -573,7 +578,7 @@ withConnectLoop mgr act =
       when
         (l < mgr.config.maxPeers)
         (getNewPeer mgr >>= mapM_ (managerConnect mgr))
-      threadDelay =<< randomRIO (10 ^ 5, 5 * 10 ^ 6)
+      threadDelay =<< randomRIO (100000 :: Int, 5000000)
 
 -- | Upper bound on addresses remembered for future connections. Peers keep
 -- relaying addresses for as long as the node runs, and with every connection
@@ -606,41 +611,6 @@ gotPong b nonce now p =
 setPeerPing :: TVar [OnlinePeer] -> Word64 -> UTCTime -> Peer -> STM ()
 setPeerPing b nonce now p =
   modifyPeer b p $ \o -> o {ping = Just (now, nonce)}
-
--- | Store the version of a peer. Returns 'Nothing' to reject it if the peer does
--- not serve the full chain, is ourselves, is unknown, or already sent a version.
---
--- A peer must offer the full chain ('nodeNetwork') to be useful for syncing, and
--- a version whose nonce matches one of ours means the node has connected to
--- itself, which happens when it learns its own address from gossip.
-setPeerVersion :: TVar [OnlinePeer] -> Peer -> Version -> STM (Maybe OnlinePeer)
-setPeerVersion b p v
-  | v.services .&. nodeNetwork == 0 = return Nothing
-  | otherwise =
-      readTVar b >>= \ops ->
-        if any (\o -> v.nonce == o.nonce) ops
-          then return Nothing -- peer is myself
-          else
-            findPeer b p >>= \case
-              Nothing -> return Nothing -- peer not found
-              Just OnlinePeer {version = Just _} ->
-                return Nothing -- duplicate version
-              Just o -> do
-                let n = o {version = Just v, online = o.verack}
-                insertPeer b n
-                return (Just n)
-
--- | Record that a peer acknowledged our version. Returns 'Nothing' if the peer is
--- unknown or already sent one.
-setPeerVerAck :: TVar [OnlinePeer] -> Peer -> STM (Maybe OnlinePeer)
-setPeerVerAck b p =
-  findPeer b p >>= \case
-    Just OnlinePeer {verack = True} -> return Nothing -- duplicate verack
-    Just o -> do
-      let o' = o {verack = True, online = isJust o.version}
-      insertPeer b o'
-      return (Just o')
-    Nothing -> return Nothing
 
 -- | Find a peer in the list.
 findPeer :: TVar [OnlinePeer] -> Peer -> STM (Maybe OnlinePeer)
@@ -678,7 +648,8 @@ getPeers :: (MonadIO m) => PeerMgr -> m [OnlinePeer]
 getPeers = getConnectedPeers
 
 -- | Information about a peer, or 'Nothing' if the peer manager does not know it.
--- The peer may still be in the middle of the handshake; check 'online'.
+-- The peer may still be in the middle of the handshake; check its
+-- 'handshake'.
 getOnlinePeer :: (MonadIO m) => PeerMgr -> Peer -> m (Maybe OnlinePeer)
 getOnlinePeer mgr p = atomically (mgr.peers `findPeer` p)
 
@@ -718,91 +689,6 @@ peerMgrAddrs mgr p addrs = PeerAddrs p addrs `send` mgr.mailbox
 -- | Wait until the peer manager has handled every message sent to it before.
 peerMgrSync :: (MonadIO m) => PeerMgr -> m ()
 peerMgrSync mgr = Sync `query` mgr.mailbox
-
--- | Whether an address that a peer relayed is worth connecting to: a public
--- unicast address with a port. Loopback, private, link-local, shared,
--- documentation, multicast and reserved ranges are refused, so that a peer
--- cannot make the node connect to services on its own host or network.
--- Static peers in the configuration are not checked.
-isRoutable :: SockAddr -> Bool
-isRoutable (SockAddrInet port h) =
-  port /= 0 && routable4 (hostAddressToTuple h)
-isRoutable (SockAddrInet6 port _ h _) =
-  port /= 0 && case hostAddress6ToTuple h of
-    (0, 0, 0, 0, 0, 0xffff, hi, lo) ->
-      routable4
-        ( fromIntegral (hi `div` 256),
-          fromIntegral (hi `mod` 256),
-          fromIntegral (lo `div` 256),
-          fromIntegral (lo `mod` 256)
-        )
-    (a, b, _, _, _, _, _, _)
-      | a == 0 -> False -- unspecified, loopback, IPv4-compatible
-      | a .&. 0xfe00 == 0xfc00 -> False -- unique local
-      | a .&. 0xffc0 == 0xfe80 -> False -- link-local
-      | a .&. 0xffc0 == 0xfec0 -> False -- site-local
-      | a .&. 0xff00 == 0xff00 -> False -- multicast
-      | a == 0x2001 && b == 0x0db8 -> False -- documentation
-      | otherwise -> True
-isRoutable _ = False
-
--- | Whether an IPv4 address is public unicast.
-routable4 :: (Word8, Word8, Word8, Word8) -> Bool
-routable4 (a, b, c, _)
-  | a == 0 = False -- this network
-  | a == 10 = False -- private
-  | a == 100 && b .&. 0xc0 == 64 = False -- shared address space
-  | a == 127 = False -- loopback
-  | a == 169 && b == 254 = False -- link-local
-  | a == 172 && b .&. 0xf0 == 16 = False -- private
-  | a == 192 && b == 0 && c == 0 = False -- protocol assignments
-  | a == 192 && b == 0 && c == 2 = False -- documentation
-  | a == 192 && b == 168 = False -- private
-  | a == 198 && b .&. 0xfe == 18 = False -- benchmarking
-  | a == 198 && b == 51 && c == 100 = False -- documentation
-  | a == 203 && b == 0 && c == 113 = False -- documentation
-  | a >= 224 = False -- multicast and reserved
-  | otherwise = True
-
--- | Split a peer address into host and port. Accepts @host@, @host:port@,
--- @[ipv6]@ and @[ipv6]:port@. Either part is 'Nothing' if missing.
-toHostService :: String -> (Maybe String, Maybe String)
-toHostService str =
-  let host = case m6 of
-        Just (x, _) -> Just x
-        Nothing -> case takeWhile (/= ':') str of
-          [] -> Nothing
-          xs -> Just xs
-      srv = case m6 of
-        Just (_, y) -> s y
-        Nothing -> s str
-      s xs =
-        case dropWhile (/= ':') xs of
-          [] -> Nothing
-          _ : ys -> Just ys
-      m6 = case str of
-        (x : xs)
-          | x == '[' -> do
-              i <- elemIndex ']' xs
-              return $ second (drop 1) $ splitAt i xs
-          | x == ':' -> do
-              return (str, "")
-        _ -> Nothing
-   in (host, srv)
-
--- | Resolve a peer address given as in 'toHostService' into socket addresses,
--- using the default port of the network if none is given. Returns an empty list
--- if it cannot be resolved.
-toSockAddr :: Network -> String -> IO [SockAddr]
-toSockAddr net str =
-  go `catch` e
-  where
-    go = fmap (map addrAddress) $ getAddrInfo Nothing host srv
-    (host, srv) =
-      second (<|> Just (show net.defaultPort)) $
-        toHostService str
-    e :: (Monad m) => SomeException -> m [SockAddr]
-    e _ = return []
 
 -- | Median of a list, or 'Nothing' if it is empty.
 median :: (Ord a, Fractional a) => [a] -> Maybe a
