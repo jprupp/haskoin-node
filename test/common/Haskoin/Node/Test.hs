@@ -17,6 +17,10 @@ module Haskoin.Node.Test
     headersMessage,
     nowTimestamp,
 
+    -- * Blocks from Bitcoin Core
+    corePreSegWitBlock,
+    coreSegWitBlock,
+
     -- * Database
     withTestDB,
     withDBAt,
@@ -30,6 +34,7 @@ module Haskoin.Node.Test
     remoteReceiveMatch,
     remoteClose,
     remoteVersion,
+    fullNodeServices,
     respondHonestly,
     honestRemote,
     encodeMessage,
@@ -48,12 +53,14 @@ where
 
 import Conduit (awaitForever, yield)
 import Control.Monad (forM_, unless)
+import Data.Bits ((.|.))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.Default (def)
 import Data.List (elemIndex)
 import Data.Maybe (fromMaybe, listToMaybe, mapMaybe)
 import Data.Serialize (decode, encode, runGet, runPut)
+import Data.Text (Text)
 import Data.Time.Clock (NominalDiffTime)
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Word (Word32, Word64)
@@ -181,6 +188,52 @@ serveHeaders net chain gh =
 headersMessage :: [BlockHeader] -> Message
 headersMessage hs = MHeaders (Headers [(h, VarInt 0) | h <- hs])
 
+-- | Block 1 of a regtest chain that Bitcoin Core 32.1 mined with
+-- @-testactivationheight=segwit\@200@, so before SegWit was active. Its
+-- hash is @55e949fa...bd71d75@. Core put a witness commitment in the
+-- coinbase but no witness in it, as its miner does before activation, and
+-- Core accepts the block. It has one transaction.
+corePreSegWitBlock :: Block
+corePreSegWitBlock =
+  coreBlock
+    "0000002006226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf188910f010cb977ece0103280894534\
+    \38b7a55c1a016c9fa40c5205571956069623333bd8faf16affff7f200100000001020000000100000000000000000000\
+    \00000000000000000000000000000000000000000000ffffffff025100feffffff0200f2052a010000001976a914636d\
+    \4698f1523dc6688ccccd04850ade37a6c94988ac0000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa3\
+    \6953755c690689799962b48bebd836974e8cf900000000"
+
+-- | Block 302 of the same chain, after SegWit activated. Its hash is
+-- @30f22128...3a62efb@ and its parent is block 301, @7bd5bfeb...b63e52b9@.
+-- It has three transactions: the coinbase, whose witness is the 32-byte
+-- reserved value; a P2WPKH spend, txid @9d304fed...6401d23d@ and wtxid
+-- @a6b593b3...256a158e@; and a legacy spend without witness. Core accepted
+-- it, and gave @bad-witness-merkle-match@ for a block like it whose spend had
+-- one byte of its witness changed.
+coreSegWitBlock :: Block
+coreSegWitBlock =
+  coreBlock
+    "00000030b9523eb63f97c829f511bb532cf784c8827dc52b299f2fd994316deaebbfd57b9fa7b223e45c1d3509c35803\
+    \274fc47a62cdbdd25f8b081e80d3c026577dfe7f0cfbf16affff7f200000000003020000000001010000000000000000\
+    \000000000000000000000000000000000000000000000000ffffffff03022e01feffffff02ea0b834a000000001976a9\
+    \145b0082ee7098f21fb42b61bf40ba80ed4714108288ac0000000000000000266a24aa21a9ed3689d337d76ca8ae1070\
+    \b00bcfde4a16d82ae87ea9307d8705ef1b308792ef750120000000000000000000000000000000000000000000000000\
+    \00000000000000002d0100000200000000010156ed4c57e51a1912b3d4a0c92dec5aa90e5db79f60ee3294490803bea1\
+    \32ef1c0100000000fdffffff01d29f6659000000001976a9142d26b779a8053861ca5d01bf5d3880292280290288ac02\
+    \47304402206b38df4637ea3c6474da4d1310260d3cd9738e0bd496ed33841c02973d65d56f0220465694613885394876\
+    \ff1722e5675fd1e6dec5621b285fca4212c3e4a3135ade0121039e06e681933cef4160b02d907c68e3e54144b9ae0bdf\
+    \d2c696d0d51132c6058c0000000002000000014e4d8f4536ded4cdfb0e1769f70e60904ee6fb6babca4cdf0dbf522030\
+    \3c8985000000006a473044022013d2f4e1bd3a3f304d9028a4d1e3b4157989ac0481934c6250d8a29595b873d302201e\
+    \df49731a27af137e0e0b6aee291d940db33033bbcebec78311c67650194472012102034d48cf5a3fcbd59d813ab02bec\
+    \67ca2b351830ce6931a76c2ffe2529433d87fdffffff02f67e8b3b000000001976a914ca4b520b0a1c5d5595e337cd1f\
+    \945bc9e2860b8c88ac40717759000000001976a9142b83d6a87a77b0f96f812d4df53830a64f6a909e88ac2d010000"
+
+-- | A block from its serialization in hex, as @getblock@ prints it.
+coreBlock :: Text -> Block
+coreBlock hex =
+  case decode =<< maybe (Left "bad hex") Right (decodeHex hex) of
+    Left e -> error ("coreBlock: " <> e)
+    Right b -> b
+
 -- | Temporary RocksDB database.
 withTestDB :: (DB -> IO a) -> IO a
 withTestDB f =
@@ -283,6 +336,13 @@ remoteReceiveMatch s what r f = within s what go
 zeroAddress :: Word64 -> NetworkAddress
 zeroAddress srv = NetworkAddress srv (sockToHostAddress (SockAddrInet 0 0))
 
+-- | Services that a full node of the network offers, as Bitcoin Core does:
+-- the full chain, and witness data on a network with SegWit.
+fullNodeServices :: Network -> Word64
+fullNodeServices net
+  | net.segWit = nodeNetwork .|. nodeWitness
+  | otherwise = nodeNetwork
+
 -- | Version message for a remote peer.
 remoteVersion :: Network -> Word64 -> Word64 -> IO Version
 remoteVersion net services nonce = do
@@ -320,7 +380,7 @@ respondHonestly r blocks = \case
 -- | Remote that completes the handshake and serves the provided blocks.
 honestRemote :: TVar [Block] -> Remote -> IO ()
 honestRemote blocks r = do
-  v <- remoteVersion r.net nodeNetwork =<< randomIO
+  v <- remoteVersion r.net (fullNodeServices r.net) =<< randomIO
   remoteSend r (MVersion v)
   let go =
         remoteReceive r >>= \case

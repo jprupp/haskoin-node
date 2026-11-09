@@ -37,6 +37,7 @@ library
   exposed-modules:
       Haskoin.Node
       Haskoin.Node.Address
+      Haskoin.Node.Block
       Haskoin.Node.Chain
       Haskoin.Node.Chain.Database
       Haskoin.Node.Chain.Sync
@@ -74,6 +75,7 @@ library
     , rocksdb-haskell-jprupp >=2.6.1 && <2.7
     , rocksdb-query >=0.6.1 && <0.7
     , stm ==2.5.*
+    , streaming-commons ==0.2.*
     , string-conversions ==0.4.*
     , text >=2.0 && <2.2
     , time >=1.12 && <1.15
@@ -113,6 +115,7 @@ test-suite regtest
     , process
     , random
     , rocksdb-haskell-jprupp
+    , text
     , time
     , unliftio
   default-language: GHC2024
@@ -122,6 +125,7 @@ test-suite spec
   main-is: Spec.hs
   other-modules:
       Haskoin.Node.AddressSpec
+      Haskoin.Node.BlockSpec
       Haskoin.Node.Chain.SyncSpec
       Haskoin.Node.ChainSpec
       Haskoin.Node.Peer.LockSpec

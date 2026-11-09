@@ -27,6 +27,8 @@ data Op
   | Finish Int
   | Drop Int
   | Poll
+  | Ask Int
+  | Answer Int
   deriving stock (Show)
 
 instance Arbitrary Op where
@@ -39,7 +41,9 @@ instance Arbitrary Op where
         Refresh <$> peer,
         Finish <$> peer,
         Drop <$> peer,
-        pure Poll
+        pure Poll,
+        Ask <$> peer,
+        Answer <$> peer
       ]
     where
       peer = chooseInt (1, 4)
@@ -49,11 +53,13 @@ apply s = \case
   Connect p -> peerConnected p s
   Disconnect p -> peerDisconnected p s
   Request p -> requestSync p s
-  Start p -> startSync (at 1) p s
+  Start p -> startSync (at 1) (at 1000) p s
   Refresh p -> refreshSync (at 2) p s
   Finish p -> finishSync p s
   Drop p -> dropPeer p s
   Poll -> pollPeers (at 3) s
+  Ask p -> askHeaders (at 4) p s
+  Answer p -> gotHeaders p s
 
 states :: [Op] -> [SyncState Int]
 states = scanl apply (emptySync t0)
@@ -131,6 +137,47 @@ spec = describe "header sync state" $ do
     it "is not synced while a peer is queued or syncing" $ do
       isSynced net now recent (run [Connect 1]) `shouldBe` False
       isSynced net now recent (run [Connect 1, Start 1]) `shouldBe` False
+    it "is synced with a tip exactly two hours old, and not one second older" $ do
+      -- two hours = 7200 seconds, the most a block may be ahead of the clock
+      let nowSecs = floor (utcTimeToPOSIXSeconds now)
+      isSynced net now (tipAt (nowSecs - 7200) 1) idle `shouldBe` True
+      isSynced net now (tipAt (nowSecs - 7201) 1) idle `shouldBe` False
+
+  describe "deadline of a turn" $ do
+    let net = btcRegTest
+        bestAt t =
+          BlockNode
+            { header = net.genesisHeader {timestamp = t},
+              height = 1,
+              work = 1,
+              skip = headerHash net.genesisHeader
+            }
+        tipSecs = floor (utcTimeToPOSIXSeconds t0)
+    it "is 15 minutes plus 1 ms for each block expected since the best block" $
+      -- 6,000,000 s / 600 s per block = 10,000 blocks x 1 ms = 10 s,
+      -- plus 900 s = 910 s
+      syncDeadline net (at 6000000) (bestAt tipSecs) `shouldBe` at (6000000 + 910)
+    it "is 15 minutes when the best block is not older than now" $
+      syncDeadline net t0 (bestAt (tipSecs + 60)) `shouldBe` at 900
+    it "has passed only after the deadline" $ do
+      let s = run [Connect 1, Connect 2, Start 1]
+      syncTimedOut (at 1000) s `shouldBe` False
+      syncTimedOut (at 1001) s `shouldBe` True
+    it "does not end the turn when no other peer could take over" $ do
+      syncTimedOut (at 1001) (run [Connect 1, Start 1]) `shouldBe` False
+      syncTimedOut (at 1001) (run [Connect 1, Connect 2, Start 1, Drop 2]) `shouldBe` False
+
+  describe "requests in flight" $ do
+    it "does not ask a peer again within two minutes of asking it" $ do
+      let s = askHeaders (at 0) 1 (run [Connect 1])
+      mayAsk (at 120) 1 s `shouldBe` False
+      mayAsk (at 121) 1 s `shouldBe` True
+    it "asks a peer again once it answered" $
+      mayAsk (at 1) 1 (gotHeaders 1 (askHeaders (at 0) 1 (run [Connect 1]))) `shouldBe` True
+    it "keeps track of each peer separately" $
+      mayAsk (at 1) 2 (askHeaders (at 0) 1 (run [Connect 1, Connect 2])) `shouldBe` True
+    it "forgets the requests of a peer that disconnects" $
+      mayAsk (at 1) 1 (run [Connect 1, Ask 1, Disconnect 1, Connect 1]) `shouldBe` True
 
   prop "never syncs against more than one peer" $ \ops ->
     all ((<= 1) . length . filter isSyncingStatus . statuses) (states ops)

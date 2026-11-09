@@ -30,6 +30,12 @@
 --
 -- Keeping these rules in a pure function means each one can be tested on its
 -- own, without a connection.
+--
+-- A block is matched to a request by the hash of its header only. That is
+-- enough because the peer process checks every block before passing it on,
+-- with 'Haskoin.Node.Block.blockMutation': a block that arrives here holds
+-- the transactions its header commits to. A transaction is matched by its
+-- id, which does not cover its witness.
 module Haskoin.Node.Peer.Request
   ( Request,
     RequestStep (..),

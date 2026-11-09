@@ -138,8 +138,25 @@ syncPeer ct label hs = do
   expectSendHeaders fp
   return fp
 
+-- | The header with the first nonce for which its hash is above its target.
+-- Only its proof of work is wrong: its bits, time and parent are those of a
+-- valid header.
 invalidPow :: BlockHeader -> BlockHeader
-invalidPow h = h {bits = 0x1d00ffff}
+invalidPow h =
+  case [h' | n <- [0 ..], let h' = withNonce n, blockPOW (headerHash h') > target] of
+    h' : _ -> h'
+    [] -> h
+  where
+    (target, _) = decodeCompact h.bits
+    withNonce n =
+      BlockHeader
+        { version = h.version,
+          prev = h.prev,
+          merkle = h.merkle,
+          timestamp = h.timestamp,
+          bits = h.bits,
+          nonce = n
+        }
 
 spec :: Spec
 spec = forM_ [btcRegTest, bchRegTest] $ \net ->
@@ -256,6 +273,32 @@ spec = forM_ [btcRegTest, bchRegTest] $ \net ->
           g <- expectGetHeaders b
           take 1 g.locator `shouldBe` [hashAt 2000]
 
+      it "asks a peer that announces an unknown block while another peer syncs" $
+        slow $ \ct -> do
+          a <- connectPeer ct "a"
+          b <- connectPeer ct "b"
+          -- a holds the turn and never answers
+          _ <- expectGetHeaders a
+          chainBlocksAnnounced ct.chain b.peer [hashAt 100]
+          g <- expectGetHeaders b
+          take 1 g.locator `shouldBe` [headerHash net.genesisHeader]
+
+      it "asks an announcing peer only once until it answers" $
+        slow $ \ct -> do
+          a <- connectPeer ct "a"
+          b <- connectPeer ct "b"
+          _ <- expectGetHeaders a
+          chainBlocksAnnounced ct.chain b.peer [hashAt 100]
+          _ <- expectGetHeaders b
+          chainBlocksAnnounced ct.chain b.peer [hashAt 101]
+          sendHeaders ct b (take 5 (drop 49 main))
+          expectNoRequest 1 b
+          -- headers that connect answer the request
+          sendHeaders ct b (take 5 main)
+          _ <- waitHeight ct 5
+          chainBlocksAnnounced ct.chain b.peer [hashAt 102]
+          void $ expectGetHeaders b
+
       it "keeps syncing peer when another peer announces headers" $
         slow $ \ct -> do
           a <- connectPeer ct "a"
@@ -279,6 +322,15 @@ spec = forM_ [btcRegTest, bchRegTest] $ \net ->
 
     describe "reorganizations" $ do
       let fork n = mkHeaders net 1 (main !! 14) (t0 + 100) n
+      it "keeps the first chain it saw when a fork has the same work" $ slow $ \ct -> do
+        a <- syncPeer ct "a" short
+        -- five headers on block 15 reach height 20, with the same work
+        sendHeaders ct a (fork 5)
+        let tip = headerHash (last (fork 5))
+        eventually 10 "fork stored" $
+          (/= Nothing) <$> chainGetBlock ct.chain tip
+        bestHash ct `shouldReturn` hashAt 20
+
       it "switches to a fork with more work" $ slow $ \ct -> do
         a <- syncPeer ct "a" short
         sendHeaders ct a (fork 10)
@@ -306,6 +358,30 @@ spec = forM_ [btcRegTest, bchRegTest] $ \net ->
           _ <- expectGetHeaders a
           sendHeaders ct a [invalidPow (main !! 0)]
           expectKilled a
+
+      it "publishes the best block when a batch fails after valid headers" $
+        slow $ \ct -> do
+          a <- connectPeer ct "a"
+          _ <- expectGetHeaders a
+          sendHeaders ct a (take 5 main <> [invalidPow (main !! 5)])
+          expectKilled a
+          bn <- receiveWithin 10 "best block at height 5" ct.events $ \case
+            ChainBestBlock bn | bn.height == 5 -> Just bn
+            _ -> Nothing
+          nodeHash bn `shouldBe` hashAt 5
+
+      it "ends the turn of a peer whose full batch brings no new header" $
+        slow $ \ct -> do
+          a <- connectPeer ct "a"
+          b <- connectPeer ct "b"
+          _ <- answer ct a main
+          _ <- waitHeight ct 2000
+          -- asked for the headers after 2000, a sends the first 2000 again
+          _ <- expectGetHeaders a
+          sendHeaders ct a (take 2000 main)
+          expectSendHeaders a
+          g <- expectGetHeaders b
+          take 1 g.locator `shouldBe` [hashAt 2000]
 
       it "disconnects a peer that sends headers that do not form a chain" $
         slow $ \ct -> do

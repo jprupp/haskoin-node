@@ -63,8 +63,16 @@
 --
 -- * __Relayed addresses are untrusted.__ Peers gossip addresses, and a
 --   malicious peer could gossip private or loopback addresses to make the node
---   probe its own network. Only public addresses are accepted, and only a
---   bounded number are kept, so gossip cannot exhaust memory.
+--   probe its own network. Only public addresses are accepted, from gossip and
+--   from DNS seeds alike, and only a bounded number are kept, so gossip cannot
+--   exhaust memory.
+--
+-- * __One connection per network group.__ Addresses that the node learned are
+--   picked at random, and at most one connection is open to each network group
+--   (a /16 of IPv4, a /32 of IPv6; see 'Haskoin.Node.Address.netGroup'), as in
+--   Bitcoin Core. One operator with one block of addresses can then hold one
+--   slot, not all of them. Configured peers are exempt: the operator chose
+--   them.
 module Haskoin.Node.PeerMgr
   ( PeerMgrConfig (..),
     PeerEvent (..),
@@ -107,7 +115,7 @@ import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
 import Data.Word (Word32, Word64)
 import GHC.Records (HasField (..))
 import Haskoin
-import Haskoin.Node.Address (isRoutable, toHostService, toSockAddr)
+import Haskoin.Node.Address (NetGroup, isRoutable, netGroup, toHostService, toSockAddr)
 import Haskoin.Node.Logger
 import Haskoin.Node.Loop (loopForever)
 import Haskoin.Node.Peer
@@ -143,7 +151,10 @@ data PeerMgrConfig = PeerMgrConfig
     -- | how to open a connection to a peer address
     connect :: !(SockAddr -> WithConnection),
     -- | log messages here
-    logger :: !Logger
+    logger :: !Logger,
+    -- | look up a stored block header; given to every peer as the
+    -- @lookupBlock@ of its t'PeerConfig', to check the blocks it sends
+    lookupBlock :: !(BlockHash -> IO (Maybe BlockNode))
   }
 
 -- | Handle to a running peer manager. Obtain one with 'withPeerMgr', or from
@@ -298,7 +309,7 @@ dispatch mgr = \case
   PeerVersion p v -> do
     logDebug mgr.config.logger ("Received version from peer " <> p.label)
     nonces <- map (.nonce) <$> readTVarIO mgr.peers
-    peerInput mgr p $ either Refused (GotHandshake . GotVersion) (checkVersion nonces v)
+    peerInput mgr p $ either Refused (GotHandshake . GotVersion) (checkVersion mgr.config.net nonces v)
   PeerVerAck p -> do
     logDebug mgr.config.logger ("Received version ack from peer " <> p.label)
     peerInput mgr p (GotHandshake GotVerAck)
@@ -437,37 +448,56 @@ logConnectedPeers mgr = do
 -- | Next address to connect to. The configured peers and, if discovery is on,
 -- the seeds are loaded when there is nothing to try and they were not loaded
 -- recently.
+--
+-- Configured peers come first. Otherwise an address is picked at random among
+-- those in a network group that the node is not connected to yet, as Bitcoin
+-- Core requires of its automatic outbound connections (see 'netGroup').
 getNewPeer :: PeerMgr -> IO (Maybe SockAddr)
 getNewPeer mgr = do
   now <- getCurrentTime
   reload <- needsReload now <$> readTVarIO mgr.addresses
   when reload $ loadPeers mgr now
-  atomically . stateTVar mgr.addresses $ \book ->
-    case takeAddress now book of
-      Just (sa, book') -> (Just sa, book')
-      Nothing -> (Nothing, book)
+  r <- randomIO
+  atomically $ do
+    used <- usedGroups <$> readTVar mgr.peers
+    stateTVar mgr.addresses $ \book ->
+      case takeAddress now r ((`notElem` used) . netGroup) book of
+        Just (sa, book') -> (Just sa, book')
+        Nothing -> (Nothing, book)
+
+-- | Network groups of the open connections.
+usedGroups :: [OnlinePeer] -> [NetGroup]
+usedGroups = map (netGroup . (.address))
 
 -- | Resolve the configured peers and, if discovery is on, the seeds of the
--- network, and add them to the address book.
+-- network, and add them to the address book. Seed results must be routable,
+-- like relayed addresses: whoever answers the DNS query could otherwise point
+-- the node at its own network. Bitcoin Core's address manager refuses them
+-- too. On regtest the seed is @localhost@, so local peers there have to be
+-- configured.
 loadPeers :: PeerMgr -> UTCTime -> IO ()
 loadPeers mgr now = do
   let net = mgr.config.net
       resolve = fmap concat . mapM (toSockAddr net)
   configured <- resolve mgr.config.peers
-  seeds <- if mgr.config.discover then resolve net.seeds else return []
+  seeds <- if mgr.config.discover then filter isRoutable <$> resolve net.seeds else return []
   atomically . modifyTVar' mgr.addresses $ \book ->
     markLoaded now $
-      foldr (addAddress Discovered) (foldr (addAddress Configured) book configured) seeds
+      foldr (addAddress Seeded) (foldr (addAddress Configured) book configured) seeds
 
 -- | Start a peer process for an address taken from the address book and send
--- it our version, unless there are no free slots or the address is connected
--- already, in which case the address is given back.
+-- it our version, unless there are no free slots, the address is connected
+-- already, or it is a seed or gossiped address in a network group that the
+-- node is connected to already. Then the address is given back.
 connectPeer :: PeerMgr -> SockAddr -> IO ()
 connectPeer mgr sa = do
   ops <- readTVarIO mgr.peers
+  source <- addressSource sa <$> readTVarIO mgr.addresses
   if
     | length ops >= mgr.config.maxPeers -> giveBack "no free slots"
     | any ((== sa) . (.address)) ops -> giveBack "already connected"
+    | source /= Just Configured && netGroup sa `elem` usedGroups ops ->
+        giveBack "network group in use"
     | otherwise -> do
         logInfo mgr.config.logger ("Connecting to peer " <> cs (show sa))
         nonce <- randomIO
@@ -484,7 +514,8 @@ connectPeer mgr sa = do
                   net = net,
                   label = cs (show sa),
                   connect = mgr.config.connect sa,
-                  logger = withSource "Peer" mgr.config.logger
+                  logger = withSource "Peer" mgr.config.logger,
+                  lookupBlock = mgr.config.lookupBlock
                 }
         (inbox, mailbox) <- newMailbox
         busy <- newTVarIO Free

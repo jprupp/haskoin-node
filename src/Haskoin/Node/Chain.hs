@@ -30,17 +30,36 @@
 --   to show a better chain. "Haskoin.Node.Chain.Sync" decides whose turn it
 --   is.
 --
+-- * __A turn cannot be held forever.__ A turn ends when the peer sends a
+--   short batch, or a full batch that brings no header the node did not
+--   have, as a peer that replays known headers does. It also ends, with the
+--   peer dropped, when it passes the deadline that Bitcoin Core gives its
+--   initial headers sync and another peer could take over (see
+--   'syncDeadline'). Without these, one peer that kept sending full batches
+--   held the turn until it disconnected, and no other peer was asked.
+--
 -- * __Every hint of unknown blocks is followed.__ A peer announces a new block
 --   with a headers message only while it believes the node has the parent.
 --   When many blocks are found at once, or the node missed an announcement,
 --   the peer sends an inventory message instead, or headers that do not
---   connect. Either way the node asks that peer for headers. Ignoring these
+--   connect. Either way the node asks that peer for headers: at once if
+--   another peer holds the turn, as Bitcoin Core does, with at most one
+--   request in flight per peer, and again when its turn comes. Ignoring these
 --   left the chain stuck at an old height until the peer reconnected.
 --
 -- * __Quiet means poll.__ If no headers are requested or received for
 --   'timeout' seconds, every connected peer is asked for headers again. This
---   costs one small request per peer per quiet period, and puts a bound on how
---   long any unforeseen stall can last.
+--   costs one small request per peer per quiet period, and ends a stall in
+--   which nothing happens at all. A stall in which a peer keeps sending
+--   headers is not quiet; the rules above end that one.
+--
+-- * __Headers are kept before the chain has the minimum work.__ Bitcoin Core
+--   first checks that a peer's headers reach the network's minimum chain
+--   work and only then stores them (its @HeadersSyncState@). This node
+--   stores every valid header at once. During the initial sync, a peer can
+--   therefore make the node store a fork of low difficulty, at the cost of
+--   its proof of work. The deadline above bounds how long one turn can do
+--   this, but not the disk used over many turns.
 --
 -- * __Most work wins.__ The best chain is the one with the most accumulated
 --   proof of work, not the longest or the first seen, as in every Bitcoin
@@ -82,7 +101,8 @@ import Control.Concurrent.STM
 import Control.Monad (filterM, unless, void, when)
 import Data.Function (on)
 import Data.Functor ((<&>))
-import Data.Maybe (isNothing)
+import Data.List.NonEmpty qualified as NE
+import Data.Maybe (isJust, isNothing)
 import Data.String.Conversions (cs)
 import Data.Text (Text)
 import Data.Time.Clock
@@ -257,9 +277,10 @@ whenConnected ch p go =
 processHeaders :: Chain -> Peer -> [BlockHeader] -> IO ()
 processHeaders ch p [] = do
   logDebug ch.config.logger ("No headers from peer " <> p.label)
+  update ch (gotHeaders p)
   syncing <- isSyncing ch p
   when syncing $ finish ch p
-processHeaders ch p hs@(h : _) = do
+processHeaders ch p hs@(h : rest) = do
   logDebug
     ch.config.logger
     ("Processing " <> cs (show (length hs)) <> " headers from peer " <> p.label)
@@ -270,13 +291,21 @@ processHeaders ch p hs@(h : _) = do
         ("Headers from peer " <> p.label <> " do not connect")
       update ch (requestSync p)
       syncNext ch
-    Just _ ->
+      askAnnouncer ch p
+    Just _ -> do
+      update ch (gotHeaders p)
+      -- Stored headers form a tree from genesis, so the batch brings nothing
+      -- new exactly when its last header is stored already.
+      known <- isJust <$> chainGetBlock ch (headerHash (NE.last (h NE.:| rest)))
       importHeaders ch hs >>= \case
         Left e -> misbehaving ch p ("could not connect headers: " <> cs e)
         Right lst -> do
           syncing <- isSyncing ch p
           let full = length hs >= fromIntegral maxHeadersSize
           if
+            | full && syncing && known -> do
+                logDebug ch.config.logger ("No new headers from peer " <> p.label)
+                finish ch p
             | full && syncing -> requestHeaders ch p (Just lst)
             | full -> update ch (requestSync p) >> syncNext ch
             | syncing -> finish ch p
@@ -298,8 +327,24 @@ processAnnouncement ch p bhs = do
       )
     update ch (requestSync p)
     syncNext ch
+    askAnnouncer ch p
 
--- | Disconnect the syncing peer if it has not answered in time. If no peer is
+-- | Ask a peer for headers at once, because it told the node about blocks
+-- the node does not have, unless it is the syncing peer, whose request is
+-- outstanding, or a request to it is in flight already (see 'mayAsk'). The
+-- peer stays queued for its turn as well.
+askAnnouncer :: Chain -> Peer -> IO ()
+askAnnouncer ch p = do
+  now <- getCurrentTime
+  s <- (.sync) <$> readTVarIO ch.state
+  let syncing = fmap fst (syncingPeer s) == Just p
+  when (not syncing && mayAsk now p s) $ do
+    best <- withDB ch getBestBlockHeader
+    logDebug ch.config.logger ("Asking announcing peer for headers: " <> p.label)
+    sendGetHeaders ch now p best
+
+-- | Disconnect the syncing peer if it has not answered in time, or if its
+-- turn is past its deadline and another peer can take over. If no peer is
 -- syncing, start with a queued one, or queue every peer if nothing has
 -- happened for a while.
 checkSync :: Chain -> IO ()
@@ -310,6 +355,7 @@ checkSync ch = do
   case syncingPeer s of
     Just (p, t)
       | quiet t -> misbehaving ch p "timed out"
+      | syncTimedOut now s -> misbehaving ch p "headers sync took too long"
       | otherwise -> return ()
     Nothing
       | not (null (queuedPeers s)) -> syncNext ch
@@ -333,7 +379,8 @@ syncNext ch = do
         True -> do
           logDebug ch.config.logger ("Syncing against peer " <> p.label)
           now <- getCurrentTime
-          update ch (startSync now p)
+          best <- withDB ch getBestBlockHeader
+          update ch (startSync now (syncDeadline ch.config.net now best) p)
           requestHeaders ch p Nothing
         False -> do
           logDebug ch.config.logger ("Could not lock peer: " <> p.label)
@@ -346,6 +393,13 @@ requestHeaders ch p after = do
   now <- getCurrentTime
   update ch (refreshSync now p)
   bn <- maybe (withDB ch getBestBlockHeader) return after
+  sendGetHeaders ch now p bn
+
+-- | Send a peer a request for the headers after the given block, and record
+-- it as in flight.
+sendGetHeaders :: Chain -> UTCTime -> Peer -> BlockNode -> IO ()
+sendGetHeaders ch now p bn = do
+  update ch (askHeaders now p)
   loc <- withDB ch (blockLocator bn)
   logDebug
     ch.config.logger
@@ -400,22 +454,27 @@ isSyncing ch p =
 
 -- | Validate and store a run of headers, and publish the best block if it
 -- changed. Returns the node of the last header.
+--
+-- The best block is compared even when a header fails. haskoin-core's
+-- 'connectBlocks' keeps the headers before the one that failed, and they may
+-- have moved the best block.
 importHeaders ::
   Chain -> [BlockHeader] -> IO (Either String BlockNode)
 importHeaders ch hs = do
   now <- getCurrentTime
   let timestamp = floor (utcTimeToPOSIXSeconds now)
   before <- withDB ch getBestBlockHeader
-  withDB ch (connectBlocks ch.config.net timestamp hs) >>= \case
+  result <- withDB ch (connectBlocks ch.config.net timestamp hs)
+  after <- withDB ch getBestBlockHeader
+  when (before.header /= after.header) $
+    chainEvent ch (ChainBestBlock after)
+  case result of
     Left e -> do
       logError ch.config.logger ("connectBlocks: " <> cs e)
       return (Left e)
     Right [] -> return (Left "no headers")
     Right (lst : _) -> do
       update ch (touchSync now)
-      after <- withDB ch getBestBlockHeader
-      when (before.header /= after.header) $
-        chainEvent ch (ChainBestBlock after)
       return (Right lst)
 
 -- | Publish a 'ChainSynced' event the first time the chain is synced (see

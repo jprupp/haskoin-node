@@ -171,6 +171,11 @@ spec = do
                 Just (MVersion _) <- remoteReceive r
                 remoteSend r MVerAck
                 Just MVerAck <- remoteReceive r
+                -- The chain asks for headers once the peer is announced, so
+                -- closing after that request cannot beat the announcement.
+                remoteReceiveMatch 10 "header request" r $ \case
+                  MGetHeaders _ -> Just ()
+                  _ -> Nothing
                 return () -- close the connection
             | otherwise = honestRemote blocks r
       withScriptedNode net id script $ \t -> do

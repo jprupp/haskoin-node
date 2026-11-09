@@ -10,9 +10,11 @@ import Test.Hspec
 import Test.Hspec.QuickCheck (prop)
 import Test.QuickCheck
 
--- | Version of a full node with nonce 7.
+-- | Version of a full node with nonce 7. It offers the full chain and
+-- witness data: NODE_NETWORK (1) + NODE_WITNESS (8) = 9, as Bitcoin Core
+-- does.
 version :: Version
-version = versionWith nodeNetwork
+version = versionWith 9
 
 versionWith :: Word64 -> Version
 versionWith services =
@@ -86,10 +88,15 @@ spec = describe "version handshake" $ do
 
   describe "version checks" $ do
     it "accepts a full node" $
-      checkVersion [1, 2] version `shouldBe` Right version
+      checkVersion btcRegTest [1, 2] version `shouldBe` Right version
     it "rejects a peer that does not serve blocks" $
-      checkVersion [] (versionWith 0) `shouldBe` Left NotFullNode
+      checkVersion btcRegTest [] (versionWith 0) `shouldBe` Left NotFullNode
+    it "rejects a Bitcoin peer that serves blocks without witness data" $
+      -- NODE_NETWORK (1) without NODE_WITNESS (8)
+      checkVersion btcRegTest [] (versionWith 1) `shouldBe` Left NotWitnessNode
+    it "accepts a Bitcoin Cash peer that serves blocks, which have no witness" $
+      checkVersion bchRegTest [] (versionWith 1) `shouldBe` Right (versionWith 1)
     it "rejects a connection to ourselves" $
-      checkVersion [7] version `shouldBe` Left ConnectedToSelf
+      checkVersion btcRegTest [7] version `shouldBe` Left ConnectedToSelf
     it "uses our protocol version" $
       version.version `shouldBe` fromIntegral myVersion

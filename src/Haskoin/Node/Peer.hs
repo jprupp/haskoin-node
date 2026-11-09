@@ -24,9 +24,22 @@
 --   the payload read, so a peer cannot make the node buffer a huge message it
 --   would refuse anyway.
 --
+-- * A payload is read in time and memory linear in its size, however small
+--   the pieces it arrives in. The pieces are collected and joined once. An
+--   earlier version appended each piece to the bytes read so far, so a peer
+--   that sent a large message in small TCP segments made the node copy it
+--   over and over, with a cost that grew with the square of the size.
+--
 -- * Anything that does not parse closes the connection with a
 --   'PeerException' saying why. There is no attempt to recover, because a
 --   peer that sends garbage once is not worth the risk.
+--
+-- * A block whose transactions are not the ones its header commits to closes
+--   the connection too ('MutatedBlock'). The header carries the proof of
+--   work, but anyone can attach other transactions to it. The check is
+--   "Haskoin.Node.Block", the same as Bitcoin Core runs on every block it
+--   receives. It is done here, once, so that 'getBlocks', 'getData' and the
+--   'PeerMessage' events all see only blocks that passed it.
 --
 -- * Reading pauses when the node falls behind ('maxPendingMessages'), so the
 --   speed of the node, not the speed of the peer, sets the pace.
@@ -75,6 +88,7 @@ import Data.String.Conversions (cs)
 import Data.Text (Text)
 import Data.Word (Word32)
 import Haskoin
+import Haskoin.Node.Block
 import Haskoin.Node.Logger
 import Haskoin.Node.Loop (loopForever)
 import Haskoin.Node.Peer.Lock
@@ -109,7 +123,14 @@ data PeerConfig = PeerConfig
     -- | how to open the connection to the peer
     connect :: !WithConnection,
     -- | log messages here
-    logger :: !Logger
+    logger :: !Logger,
+    -- | look up a block header that the node has stored, or give 'Nothing'.
+    -- A block from the peer is checked against its parent's height, to know
+    -- whether its witness data must match the commitment in its coinbase
+    -- (see 'witnessCheck'). "Haskoin.Node" passes 'Haskoin.Node.chainGetBlock'.
+    -- A function that always gives 'Nothing' still checks the Merkle root of
+    -- every block, but not its witness data.
+    lookupBlock :: !(BlockHash -> IO (Maybe BlockNode))
   }
 
 -- | Events published about peers.
@@ -118,7 +139,11 @@ data PeerEvent
     PeerConnected !Peer
   | -- | the peer disconnected
     PeerDisconnected !Peer
-  | -- | the peer sent a message
+  | -- | the peer sent a message. A block in an 'MBlock' message has passed
+    -- 'blockMutation': its transactions hash to the Merkle root of its
+    -- header, and its witness data matches its coinbase when the node knows
+    -- the parent of the block. Nothing else about it is checked. A
+    -- transaction in an 'MTx' message is not checked at all.
     PeerMessage !Peer !Message
   deriving (Eq)
 
@@ -138,6 +163,9 @@ data PeerException
     MessageTooLarge !MessageCommand !Word32
   | -- | the payload could not be parsed; holds the reason
     InvalidPayload !MessageCommand !String
+  | -- | a block whose transactions are not the ones its header commits to;
+    -- holds the hash of the block and the reason (see 'blockMutation')
+    MutatedBlock !BlockHash !BlockMutation
   deriving stock (Show)
 
 instance Exception PeerException
@@ -263,29 +291,46 @@ dispatchMessage PeerConfig {label, logger} KillPeer = do
 -- The counts of list messages are not checked here. 'getMessage' fails as
 -- soon as it reads a count above the limit of the message. The limits are
 -- 2000 headers and 1000 addresses, for example.
+--
+-- The bytes of a message are collected as the pieces that arrive, and joined
+-- once, header and payload together. The cost of reading is linear in the
+-- size of the message, whatever the size of the pieces.
+--
+-- A block must pass 'blockMutation' before it is passed on. Its parent is
+-- looked up with 'lookupBlock' to choose the witness rule.
 inPeerConduit ::
   PeerConfig -> ConduitT ByteString Message IO ()
-inPeerConduit PeerConfig {label, net, logger} = loopForever $ do
+inPeerConduit PeerConfig {label, net, logger, lookupBlock} = loopForever $ do
   debug (label <> " awaiting message...")
-  x <- takeExactly 24
+  hdr <- takePieces 24
+  let x = B.concat hdr
   MessageHeader mgc cmd len _ <- case decode x of
     Left _ -> bad InvalidMessageHeader
     Right h -> return h
   when (mgc /= net.magic) $ bad (WrongNetwork mgc)
   when (len > maxPayloadSize net cmd) $ bad (MessageTooLarge cmd len)
   debug (label <> " sent cmd " <> cs (show cmd))
-  y <- takeExactly (fromIntegral len)
-  case runGet (getMessage net) $ x `B.append` y of
+  payload <- takePieces (fromIntegral len)
+  case runGet (getMessage net) (B.concat (x : payload)) of
     Left e -> bad (InvalidPayload cmd (firstLine e))
     Right m -> do
       debug (label <> " sent payload for cmd " <> cs (show cmd))
+      checkBlock m
       yield m
   where
     debug = liftIO . logDebug logger
-    takeExactly n = do
-      bs <- takeCE n .| foldC
-      when (B.length bs /= n) $ bad ConnectionClosed
-      return bs
+    -- Exactly n bytes, as the pieces they arrived in. Joining them is left
+    -- to the caller, so that it happens once.
+    takePieces n = do
+      pieces <- takeCE n .| sinkList
+      when (sum (map B.length pieces) /= n) $ bad ConnectionClosed
+      return pieces
+    checkBlock = \case
+      MBlock b -> do
+        parent <- liftIO (lookupBlock b.header.prev)
+        forM_ (blockMutation (witnessCheck net parent) b) $
+          bad . MutatedBlock (headerHash b.header)
+      _ -> return ()
     bad :: PeerException -> ConduitT i o IO a
     bad e = liftIO $ do
       logError logger (label <> ": " <> cs (show e))
@@ -356,6 +401,13 @@ setFree = void . releasePeer legacyOwner
 --
 -- The 'Int' argument is the timeout in seconds. On networks with SegWit,
 -- blocks are requested with their witness data.
+--
+-- Every block returned has passed 'blockMutation': its transactions hash to
+-- the Merkle root of its header, and, when the node knows its parent, its
+-- witness data matches the commitment in its coinbase. A peer that sends a
+-- block that fails is disconnected, and the request then gives 'Nothing'
+-- when it times out. The blocks are not validated otherwise: their
+-- transactions may still be invalid.
 getBlocks ::
   Network ->
   Int ->
@@ -377,6 +429,11 @@ getBlocks net time p bhs =
 --
 -- The 'Int' argument is the timeout in seconds. Peers normally only serve
 -- transactions that are in their mempool.
+--
+-- A transaction is matched by its id, which does not cover its witness. The
+-- peer can return the right transaction with any witness data, and nothing
+-- here can tell. Treat the witness of a transaction from 'getTxs', or from an
+-- 'MTx' event, as unauthenticated until the transaction is found in a block.
 getTxs ::
   Network ->
   Int ->
@@ -401,7 +458,8 @@ getTxs net time p ths =
 -- items means that the peer will not send the rest. Unrelated messages that
 -- arrive meanwhile are ignored. Transactions are returned as 'Left' and blocks
 -- as 'Right', in the order they were requested. "Haskoin.Node.Peer.Request"
--- has the rules.
+-- has the rules. Blocks are checked as 'getBlocks' says, and transactions as
+-- 'getTxs' says.
 getData ::
   Int -> Peer -> GetData -> IO (Maybe [Either Tx Block])
 getData seconds p gd@(GetData ivs) =

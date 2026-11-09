@@ -32,6 +32,26 @@
 --   out is marked 'Dropped' until its disconnection arrives, so nothing can
 --   queue it in between.
 --
+-- * __A turn has a deadline.__ A peer that keeps sending full batches never
+--   finishes its turn, and while it holds the turn nobody else is asked. So
+--   each turn gets the deadline that Bitcoin Core gives its initial headers
+--   sync, 15 minutes plus 1 millisecond for each header expected from the age
+--   of the best block ('syncDeadline'). When it passes and another peer could
+--   take over, the turn ends with the peer dropped ('syncTimedOut'). Core
+--   applies the deadline only while the best block is more than a day old.
+--   Here it applies to every turn, because the chain only counts as synced
+--   once no peer holds a turn, so a peer that held one forever would keep it
+--   from ever being synced. An honest turn after the initial sync takes
+--   seconds.
+--
+-- * __Announcements get an answer at once.__ A peer that announces an
+--   unknown block while another peer holds the turn is asked for headers
+--   directly, as Bitcoin Core does, so that a slow or hostile syncing peer
+--   cannot keep the node from hearing about new blocks. At most one such
+--   request is in flight per peer ('mayAsk'): a request counts as answered
+--   when the peer sends headers that connect, or none, and expires after
+--   'headersResponseTime'.
+--
 -- * __Pure and polymorphic.__ The rules are plain functions on a value, over
 --   any peer type with equality, so they can be tested exhaustively with
 --   integers instead of network connections. Transitions that do not apply to
@@ -45,11 +65,19 @@ module Haskoin.Node.Chain.Sync
     peerDisconnected,
     requestSync,
     startSync,
+    syncDeadline,
+    syncTimedOut,
     refreshSync,
     finishSync,
     dropPeer,
     pollPeers,
     touchSync,
+    askHeaders,
+    gotHeaders,
+    mayAsk,
+    headersResponseTime,
+    headersSyncTimeoutBase,
+    headersSyncTimeoutPerHeader,
     peerStatus,
     syncingPeer,
     queuedPeers,
@@ -61,7 +89,7 @@ module Haskoin.Node.Chain.Sync
 where
 
 import Data.Maybe (isNothing, listToMaybe)
-import Data.Time.Clock (NominalDiffTime, UTCTime, diffUTCTime)
+import Data.Time.Clock (NominalDiffTime, UTCTime, addUTCTime, diffUTCTime)
 import Data.Time.Clock.POSIX (posixSecondsToUTCTime)
 import Haskoin (BlockHeader (..), BlockNode (..), Network (..))
 
@@ -80,16 +108,21 @@ data PeerStatus
   deriving stock (Eq, Show)
 
 -- | Connected peers in queue order, with the last time that headers were
--- requested or received.
+-- requested or received, the deadline of the current turn, and the requests
+-- for headers in flight.
 data SyncState p = SyncState
   { peers :: ![(p, PeerStatus)],
-    activity :: !UTCTime
+    activity :: !UTCTime,
+    -- | when the turn of the syncing peer must end; set by 'startSync'
+    deadline :: !(Maybe UTCTime),
+    -- | peers asked for headers that have not answered, with the time asked
+    asked :: ![(p, UTCTime)]
   }
   deriving stock (Eq, Show)
 
 -- | No peers, with the given time as the last activity.
 emptySync :: UTCTime -> SyncState p
-emptySync = SyncState []
+emptySync t = SyncState {peers = [], activity = t, deadline = Nothing, asked = []}
 
 -- | A peer completed the handshake. It is queued to be asked for headers.
 peerConnected :: (Eq p) => p -> SyncState p -> SyncState p
@@ -99,7 +132,8 @@ peerConnected p s
 
 -- | A peer disconnected.
 peerDisconnected :: (Eq p) => p -> SyncState p -> SyncState p
-peerDisconnected p s = s {peers = filter ((/= p) . fst) s.peers}
+peerDisconnected p s =
+  s {peers = filter ((/= p) . fst) s.peers, asked = filter ((/= p) . fst) s.asked}
 
 -- | The peer told the node about blocks that it does not have.
 requestSync :: (Eq p) => p -> SyncState p -> SyncState p
@@ -109,13 +143,48 @@ requestSync p s =
     Just (Syncing t _) -> setStatus p (Syncing t True) s
     _ -> s
 
--- | Start asking a queued peer for headers, unless another peer is being
--- asked already.
-startSync :: (Eq p) => UTCTime -> p -> SyncState p -> SyncState p
-startSync now p s =
+-- | Start asking a queued peer for headers at the given time, unless another
+-- peer is being asked already. The second time is the deadline of the turn
+-- (see 'syncDeadline').
+startSync :: (Eq p) => UTCTime -> UTCTime -> p -> SyncState p -> SyncState p
+startSync now end p s =
   case (syncingPeer s, peerStatus p s) of
-    (Nothing, Just Queued) -> setStatus p (Syncing now False) s {activity = now}
+    (Nothing, Just Queued) ->
+      setStatus p (Syncing now False) s {activity = now, deadline = Just end}
     _ -> s
+
+-- | Base of the deadline of a turn: @HEADERS_DOWNLOAD_TIMEOUT_BASE@ in
+-- Bitcoin Core 32.1, 15 minutes.
+headersSyncTimeoutBase :: NominalDiffTime
+headersSyncTimeoutBase = 15 * 60
+
+-- | Time added to the deadline of a turn for each header expected:
+-- @HEADERS_DOWNLOAD_TIMEOUT_PER_HEADER@ in Bitcoin Core 32.1, 1 millisecond.
+headersSyncTimeoutPerHeader :: NominalDiffTime
+headersSyncTimeoutPerHeader = 0.001
+
+-- | Deadline of a turn that starts at the given time with the given best
+-- block, as Bitcoin Core sets it for its initial headers sync:
+-- 'headersSyncTimeoutBase', plus 'headersSyncTimeoutPerHeader' for each
+-- block that should have been found since the best block, one every
+-- 'targetSpacing' of the network.
+syncDeadline :: Network -> UTCTime -> BlockNode -> UTCTime
+syncDeadline net now best = timeout `addUTCTime` now
+  where
+    tipTime = posixSecondsToUTCTime (fromIntegral best.header.timestamp)
+    age = max 0 (floor (now `diffUTCTime` tipTime)) :: Integer
+    expected = age `div` max 1 (fromIntegral net.targetSpacing)
+    timeout = headersSyncTimeoutBase + fromIntegral expected * headersSyncTimeoutPerHeader
+
+-- | Whether the turn of the syncing peer has passed its deadline while
+-- another connected peer could take over. Bitcoin Core only drops its
+-- initial sync peer when it has another one to use.
+syncTimedOut :: (Eq p) => UTCTime -> SyncState p -> Bool
+syncTimedOut now s =
+  case (syncingPeer s, s.deadline) of
+    (Just (p, _), Just end) ->
+      now > end && any (/= p) (connectedPeers s)
+    _ -> False
 
 -- | Another request was sent to the peer being synced against.
 refreshSync :: (Eq p) => UTCTime -> p -> SyncState p -> SyncState p
@@ -142,7 +211,7 @@ dropPeer p s =
 -- | Queue every idle peer, and record the time as activity so that polling
 -- happens at most once per quiet period.
 pollPeers :: UTCTime -> SyncState p -> SyncState p
-pollPeers now s = SyncState {peers = map poll s.peers, activity = now}
+pollPeers now s = s {peers = map poll s.peers, activity = now}
   where
     poll (p, Idle) = (p, Queued)
     poll x = x
@@ -150,6 +219,30 @@ pollPeers now s = SyncState {peers = map poll s.peers, activity = now}
 -- | Headers were received at the given time.
 touchSync :: UTCTime -> SyncState p -> SyncState p
 touchSync now s = s {activity = now}
+
+-- | Longest that a request for headers counts as in flight:
+-- @HEADERS_RESPONSE_TIME@ in Bitcoin Core 32.1, 2 minutes.
+headersResponseTime :: NominalDiffTime
+headersResponseTime = 120
+
+-- | A request for headers was sent to the peer at the given time.
+askHeaders :: (Eq p) => UTCTime -> p -> SyncState p -> SyncState p
+askHeaders now p s = s {asked = (p, now) : filter ((/= p) . fst) s.asked}
+
+-- | The peer sent headers that answer a request: headers that connect to
+-- the chain, or none. Headers that do not connect cannot be an answer, as
+-- Bitcoin Core reasons, so they leave the request in flight.
+gotHeaders :: (Eq p) => p -> SyncState p -> SyncState p
+gotHeaders p s = s {asked = filter ((/= p) . fst) s.asked}
+
+-- | Whether the peer may be asked for headers at the given time: no request
+-- to it is in flight, or the last one is older than 'headersResponseTime'.
+-- This is the rule of @MaybeSendGetHeaders@ in Bitcoin Core.
+mayAsk :: (Eq p) => UTCTime -> p -> SyncState p -> Bool
+mayAsk now p s =
+  case lookup p s.asked of
+    Nothing -> True
+    Just t -> now `diffUTCTime` t > headersResponseTime
 
 -- | Status of a peer, or 'Nothing' if it is not connected.
 peerStatus :: (Eq p) => p -> SyncState p -> Maybe PeerStatus

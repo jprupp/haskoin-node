@@ -6,8 +6,105 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+This release fixes the findings of a security review. Several fixes change
+the API; each is marked "Breaking" below.
+
+### Added
+
+- `Haskoin.Node.Block`, re-exported by `Haskoin.Node`: `blockMutation` tells
+  whether the transactions of a block are the ones its header commits to, as
+  `IsBlockMutated` in Bitcoin Core 32.1 does. `witnessCheck` and
+  `segWitHeight` choose the witness rule for a block from the height of its
+  parent.
+- `Haskoin.Node.Address.netGroup` and `NetGroup`: the network group of an
+  address, as Bitcoin Core forms it, and `connectTimeout`.
+- `Haskoin.Node.Chain.Sync`: `syncDeadline`, `syncTimedOut`, `askHeaders`,
+  `gotHeaders`, `mayAsk`, `headersResponseTime`, `headersSyncTimeoutBase` and
+  `headersSyncTimeoutPerHeader`, for the deadline of a turn and the requests
+  for headers in flight.
+- `Haskoin.Node.PeerMgr.Addresses`: the `Seeded` source and `addressSource`.
+
+### Security
+
+- Blocks are checked against their headers. A peer could answer a request for
+  a block with the real header, and its proof of work, together with
+  transactions of its choice, and `getBlocks`, `getData` and the `MBlock`
+  events passed them on. Applications such as Haskoin Store would then record
+  payments that never happened. Every block a peer sends now has to pass
+  `blockMutation`: the transaction ids hash to the Merkle root, the tree does
+  not repeat transactions (CVE-2012-2459), a block without a coinbase holds no
+  64-byte transaction, and, once SegWit is active at the block's height, the
+  witness data matches the commitment in the coinbase. A peer that sends a
+  block that fails is disconnected with `MutatedBlock`. The header is not
+  marked invalid. When the node does not know the parent of a block, the
+  witness data is not checked, as in Bitcoin Core.
+- One peer could hold the header sync forever. It kept its turn as long as it
+  sent full batches, even of headers the node already had, and no other peer
+  was asked. Now a full batch that brings no new header ends the turn, a turn
+  that runs past the deadline Bitcoin Core gives its initial headers sync (15
+  minutes plus 1 millisecond per block expected since the best header) ends
+  with the peer dropped when another peer can take over, and a peer that
+  announces an unknown block is asked for headers at once, with at most one
+  request in flight per peer, as in Bitcoin Core.
+- Reading a message took time that grew with the square of its size when it
+  arrived in small pieces. A peer could keep a core busy for seconds with one
+  4 MB message, and for about a minute with a 64 MB Bitcoin Cash block
+  message. Reading is now linear.
+- One IP address could take every outbound slot. Addresses were tried in the
+  order of their port, any number of connections could go to one network, and
+  a book full of gossip learned no new seed address. Learned addresses are now
+  picked at random, at most one connection goes to each network group (a /16
+  of IPv4, a /32 of IPv6) unless the address is configured, seed addresses
+  have their own room, and a new address can replace one that failed.
+- Messages from a peer that had not completed the handshake were published to
+  the application, outside back-pressure. They are now dropped, except the
+  `version` and `verack` messages, as Bitcoin Core does.
+- Addresses returned by DNS seeds must be routable, like relayed addresses,
+  and the ORCHID ranges `2001:10::/28` and `2001:20::/28` are no longer
+  routable, as in Bitcoin Core.
+- On networks with SegWit, a peer must offer `NODE_WITNESS`, as Bitcoin Core
+  requires of its outbound peers. The node asks for blocks and transactions
+  with their witness, which such a peer cannot serve.
+- `withConnection` gives up on a connection that does not open within five
+  seconds. A relayed address that dropped connection requests held a slot for
+  about two minutes.
+
 ### Changed
 
+- Breaking: `PeerConfig` and `PeerMgrConfig` have a `lookupBlock` field, the
+  function that finds a stored header. A peer uses it to tell whether SegWit
+  applies to a block it receives. `withNode` fills it in; code that builds
+  these records itself must add it. A function that always gives `Nothing`
+  keeps the Merkle root check but skips the witness check.
+- Breaking: `PeerException` has a `MutatedBlock` constructor, and
+  `HandshakeError` a `NotWitnessNode` one.
+- Breaking: `checkVersion` takes the network.
+- Breaking: `takeAddress` takes a random number and a predicate that says
+  which seed and gossiped addresses may be taken. Configured addresses come
+  first. `Source` has a `Seeded` constructor, and the peer manager adds seed
+  addresses with it.
+- Breaking: `startSync` takes the deadline of the turn.
+- On regtest, the DNS seed of haskoin-core is `localhost`, which is not
+  routable, so discovery no longer finds a local node. Configure local peers
+  in `peers`.
+- When a batch of headers fails after some valid headers, the node keeps the
+  valid ones, as before, and now publishes the `ChainBestBlock` event for the
+  best block they set.
+- Counting the gossiped addresses in the book no longer scans it for every
+  new address.
+- The library depends on streaming-commons directly, for the TCP connection
+  that `withConnection` opens. It was already a dependency of conduit-extra.
+- The documentation says that a subscriber that falls behind holds memory,
+  that witness data from `getTxs` and `MTx` events is not authenticated, and
+  that headers below the minimum chain work are stored during the initial
+  sync.
+- The README quick start compiles again: it needed `DisambiguateRecordFields`
+  and the fields of `BlockNode`. The tutorial names the imports it adds.
+- Tests: the Bitcoin Core blocks used as fixtures, the limits of inventory,
+  locator and user agent sizes, back-pressure, the edges of the tip age and of
+  the maximum life, reserved address ranges, and ties between forks of equal
+  work are tested. Mock peers send their test messages once they are online,
+  which ends a race that made some tests time out or hang.
 - The CI workflow's shell steps moved into `scripts/check-local-deps.sh` and
   `scripts/install-system-libraries.sh`, and the regtest Containerfile's
   install step into `test/regtest/install-nodes.sh`, so each can be read and

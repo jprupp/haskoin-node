@@ -28,8 +28,11 @@
 --
 -- Everything that happens is published as a 'NodeEvent' to the 'Publisher'
 -- given in 'NodeConfig'. Subscribe to it to learn about new best blocks, peers
--- connecting and disconnecting, and every message received from a peer, such as
--- inventory announcements, blocks and transactions.
+-- connecting and disconnecting, and every message received from an online
+-- peer, such as inventory announcements, blocks and transactions. A
+-- subscription is an unbounded queue: the node does not wait for a slow
+-- subscriber, so a subscriber that falls behind holds every event it has not
+-- read in memory.
 --
 -- = Purpose
 --
@@ -67,8 +70,11 @@
 --
 -- * __Trust nothing from the network.__ Peers are strangers. Every message is
 --   checked against size limits before it is read, invalid input disconnects
---   the peer, and a peer cannot make the node allocate memory faster than it
---   can work.
+--   the peer, every block must hold the transactions its header commits to
+--   ("Haskoin.Node.Block"), and a peer cannot make the node allocate memory
+--   faster than it can work. The node's subscribers are another matter: the
+--   node does not wait for them, so a subscriber must keep up with what it
+--   asked for.
 --
 -- = Example
 --
@@ -117,6 +123,9 @@ module Haskoin.Node
     -- * Peers
     module Haskoin.Node.Peer,
 
+    -- * Blocks
+    module Haskoin.Node.Block,
+
     -- * Peer manager
     module Haskoin.Node.PeerMgr,
 
@@ -133,6 +142,7 @@ import Data.Time.Clock (NominalDiffTime)
 import Database.RocksDB (ColumnFamily, DB)
 import Haskoin
 import Haskoin.Node.Address (withConnection)
+import Haskoin.Node.Block
 import Haskoin.Node.Chain
 import Haskoin.Node.Logger
 import Haskoin.Node.Loop (loopForever)
@@ -205,23 +215,33 @@ chainEvents mgr input output = loopForever $ do
     _ -> return ()
   publish (ChainEvent event) output
 
--- | Route events from peers to the peer manager and chain. A message from a
--- peer is handled to completion before the peer may send another one past its
--- small allowance of pending messages (see 'maxPendingMessages'), so that the
--- node's queues cannot grow faster than it can work. Address, header and
--- inventory messages are only taken from peers that are online: the handshake
--- is complete and the peer is not being disconnected.
--- Inventory with blocks goes to the chain, which asks for headers if it does
--- not know them.
+-- | Route events from peers to the peer manager and chain, and publish them
+-- to the application.
+--
+-- A message from a peer is handled to completion before the peer may send
+-- another one past its small allowance of pending messages (see
+-- 'maxPendingMessages'), so that the node's own queues cannot grow faster
+-- than it can work. Address, header and inventory messages are only taken
+-- from peers that are online: the handshake is complete and the peer is not
+-- being disconnected. Inventory with blocks goes to the chain, which asks for
+-- headers if it does not know them.
+--
+-- Messages reach the application only from online peers, except @version@
+-- and @verack@, which are the handshake itself. Bitcoin Core ignores
+-- anything else a peer sends before the handshake is done, and so does the
+-- node: a peer whose version may still be refused cannot feed the
+-- application blocks and transactions.
 peerEvents ::
   Chain -> PeerMgr -> Inbox PeerEvent -> Publisher NodeEvent -> IO ()
 peerEvents ch mgr input output = loopForever $ do
   event <- receive input
   case event of
-    PeerConnected p ->
+    PeerConnected p -> do
       chainPeerConnected ch p
-    PeerDisconnected p ->
+      forward event
+    PeerDisconnected p -> do
       chainPeerDisconnected ch p
+      forward event
     PeerMessage p m -> do
       case m of
         MVersion v ->
@@ -241,14 +261,19 @@ peerEvents ch mgr input output = loopForever $ do
           bhs -> whenOnline p $ chainBlocksAnnounced ch p bhs >> chainSync ch
         _ -> return ()
       ticklePeer mgr p
+      if handshake m then forward event else whenOnline p (forward event)
       peerMessageDone p
-  publish (PeerEvent event) output
   where
+    forward event = publish (PeerEvent event) output
     whenOnline p act =
       getOnlinePeer mgr p >>= \case
         Just o | o.online -> act
         _ -> return ()
     isBlock iv = iv.invType `elem` [InvBlock, InvWitnessBlock]
+    handshake = \case
+      MVersion _ -> True
+      MVerAck -> True
+      _ -> False
 
 -- | Launch node process in the foreground.
 --
@@ -263,7 +288,7 @@ withNode cfg action =
       withPublisher $ \chainPub ->
         withSubscription chainPub $ \chainSub ->
           withChain (chainConfig chainPub) $ \chain ->
-            withPeerMgr (peerMgrConfig peerPub) $ \peerMgr ->
+            withPeerMgr (peerMgrConfig chain peerPub) $ \peerMgr ->
               withAsync (chainEvents peerMgr chainSub cfg.pub) $ \a1 ->
                 withAsync (peerEvents chain peerMgr peerSub cfg.pub) $ \a2 -> do
                   link a1
@@ -279,7 +304,7 @@ withNode cfg action =
           timeout = cfg.timeout,
           logger = withSource "Chain" cfg.logger
         }
-    peerMgrConfig pub =
+    peerMgrConfig chain pub =
       PeerMgrConfig
         { maxPeers = cfg.maxPeers,
           peers = cfg.peers,
@@ -290,5 +315,6 @@ withNode cfg action =
           timeout = cfg.timeout,
           maxPeerLife = cfg.maxPeerLife,
           connect = cfg.connect,
-          logger = withSource "PeerMgr" cfg.logger
+          logger = withSource "PeerMgr" cfg.logger,
+          lookupBlock = chainGetBlock chain
         }
