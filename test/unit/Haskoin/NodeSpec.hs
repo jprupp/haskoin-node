@@ -13,7 +13,6 @@ module Haskoin.NodeSpec (spec) where
 
 import Conduit
 import Control.Monad (forM_, forever, replicateM)
-import Control.Monad.Trans.Cont (ContT (..), runContT)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.ByteString.Base64 (decodeBase64Lenient)
@@ -403,71 +402,65 @@ freshHeader net = do
       0
       genesis {version = 4, prev = headerHash genesis, timestamp = now}
 
-waitForPeer :: (MonadIO m) => Inbox NodeEvent -> m Peer
+waitForPeer :: Inbox NodeEvent -> IO Peer
 waitForPeer inbox =
   receiveMatch inbox $ \case
     PeerEvent (PeerConnected p) -> Just p
     _ -> Nothing
 
-withLifted :: (MonadUnliftIO m) => ((a -> IO b) -> IO b) -> (a -> m b) -> m b
+withLifted :: ((a -> IO b) -> IO b) -> (a -> IO b) -> IO b
 withLifted w m = withRunInIO $ \io -> w (io . m)
 
 withTestNode ::
-  (MonadUnliftIO m) =>
-  Network -> String -> (TestNode -> m a) -> m a
+  Network -> String -> (TestNode -> IO a) -> IO a
 withTestNode = withTestNodeBlocks allBlocks
 
 -- | Like 'withTestNode', with the mock peer serving these blocks.
 withTestNodeBlocks ::
-  (MonadUnliftIO m) =>
-  [Block] -> Network -> String -> (TestNode -> m a) -> m a
+  [Block] -> Network -> String -> (TestNode -> IO a) -> IO a
 withTestNodeBlocks blocks = withTestNodeOpts (defOpts blocks)
 
 withTestNodeOpts ::
-  (MonadUnliftIO m) =>
-  TestOpts -> Network -> String -> (TestNode -> m a) -> m a
-withTestNodeOpts opts net str f = flip runContT return $ do
-  w <- ContT $ withSystemTempDirectory ("haskoin-node-test-" <> str <> "-")
-  count <- newTVarIO 0
-  pub <- ContT withPublisher
-  sub <- ContT $ withSubscription pub
-  db <- ContT $ withLifted (R.withDBCF w cfg cols)
-  liftIO (opts.setup db)
-  let ad =
-        NetworkAddress
-          nodeNetwork
-          (sockToHostAddress (SockAddrInet 0 0))
-      na =
-        NetworkAddress
-          0
-          (sockToHostAddress (SockAddrInet 0 0))
-      cfg' =
-        NodeConfig
-          { maxPeers = 20,
-            db = db,
-            cf = listToMaybe (R.columnFamilies db),
-            -- IPv4, so that the mock peer is reachable without IPv6
-            peers = ["127.0.0.1:17486"],
-            discover = False,
-            address = na,
-            net = net,
-            pub = pub,
-            timeout = opts.timeout,
-            maxPeerLife = 48 * 3600,
-            connect = dummyPeerConnect opts.react count net ad,
-            logger = Logger {level = LevelError, source = "", push = \_ -> return ()}
-          }
-  Node mgr ch <- ContT $ withNode cfg'
-  lift $
-    f
-      TestNode
-        { testMgr = mgr,
-          testChain = ch,
-          nodeEvents = sub,
-          testDB = db,
-          getHeadersCount = count
-        }
+  TestOpts -> Network -> String -> (TestNode -> IO a) -> IO a
+withTestNodeOpts opts net str f =
+  withSystemTempDirectory ("haskoin-node-test-" <> str <> "-") $ \w ->
+    withPublisher $ \pub ->
+      withSubscription pub $ \sub ->
+        withLifted (R.withDBCF w cfg cols) $ \db -> do
+          count <- newTVarIO 0
+          opts.setup db
+          withNode (nodeConfig count pub db) $ \(Node mgr ch) ->
+            f
+              TestNode
+                { testMgr = mgr,
+                  testChain = ch,
+                  nodeEvents = sub,
+                  testDB = db,
+                  getHeadersCount = count
+                }
   where
+    nodeConfig count pub db =
+      NodeConfig
+        { maxPeers = 20,
+          db = db,
+          cf = listToMaybe (R.columnFamilies db),
+          -- IPv4, so that the mock peer is reachable without IPv6
+          peers = ["127.0.0.1:17486"],
+          discover = False,
+          address = NetworkAddress 0 anywhere,
+          net = net,
+          pub = pub,
+          timeout = opts.timeout,
+          maxPeerLife = 48 * 3600,
+          connect =
+            dummyPeerConnect
+              opts.react
+              count
+              net
+              (NetworkAddress nodeNetwork anywhere),
+          logger = Logger {level = LevelError, source = "", push = \_ -> return ()}
+        }
+    anywhere = sockToHostAddress (SockAddrInet 0 0)
     cfg = def {R.createIfMissing = True, R.errorIfExists = True}
     cols = [("node", def)]
 

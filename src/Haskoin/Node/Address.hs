@@ -23,6 +23,7 @@ where
 
 import Control.Applicative ((<|>))
 import Control.Arrow (second)
+import Control.Exception (IOException, catch)
 import Data.Bits ((.&.))
 import Data.Conduit.Network
   ( ClientSettings,
@@ -46,7 +47,6 @@ import Network.Socket
     hostAddressToTuple,
   )
 import Text.Read (readMaybe)
-import UnliftIO (MonadUnliftIO, SomeException, catch, liftIO)
 
 -- | Split a peer address into host and port. Accepts @host@, @host:port@,
 -- @[ipv6]@ and @[ipv6]:port@. Either part is 'Nothing' if missing.
@@ -77,9 +77,13 @@ toHostService str =
 -- | Resolve a peer address given as in 'toHostService' into socket addresses,
 -- using the default port of the network if none is given. Returns an empty list
 -- if it cannot be resolved.
+--
+-- Only resolver failures, which are 'IOException's, are caught. Catching
+-- every exception would also swallow the asynchronous exception that cancels
+-- the thread doing the lookup, and the node could then never shut down.
 toSockAddr :: Network -> String -> IO [SockAddr]
 toSockAddr net str =
-  resolve `catch` \(_ :: SomeException) -> return []
+  resolve `catch` \(_ :: IOException) -> return []
   where
     resolve = map (.addrAddress) <$> getAddrInfo Nothing host srv
     (host, srv) =
@@ -143,11 +147,11 @@ withConnection sa f =
 
 -- | Turn a socket address into client settings for a TCP connection, or
 -- 'Nothing' if it cannot be converted.
-fromSockAddr :: (MonadUnliftIO m) => SockAddr -> m (Maybe ClientSettings)
+fromSockAddr :: SockAddr -> IO (Maybe ClientSettings)
 fromSockAddr sa =
-  resolve `catch` \(_ :: SomeException) -> return Nothing
+  resolve `catch` \(_ :: IOException) -> return Nothing
   where
     flags = [NI_NUMERICHOST, NI_NUMERICSERV]
     resolve = do
-      (host, port) <- liftIO (getNameInfo flags True True sa)
+      (host, port) <- (getNameInfo flags True True sa)
       return $ clientSettings <$> (readMaybe =<< port) <*> (cs <$> host)

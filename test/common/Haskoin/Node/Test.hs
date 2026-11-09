@@ -48,7 +48,6 @@ where
 
 import Conduit (awaitForever, yield)
 import Control.Monad (forM_, unless)
-import Control.Monad.Trans.Maybe
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.Default (def)
@@ -79,44 +78,44 @@ withTestLogger f =
     Nothing -> f Logger {level = LevelError, source = "", push = \_ -> return ()}
 
 -- | Fail the test if the action does not complete in the given seconds.
-within :: (MonadUnliftIO m) => Double -> String -> m a -> m a
+within :: Double -> String -> IO a -> IO a
 within s what act =
   timeout (round (s * 1000000)) act >>= \case
-    Nothing -> liftIO . assertFailure $ "Timed out after " <> show s <> "s: " <> what
+    Nothing -> assertFailure $ "Timed out after " <> show s <> "s: " <> what
     Just x -> return x
 
 -- | Fail the test unless the condition becomes true in the given seconds.
-eventually :: (MonadUnliftIO m) => Double -> String -> m Bool -> m ()
+eventually :: Double -> String -> IO Bool -> IO ()
 eventually s what cond = within s what go
   where
     go = cond >>= \b -> unless b (threadDelay 20000 >> go)
 
 -- | Receive the first matching message in the given seconds.
 receiveWithin ::
-  (MonadUnliftIO m, InChan mbox) =>
+  (InChan mbox) =>
   Double ->
   String ->
   mbox msg ->
   (msg -> Maybe a) ->
-  m a
+  IO a
 receiveWithin s what mbox f = within s what (receiveMatch mbox f)
 
 -- | Fail the test if a matching message arrives in the given seconds.
 expectNothingWithin ::
-  (MonadUnliftIO m, InChan mbox) =>
+  (InChan mbox) =>
   Double ->
   String ->
   mbox msg ->
   (msg -> Maybe a) ->
-  m ()
+  IO ()
 expectNothingWithin s what mbox f =
   timeout (round (s * 1000000)) (receiveMatch mbox f) >>= \case
     Nothing -> return ()
-    Just _ -> liftIO . assertFailure $ "Unexpected: " <> what
+    Just _ -> assertFailure $ "Unexpected: " <> what
 
 -- | Current time as a block timestamp.
-nowTimestamp :: (MonadIO m) => m Word32
-nowTimestamp = floor <$> liftIO getPOSIXTime
+nowTimestamp :: IO Word32
+nowTimestamp = floor <$> getPOSIXTime
 
 -- | Coinbase-like transaction that makes each block unique.
 coinbaseTx :: Word32 -> Int -> Tx
@@ -233,27 +232,31 @@ memoryConnection net script f = do
 encodeMessage :: Network -> Message -> ByteString
 encodeMessage net = runPut . putMessage net
 
-remoteSend :: (MonadIO m) => Remote -> Message -> m ()
+remoteSend :: Remote -> Message -> IO ()
 remoteSend r m = Just (encodeMessage r.net m) `send` r.outbox
 
-remoteSendRaw :: (MonadIO m) => Remote -> ByteString -> m ()
+remoteSendRaw :: Remote -> ByteString -> IO ()
 remoteSendRaw r bs = Just bs `send` r.outbox
 
-remoteClose :: (MonadIO m) => Remote -> m ()
+remoteClose :: Remote -> IO ()
 remoteClose r = Nothing `send` r.outbox
 
 -- | Receive next message from the local peer. 'Nothing' if it closed the
 -- connection.
-remoteReceive :: (MonadIO m) => Remote -> m (Maybe Message)
-remoteReceive r = liftIO . runMaybeT $ do
-  hdr <- MaybeT (take_bytes 24)
-  len <- case decode hdr of
-    Left e -> liftIO . assertFailure $ "Bad header from local peer: " <> e
-    Right (MessageHeader _ _ len _) -> return len
-  payload <- MaybeT (take_bytes (fromIntegral len))
-  case runGet (getMessage r.net) (hdr <> payload) of
-    Left e -> liftIO . assertFailure $ "Bad message from local peer: " <> e
-    Right m -> return m
+remoteReceive :: Remote -> IO (Maybe Message)
+remoteReceive r =
+  take_bytes 24 >>= \case
+    Nothing -> return Nothing
+    Just hdr -> do
+      len <- case decode hdr of
+        Left e -> assertFailure $ "Bad header from local peer: " <> e
+        Right (MessageHeader _ _ len _) -> return len
+      take_bytes (fromIntegral len) >>= \case
+        Nothing -> return Nothing
+        Just payload ->
+          case runGet (getMessage r.net) (hdr <> payload) of
+            Left e -> assertFailure $ "Bad message from local peer: " <> e
+            Right m -> return (Just m)
   where
     take_bytes n = do
       b <- readIORef r.buffer
@@ -269,19 +272,19 @@ remoteReceive r = liftIO . runMaybeT $ do
 
 -- | Receive messages from the local peer until one matches.
 remoteReceiveMatch ::
-  (MonadUnliftIO m) => Double -> String -> Remote -> (Message -> Maybe a) -> m a
+  Double -> String -> Remote -> (Message -> Maybe a) -> IO a
 remoteReceiveMatch s what r f = within s what go
   where
     go =
       remoteReceive r >>= \case
-        Nothing -> liftIO . assertFailure $ "Connection closed awaiting " <> what
+        Nothing -> assertFailure $ "Connection closed awaiting " <> what
         Just m -> maybe go return (f m)
 
 zeroAddress :: Word64 -> NetworkAddress
 zeroAddress srv = NetworkAddress srv (sockToHostAddress (SockAddrInet 0 0))
 
 -- | Version message for a remote peer.
-remoteVersion :: (MonadIO m) => Network -> Word64 -> Word64 -> m Version
+remoteVersion :: Network -> Word64 -> Word64 -> IO Version
 remoteVersion net services nonce = do
   now <- nowTimestamp
   return $
@@ -361,7 +364,7 @@ withTestNode net peers connect modify f =
                     logger = logger
                   }
           withNode (modify cfg) $ \n ->
-            liftIO $ f TestNode {node = n, events = sub, net = net}
+            f TestNode {node = n, events = sub, net = net}
 
 setTimeout :: NominalDiffTime -> NodeConfig -> NodeConfig
 setTimeout t c = c {NC.timeout = t}

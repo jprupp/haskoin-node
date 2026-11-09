@@ -75,6 +75,10 @@ a full node.
   written down as a pure state machine. A message that does not fit the current
   state is refused instead of handled by accident, and every rule is tested
   without a network.
+- **Plain `IO`.** Every function runs in `IO`, with no monad transformers and
+  no `MonadIO` or `MonadUnliftIO` constraints. Types say exactly what runs, GHC
+  has nothing to specialise, and long-running loops cannot leak through an
+  unspecialised dictionary. From your own monad, call the node with `liftIO`.
 - **Never stuck.** Every hint that a peer has blocks the node lacks makes it ask
   for headers, and a quiet period makes it ask every peer, so a missed
   announcement cannot leave the chain behind.
@@ -402,7 +406,7 @@ parents <- chainGetParents node.chain height top
 synced <- chainIsSynced node.chain
 ```
 
-`runChainT` runs the header functions of haskoin-core, such as `getAncestor`,
+`chainRunHeaders` runs the header functions of haskoin-core, such as `getAncestor`,
 against the database of the chain.
 
 ### Static peers
@@ -451,7 +455,7 @@ own `push` function to log elsewhere.
 | Node           | `NodeConfig`, `NodeEvent`, `Node`, `withNode`, `withConnection`              |
 | Peers          | `Peer`, `PeerEvent`, `PeerException`, `sendMessage`, `getBlocks`, `getTxs`, `getData`, `pingPeer`, `killPeer` |
 | Peer manager   | `PeerMgr`, `OnlinePeer`, `Handshake`, `getPeers`, `getOnlinePeer`, `toSockAddr`, `isRoutable` |
-| Chain          | `Chain`, `ChainEvent`, `chainGetBest`, `chainGetBlock`, `chainGetAncestor`, `chainGetParents`, `chainGetSplitBlock`, `chainBlockMain`, `chainIsSynced`, `runChainT` |
+| Chain          | `Chain`, `ChainEvent`, `chainGetBest`, `chainGetBlock`, `chainGetAncestor`, `chainGetParents`, `chainGetSplitBlock`, `chainBlockMain`, `chainIsSynced`, `chainRunHeaders` |
 | Logging        | `Logger`, `LogLevel`, `withLogger`, `withSource`, `logDebug` ... `logError`  |
 
 The lower-level functions that feed messages to the peer manager and the chain

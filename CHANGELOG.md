@@ -26,6 +26,9 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   Node 29.2.0 in Podman, from official binaries with checked hashes, and a CI
   job that runs it.
 - `cabal.project`, so the package builds with Cabal too.
+- `chainRunHeaders` runs header functions of haskoin-core, such as
+  `getAncestor` or `blockLocator`, against the headers of a chain, and
+  `runHeaders` does the same for a `ChainDB`.
 
 ### Changed
 
@@ -38,6 +41,15 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   field instead of the `verack`, `online` and `version` fields. These are still
   available as computed fields, so `o.version` and `o.online` keep working, but
   code that builds or pattern matches `OnlinePeer` records must change.
+- Breaking: `ChainT` and `runChainT` are removed, along with the
+  `BlockHeaders` instances for `ReaderT Chain m` and `ReaderT ChainConfig m`.
+  Use `chainRunHeaders` instead. The package no longer uses monad
+  transformers outside `Haskoin.Node.Chain.Database`, where a `ReaderT` carries
+  the database for haskoin-core's header functions; `withNode` nests its
+  resources directly instead of through `ContT`.
+- Breaking: every function runs in `IO`. The `MonadIO` and `MonadUnliftIO`
+  constraints are gone, so code in another monad must call the node with
+  `liftIO`. The library depends on async and stm instead of unliftio.
 - The package uses the GHC2024 language edition, strict warnings and upper
   bounds on its dependencies. `Setup.hs`, `hie.yaml` and `.hindent.yaml` were
   removed.

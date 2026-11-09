@@ -19,16 +19,19 @@
 -- * __Headers are stored, not kept in memory.__ Storing them lets a restart
 --   resume where it stopped instead of downloading the whole chain again.
 --
--- * __Through haskoin-core's interface.__ The 'BlockHeaders' instance lets
---   the header functions of haskoin-core, such as 'connectBlocks' and
---   'getAncestor', run directly against the database, so validation and
---   storage are not reimplemented here.
+-- * __Through haskoin-core's interface.__ The header functions of
+--   haskoin-core, such as 'connectBlocks' and 'getAncestor', run in any monad
+--   with a 'BlockHeaders' instance. 'runHeaders' runs them against the
+--   database, so validation and storage are not reimplemented here. The monad
+--   that carries the database is a 'ReaderT', and it stays inside this
+--   module: everything else calls 'runHeaders' and works in plain 'IO'.
 --
 -- * __Separate from syncing.__ This module only knows how headers are laid
 --   out on disk. The chain process decides what to store and when.
 module Haskoin.Node.Chain.Database
   ( ChainDB (..),
     initChainDB,
+    runHeaders,
   )
 where
 
@@ -51,7 +54,6 @@ import Database.RocksDB.Query
     writeBatch,
   )
 import Haskoin hiding (Key)
-import UnliftIO (MonadIO, liftIO)
 
 -- | Where headers are stored: a database and an optional column family.
 data ChainDB = ChainDB
@@ -93,18 +95,23 @@ instance Serialize BestBlockKey where
 
 instance KeyValue BestBlockKey BlockNode
 
+-- | Run header functions of haskoin-core against the database.
+runHeaders ::
+  ChainDB -> (forall n. (BlockHeaders n) => n a) -> IO a
+runHeaders c action = (runReaderT action c)
+
 -- | Read and write headers in the database.
-instance (MonadIO m) => BlockHeaders (ReaderT ChainDB m) where
+instance BlockHeaders (ReaderT ChainDB IO) where
   addBlockHeader bn = ReaderT $ \c -> insertCommon c (nodeKey bn) bn
   getBlockHeader bh =
-    ReaderT $ \c -> liftIO $ retrieveCommon c.db c.cf (BlockHeaderKey bh)
+    ReaderT $ \c -> retrieveCommon c.db c.cf (BlockHeaderKey bh)
   getBestBlockHeader = ReaderT $ \c ->
-    liftIO (retrieveCommon c.db c.cf BestBlockKey) >>= \case
+    (retrieveCommon c.db c.cf BestBlockKey) >>= \case
       Nothing -> error "Could not get best block from database"
       Just b -> return b
   setBestBlockHeader bn = ReaderT $ \c -> insertCommon c BestBlockKey bn
   addBlockHeaders bns =
-    ReaderT $ \c -> liftIO . writeBatch c.db $ map (op c) bns
+    ReaderT $ \c -> writeBatch c.db $ map (op c) bns
     where
       op c bn = case c.cf of
         Nothing -> insertOp (nodeKey bn) bn
@@ -114,12 +121,12 @@ nodeKey :: BlockNode -> BlockHeaderKey
 nodeKey bn = BlockHeaderKey (headerHash bn.header)
 
 insertCommon ::
-  (MonadIO m, KeyValue k v, Serialize k, Serialize v) =>
+  (KeyValue k v, Serialize k, Serialize v) =>
   ChainDB ->
   k ->
   v ->
-  m ()
-insertCommon c k v = liftIO $ case c.cf of
+  IO ()
+insertCommon c k v = case c.cf of
   Nothing -> insert c.db k v
   Just cf -> insertCF c.db cf k v
 
@@ -130,13 +137,13 @@ dataVersion = 1
 -- | Prepare the database for a network. If its data version is not the
 -- current one, headers and best block are deleted first. An empty database
 -- gets the genesis block of the network as its best block.
-initChainDB :: (MonadIO m) => Network -> ChainDB -> m ()
-initChainDB net c = liftIO $ do
+initChainDB :: Network -> ChainDB -> IO ()
+initChainDB net c = do
   ver <- retrieveCommon c.db c.cf VersionKey
   unless (ver == Just dataVersion) $ purgeChainDB c
   insertCommon c VersionKey dataVersion
   best <- retrieveCommon c.db c.cf BestBlockKey
-  when (isNothing (best :: Maybe BlockNode)) . flip runReaderT c $ do
+  when (isNothing (best :: Maybe BlockNode)) $ runHeaders c $ do
     addBlockHeader (genesisNode net)
     setBestBlockHeader (genesisNode net)
 

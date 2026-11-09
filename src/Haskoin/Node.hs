@@ -58,6 +58,13 @@
 --   by messages, which keeps the concurrency easy to reason about and lets a
 --   failing peer die without disturbing the rest.
 --
+-- * __Plain 'IO'.__ Every function runs in 'IO', without monad transformers
+--   or @MonadIO@ and @MonadUnliftIO@ constraints. The types say exactly what
+--   runs, GHC has nothing to specialise, and the long-running loops of the node
+--   cannot leak memory through an unspecialised dictionary (see
+--   "Haskoin.Node.Loop"). Programs that work in their own monad call the node
+--   with @liftIO@.
+--
 -- * __Trust nothing from the network.__ Peers are strangers. Every message is
 --   checked against size limits before it is read, invalid input disconnects
 --   the peer, and a peer cannot make the node allocate memory faster than it
@@ -121,8 +128,7 @@ module Haskoin.Node
   )
 where
 
-import Control.Monad.Trans.Class (lift)
-import Control.Monad.Trans.Cont (ContT (..), evalContT)
+import Control.Concurrent.Async (link, withAsync)
 import Data.Time.Clock (NominalDiffTime)
 import Database.RocksDB (ColumnFamily, DB)
 import Haskoin
@@ -135,7 +141,6 @@ import Haskoin.Node.PeerMgr
 import Haskoin.Node.PeerMgr.Handshake (isEstablished)
 import NQE
 import Network.Socket (SockAddr)
-import UnliftIO
 
 -- | General node configuration. Passed to 'withNode'.
 --
@@ -193,7 +198,7 @@ data NodeEvent
 -- manager about every new best block height so that it can tell peers apart
 -- that are behind.
 chainEvents ::
-  (MonadIO m) => PeerMgr -> Inbox ChainEvent -> Publisher NodeEvent -> m ()
+  PeerMgr -> Inbox ChainEvent -> Publisher NodeEvent -> IO ()
 chainEvents mgr input output = loopForever $ do
   event <- receive input
   case event of
@@ -209,8 +214,7 @@ chainEvents mgr input output = loopForever $ do
 -- Inventory with blocks goes to the chain, which asks for headers if it does
 -- not know them.
 peerEvents ::
-  (MonadIO m) =>
-  Chain -> PeerMgr -> Inbox PeerEvent -> Publisher NodeEvent -> m ()
+  Chain -> PeerMgr -> Inbox PeerEvent -> Publisher NodeEvent -> IO ()
 peerEvents ch mgr input output = loopForever $ do
   event <- receive input
   case event of
@@ -252,36 +256,39 @@ peerEvents ch mgr input output = loopForever $ do
 -- handle to the given action, and stop everything when the action returns. If
 -- any component fails, the exception is re-thrown in the calling thread.
 withNode ::
-  (MonadUnliftIO m) => NodeConfig -> (Node -> m a) -> m a
-withNode cfg action = evalContT $ do
-  peerPub <- ContT withPublisher
-  peerSub <- ContT (withSubscription peerPub)
-  chainPub <- ContT withPublisher
-  chainSub <- ContT (withSubscription chainPub)
-  chain <-
-    ContT . withChain $
+  NodeConfig -> (Node -> IO a) -> IO a
+withNode cfg action =
+  withPublisher $ \peerPub ->
+    withSubscription peerPub $ \peerSub ->
+      withPublisher $ \chainPub ->
+        withSubscription chainPub $ \chainSub ->
+          withChain (chainConfig chainPub) $ \chain ->
+            withPeerMgr (peerMgrConfig peerPub) $ \peerMgr ->
+              withAsync (chainEvents peerMgr chainSub cfg.pub) $ \a1 ->
+                withAsync (peerEvents chain peerMgr peerSub cfg.pub) $ \a2 -> do
+                  link a1
+                  link a2
+                  action Node {peerMgr = peerMgr, chain = chain}
+  where
+    chainConfig pub =
       ChainConfig
         { db = cfg.db,
           cf = cfg.cf,
           net = cfg.net,
-          pub = chainPub,
+          pub = pub,
           timeout = cfg.timeout,
           logger = withSource "Chain" cfg.logger
         }
-  peerMgr <-
-    ContT . withPeerMgr $
+    peerMgrConfig pub =
       PeerMgrConfig
         { maxPeers = cfg.maxPeers,
           peers = cfg.peers,
           discover = cfg.discover,
           address = cfg.address,
           net = cfg.net,
-          pub = peerPub,
+          pub = pub,
           timeout = cfg.timeout,
           maxPeerLife = cfg.maxPeerLife,
           connect = cfg.connect,
           logger = withSource "PeerMgr" cfg.logger
         }
-  link =<< ContT (withAsync $ chainEvents peerMgr chainSub cfg.pub)
-  link =<< ContT (withAsync $ peerEvents chain peerMgr peerSub cfg.pub)
-  lift $ action Node {peerMgr = peerMgr, chain = chain}
