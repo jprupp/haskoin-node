@@ -1,5 +1,5 @@
 name: haskoin-node
-version: 2.4.0
+version: 2.5.0
 synopsis: P2P library for Bitcoin and Bitcoin Cash
 # A literal block, so that hpack keeps the line breaks in the cabal file.
 description: |
@@ -59,7 +59,7 @@ library:
     - network >= 3.1 && < 3.3
     - nqe >= 0.6.9 && < 0.7
     - random >= 1.2 && < 1.4
-    - rocksdb-haskell-jprupp >= 2.6.1 && < 2.7
+    - rocksdb-haskell-jprupp >= 2.6.1 && < 2.8
     - rocksdb-query >= 0.6.1 && < 0.7
     - stm >= 2.5 && < 2.6
     - streaming-commons >= 0.2 && < 0.3

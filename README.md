@@ -169,11 +169,11 @@ add it and its dependencies to `stack.yaml`:
 
 ```yaml
 extra-deps:
-  - haskoin-node-2.4.0
+  - haskoin-node-2.5.0
   - haskoin-core-1.6.1
   - secp256k1-haskell-2.0.1
   - base16-2.0
-  - rocksdb-haskell-jprupp-2.6.1
+  - rocksdb-haskell-jprupp-2.7.1
   - rocksdb-query-0.6.1
   - nqe-0.6.9
 ```

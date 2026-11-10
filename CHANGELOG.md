@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-11-10
+
 This release fixes the findings of a security review. Several fixes change
 the API; each is marked "Breaking" below.
 
@@ -71,6 +73,11 @@ the API; each is marked "Breaking" below.
 
 ### Changed
 
+- Allow `rocksdb-haskell-jprupp` 2.7, which adds iterators that stop at a
+  bound. Nothing in this package changes with it: version 2.7 is a new
+  major version only because the `DB` record gained a field, and this
+  package gets its `DB` from `withDBCF`. It is built and tested with 2.7.1,
+  and versions from 2.6.1 on are still allowed.
 - Breaking: `PeerConfig` and `PeerMgrConfig` have a `lookupBlock` field, the
   function that finds a stored header. A peer uses it to tell whether SegWit
   applies to a block it receives. `withNode` fills it in; code that builds
