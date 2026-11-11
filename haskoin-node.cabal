@@ -5,7 +5,7 @@ cabal-version: 1.18
 -- see: https://github.com/sol/hpack
 
 name:           haskoin-node
-version:        2.5.0
+version:        2.5.1
 synopsis:       P2P library for Bitcoin and Bitcoin Cash
 description:    Connect to Bitcoin (BTC) and Bitcoin Cash (BCH) peers, keep them healthy, and
                 sync block headers into a RocksDB database. Blocks and transactions can be

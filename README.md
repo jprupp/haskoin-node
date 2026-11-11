@@ -169,7 +169,7 @@ add it and its dependencies to `stack.yaml`:
 
 ```yaml
 extra-deps:
-  - haskoin-node-2.5.0
+  - haskoin-node-2.5.1
   - haskoin-core-1.6.1
   - secp256k1-haskell-2.0.1
   - base16-2.0
@@ -198,7 +198,7 @@ extra-deps:
    stack run
    ```
 
-   Within a few seconds it logs connections and starts printing header
+   Within a few seconds it has peers and starts printing header
    heights. A full header sync of Bitcoin usually takes minutes and on the
    order of a hundred megabytes of disk; it resumes where it stopped if you
    interrupt it.
@@ -494,6 +494,15 @@ in tests, as the test suite does.
 `withLogger level` logs to standard error, one line per message, such as
 `[Info#Chain] Best block header at height 870000`. Build a `Logger` with your
 own `push` function to log elsewhere.
+
+| Level | What it is for |
+| --- | --- |
+| Debug | Everything: each peer that connects or leaves, each message |
+| Info | Milestones: the best block, headers in sync, peers again after none |
+| Warn | Something unusual that the node dealt with: a misbehaving peer, no peers left |
+| Error | Something wrong with this node. Nothing that a peer does is an error |
+
+An alert on errors is then an alert about the node, not about the network.
 
 ## Configuration
 

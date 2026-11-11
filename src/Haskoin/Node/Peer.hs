@@ -279,7 +279,7 @@ dispatchMessage PeerConfig {label, logger} (SendMessage m) = do
   yield m
   return True
 dispatchMessage PeerConfig {label, logger} KillPeer = do
-  liftIO $ logInfo logger (label <> " disconnecting")
+  liftIO $ logDebug logger (label <> " disconnecting")
   return False
 
 -- | Internal conduit to parse messages coming from peer. The header is checked
@@ -333,7 +333,13 @@ inPeerConduit PeerConfig {label, net, logger, lookupBlock} = loopForever $ do
       _ -> return ()
     bad :: PeerException -> ConduitT i o IO a
     bad e = liftIO $ do
-      logError logger (label <> ": " <> cs (show e))
+      -- a peer that hangs up is the ordinary end of a connection; one that
+      -- sends what it should not is worth a look, and is not an error of
+      -- this node either
+      let level = case e of
+            ConnectionClosed -> logDebug
+            _ -> logWarn
+      level logger (label <> ": " <> cs (show e))
       throwIO e
     -- The reason is on the first line of the parser's error text. The lines
     -- after it are call stack noise.

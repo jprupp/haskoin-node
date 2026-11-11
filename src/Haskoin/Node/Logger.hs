@@ -32,13 +32,17 @@ import System.Log.FastLogger
 
 -- | Severity of a log message, from least to most severe.
 data LogLevel
-  = -- | detailed tracing, useful when debugging
+  = -- | everything, for debugging: each peer that connects or leaves, each
+    -- message
     LevelDebug
-  | -- | normal operation, such as peers connecting and blocks arriving
+  | -- | what an operator wants in a quiet log: the best block, headers in
+    -- sync, peers again after having none
     LevelInfo
-  | -- | unexpected events that the node recovers from
+  | -- | something unusual that the node dealt with: a peer that sent
+    -- something invalid and was disconnected, no peers left
     LevelWarn
-  | -- | failures
+  | -- | something wrong with this node, that someone should look at.
+    -- Nothing that a peer does is an error.
     LevelError
   deriving (Eq, Ord, Show)
 

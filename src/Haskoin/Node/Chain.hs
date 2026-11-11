@@ -470,7 +470,8 @@ importHeaders ch hs = do
     chainEvent ch (ChainBestBlock after)
   case result of
     Left e -> do
-      logError ch.config.logger ("connectBlocks: " <> cs e)
+      -- the caller disconnects the peer and says why, with a warning
+      logDebug ch.config.logger ("connectBlocks: " <> cs e)
       return (Left e)
     Right [] -> return (Left "no headers")
     Right (lst : _) -> do

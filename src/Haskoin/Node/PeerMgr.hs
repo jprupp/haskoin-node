@@ -171,8 +171,17 @@ data PeerMgr = PeerMgr
     -- | addresses to connect to
     addresses :: !(TVar (AddressBook SockAddr)),
     -- | open connections, fastest peers first
-    peers :: !(TVar [OnlinePeer])
+    peers :: !(TVar [OnlinePeer]),
+    -- | how well connected the log last said the node was ('Connected')
+    told :: !(TVar Connected)
   }
+
+-- | How well connected the node is, as its log says at the level of
+-- information. Peers come and go all the time, and a line for each change
+-- buries the ones that matter: that the node lost its last peer, and that
+-- it has peers again.
+data Connected = NoPeers | SomePeers | AllPeers
+  deriving (Eq, Show)
 
 -- | Messages handled by the peer manager process.
 data PeerMgrMessage
@@ -275,6 +284,7 @@ withPeerMgr cfg action = do
     best <- newTVarIO 0
     addresses <- newTVarIO emptyBook
     peers <- newTVarIO []
+    told <- newTVarIO NoPeers
     let mgr =
           PeerMgr
             { config = cfg,
@@ -282,7 +292,8 @@ withPeerMgr cfg action = do
               mailbox = inboxToMailbox inbox,
               best = best,
               addresses = addresses,
-              peers = peers
+              peers = peers,
+              told = told
             }
     withAsync (peerManager mgr inbox) $ \a ->
       withConnectLoop mgr (link a >> action mgr)
@@ -346,7 +357,7 @@ peerInput mgr p input = do
       ReplyVerAck -> MVerAck `sendMessage` p
       Announce -> do
         atomically $ modifyTVar' mgr.addresses (markConnected o.address)
-        logInfo mgr.config.logger ("Connected to peer " <> p.label)
+        logDebug mgr.config.logger ("Connected to peer " <> p.label)
         publish (PeerConnected p) mgr.config.pub
         logConnectedPeers mgr
       SendPing n -> MPing (Ping n) `sendMessage` p
@@ -405,7 +416,7 @@ peerDied mgr a e = do
   case gone of
     Nothing -> logError mgr.config.logger "Unknown peer process stopped"
     Just (o, outcome) -> do
-      logInfo mgr.config.logger $
+      logDebug mgr.config.logger $
         "Connection to peer "
           <> o.mailbox.label
           <> " ended: "
@@ -437,13 +448,24 @@ connectionOutcome st e =
       fromException x
         <|> (fromException x >>= \(ExceptionInLinkedThread _ inner) -> fromException inner)
 
--- | Log how many peers are online out of the maximum.
+-- | Log how many peers are online out of the maximum: for debugging at
+-- every change, and at a level that an operator reads when the node loses
+-- its last peer or has one again ('Connected').
 logConnectedPeers :: PeerMgr -> IO ()
 logConnectedPeers mgr = do
   l <- length <$> getPeers mgr
-  logInfo
-    mgr.config.logger
-    ("Peers connected: " <> cs (show l) <> "/" <> cs (show mgr.config.maxPeers))
+  let now
+        | l == 0 = NoPeers
+        | l >= mgr.config.maxPeers = AllPeers
+        | otherwise = SomePeers
+      count = "Peers connected: " <> cs (show l) <> "/" <> cs (show mgr.config.maxPeers)
+  before <- atomically (swapTVar mgr.told now)
+  if
+    | now == before -> logDebug mgr.config.logger count
+    | now == NoPeers -> logWarn mgr.config.logger count
+    | before == NoPeers -> logInfo mgr.config.logger count
+    -- a node that rotates a peer is as well connected as it was
+    | otherwise -> logDebug mgr.config.logger count
 
 -- | Next address to connect to. The configured peers and, if discovery is on,
 -- the seeds are loaded when there is nothing to try and they were not loaded
@@ -499,7 +521,7 @@ connectPeer mgr sa = do
     | source /= Just Configured && netGroup sa `elem` usedGroups ops ->
         giveBack "network group in use"
     | otherwise -> do
-        logInfo mgr.config.logger ("Connecting to peer " <> cs (show sa))
+        logDebug mgr.config.logger ("Connecting to peer " <> cs (show sa))
         nonce <- randomIO
         height <- readTVarIO mgr.best
         now <- getCurrentTime

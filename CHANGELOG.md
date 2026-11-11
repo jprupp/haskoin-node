@@ -6,6 +6,22 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [2.5.1] - 2026-11-11
+
+### Changed
+
+- Log levels say who has the problem. An error is now something wrong with
+  this node, and nothing a peer does is one:
+  - a peer that closes its connection is logged for debugging, and one
+    that sends something invalid as a warning; both were errors;
+  - headers that do not connect are logged once, as the warning that
+    disconnects the peer, and no longer as an error before it;
+  - connecting to a peer, its connection and its end are logged for
+    debugging, where they were information;
+  - the number of connected peers is logged for debugging at every change,
+    as a warning when the node loses its last peer, and as information
+    when it has peers again.
+
 ## [2.5.0] - 2026-11-10
 
 This release fixes the findings of a security review. Several fixes change

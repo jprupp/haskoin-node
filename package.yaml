@@ -1,5 +1,5 @@
 name: haskoin-node
-version: 2.5.0
+version: 2.5.1
 synopsis: P2P library for Bitcoin and Bitcoin Cash
 # A literal block, so that hpack keeps the line breaks in the cabal file.
 description: |
