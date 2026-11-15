@@ -7,18 +7,8 @@ nix:
     - pkg-config
 extra-deps:
   - base16-2.0
-  # secp256k1-haskell: not on Hackage yet; back to a version at the next release
-  - git: https://github.com/jprupp/secp256k1-haskell.git
-    commit: 163232414cb621d6655f747479779bdf7b7da108
-  # rocksdb-haskell: not on Hackage yet; back to a version at the next release
-  - git: https://github.com/jprupp/rocksdb-haskell.git
-    commit: 91758715ca515cfa630b9aa266818cd1dfd1ed6a
-  # rocksdb-query: not on Hackage yet; back to a version at the next release
-  - git: https://github.com/jprupp/rocksdb-query.git
-    commit: 204071197eca749195aee71ec9f54052c81850f3
-  # nqe: not on Hackage yet; back to a version at the next release
-  - git: https://github.com/jprupp/nqe.git
-    commit: 8278785ff64e25f1e4430d51fc0798912762b5f0
-  # haskoin-core: not on Hackage yet; back to a version at the next release
-  - git: https://github.com/jprupp/haskoin-core.git
-    commit: 64a336ffd94d09a77ed8f9ab5cd3743dc4cf26d7
+  - secp256k1-haskell-3.0.0
+  - rocksdb-haskell-jprupp-2.8.0
+  - rocksdb-query-0.7.0
+  - nqe-0.7.0
+  - haskoin-core-2.0.0

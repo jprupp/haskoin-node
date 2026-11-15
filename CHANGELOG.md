@@ -6,7 +6,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
-## [2.6.0] - 2026-11-14
+## [2.6.0] - 2026-11-15
 
 ### Changed
 - **Builds against haskoin-core 2.0.0**, which keeps the context of
