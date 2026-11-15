@@ -12,19 +12,27 @@ packages:
   original:
     hackage: base16-2.0
 - completed:
-    hackage: secp256k1-haskell-2.0.1@sha256:bfcca05cde8d909403be31cf0f2d6a96d4072cc814f0656478edc32f8cb37d3e,2704
+    commit: 163232414cb621d6655f747479779bdf7b7da108
+    git: https://github.com/jprupp/secp256k1-haskell.git
+    name: secp256k1-haskell
     pantry-tree:
-      sha256: 4a508eedf34c3bef598ceb710fb23cb022770351646b8a0ab84862d519bee3af
-      size: 1392
+      sha256: a892d4a3f922ae1d3664ef4d8e57060750ef5c68c7b15ce0733f97dba9113113
+      size: 1903
+    version: 3.0.0
   original:
-    hackage: secp256k1-haskell-2.0.1
+    commit: 163232414cb621d6655f747479779bdf7b7da108
+    git: https://github.com/jprupp/secp256k1-haskell.git
 - completed:
-    hackage: rocksdb-haskell-jprupp-2.7.1@sha256:12d311591703a3d04098cacca8a5a7c82461ccc832e48560283a90ed4e811eb3,1606
+    commit: ea7397a5c912c7e212e35ca3b6825a4a29b9dec9
+    git: https://github.com/jprupp/rocksdb-haskell.git
+    name: rocksdb-haskell-jprupp
     pantry-tree:
-      sha256: ef9120833b7fef2344f90a7b55da8ca1bfdaa899077e57dbf9c0deea83709f02
-      size: 718
+      sha256: e568bdd39e3e1dbb81235d8c161f156e02241c28973d751de7ad6a02bc82901d
+      size: 1268
+    version: 2.8.0
   original:
-    hackage: rocksdb-haskell-jprupp-2.7.1
+    commit: ea7397a5c912c7e212e35ca3b6825a4a29b9dec9
+    git: https://github.com/jprupp/rocksdb-haskell.git
 - completed:
     hackage: rocksdb-query-0.6.1@sha256:46918664cceca0e69a91828eccc214f1f0ae88aa29825c31f8fc4d6b2b298496,1439
     pantry-tree:
@@ -33,19 +41,27 @@ packages:
   original:
     hackage: rocksdb-query-0.6.1
 - completed:
-    hackage: nqe-0.6.9@sha256:65b548dcaa0b663a800f60a6d75f264df1a5b8572d106917176a0d9ec187d608,1542
+    commit: 8278785ff64e25f1e4430d51fc0798912762b5f0
+    git: https://github.com/jprupp/nqe.git
+    name: nqe
     pantry-tree:
-      sha256: 1e043327670ecd938fd1fdbc8ecd5487fa868869dd82e66c7808418fa17a9d9d
-      size: 671
+      sha256: 3763fb2c286100c1d53ac3ff444b8419de973a834e4ff86c0e014c3c6d0009aa
+      size: 992
+    version: 0.7.0
   original:
-    hackage: nqe-0.6.9
+    commit: 8278785ff64e25f1e4430d51fc0798912762b5f0
+    git: https://github.com/jprupp/nqe.git
 - completed:
-    hackage: haskoin-core-1.6.1@sha256:9cb562c94482bbad41cce33679850d49ed9ec355377a0f6573b07a0f880d48c4,6180
+    commit: e5525e9409633b04315cb27c1d0b8ae40c686c94
+    git: https://github.com/jprupp/haskoin-core.git
+    name: haskoin-core
     pantry-tree:
-      sha256: 8cbf855aa0a330905ef0fe42f52251b4aad3901d967a21dea5d526ee7260c220
-      size: 7848
+      sha256: 871f5d6d0039fbe37e5efaf8fe01c49e12dcccb9f6a790d0b60a7d172bd2c312
+      size: 8861
+    version: 2.0.0
   original:
-    hackage: haskoin-core-1.6.1
+    commit: e5525e9409633b04315cb27c1d0b8ae40c686c94
+    git: https://github.com/jprupp/haskoin-core.git
 snapshots:
 - completed:
     sha256: 2c234e9f6c9b52dbbd8e0c369dd55e275f1c143474d4a984a000588d37306e2c

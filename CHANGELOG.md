@@ -6,6 +6,28 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-11-14
+
+### Changed
+- **Builds against haskoin-core 2.0.0**, which keeps the context of
+  libsecp256k1 to itself: nothing takes a `Ctx` any more. This package
+  never took one, and its own API is the same. A program that uses both
+  packages must move to haskoin-core 2.0.0 with it.
+- **Builds against nqe 0.7.0**, which runs in plain `IO` and no longer uses
+  unliftio. This package already ran in `IO`, and its own API is the same. A
+  program that uses both packages must move to nqe 0.7.0 with it, and has to
+  lift the calls to NQE that it makes from another monad, as in
+  `liftIO (receive events)`.
+- **Peers can be stopped wherever they are.** A supervisor of nqe before
+  0.7.0 started its children with asynchronous exceptions masked, so a peer
+  could be cancelled, or timed out, only where it blocked. With nqe 0.7.0
+  each peer is an ordinary thread.
+- **Builds against rocksdb-haskell-jprupp 2.8** as well as 2.6 and 2.7.
+- The tests no longer use unliftio. They take threads, STM, exceptions and
+  timeouts from base, async and stm, and temporary directories from
+  temporary. With that the unliftio package is gone from everything this
+  package builds with. Only unliftio-core remains, which conduit needs.
+
 ## [2.5.1] - 2026-11-11
 
 ### Changed

@@ -51,12 +51,17 @@ module Haskoin.Node.Test
   )
 where
 
-import Conduit (awaitForever, yield)
+import Conduit (awaitForever, liftIO, yield)
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async (withAsync)
+import Control.Concurrent.STM (TVar, atomically, newTVarIO, readTVarIO, writeTVar)
+import Control.Exception (finally)
 import Control.Monad (forM_, unless)
 import Data.Bits ((.|.))
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.Default (def)
+import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.List (elemIndex)
 import Data.Maybe (fromMaybe, listToMaybe, mapMaybe)
 import Data.Serialize (decode, encode, runGet, runPut)
@@ -72,10 +77,10 @@ import Haskoin.Node qualified as NC (NodeConfig (..))
 import NQE
 import Network.Socket (SockAddr (..))
 import System.Environment (lookupEnv)
+import System.IO.Temp (withSystemTempDirectory)
 import System.Random (randomIO)
+import System.Timeout (timeout)
 import Test.HUnit (assertFailure)
-import UnliftIO
-import UnliftIO.Concurrent (threadDelay)
 
 -- | Run with logging to stderr if HASKOIN_TEST_LOG is set, silently otherwise.
 withTestLogger :: (Logger -> IO a) -> IO a
@@ -272,10 +277,10 @@ memoryConnection net script f = do
             closed = closed
           }
       src =
-        receive to_local_in >>= \case
+        liftIO (receive to_local_in) >>= \case
           Nothing -> return ()
           Just b -> yield b >> src
-      snk = awaitForever $ \b -> Just b `send` from_local
+      snk = awaitForever $ \b -> liftIO (Just b `send` from_local)
       close_local = do
         atomically (writeTVar closed True)
         Nothing `send` from_local

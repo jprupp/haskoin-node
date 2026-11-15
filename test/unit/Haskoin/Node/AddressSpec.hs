@@ -33,8 +33,8 @@ v6 t = SockAddrInet6 8333 0 (tupleToHostAddress6 t) 0
 spec :: Spec
 spec = do
   describe "routable addresses" $ do
-    it "refuses the reserved IPv4 ranges" $
-      forM_
+    it "refuses the reserved IPv4 ranges"
+      $ forM_
         [ (198, 18, 0, 1), -- benchmarking, 198.18.0.0/15
           (198, 19, 255, 1),
           (192, 0, 2, 1), -- documentation
@@ -43,19 +43,19 @@ spec = do
           (0, 1, 2, 3), -- this network
           (192, 0, 0, 1) -- protocol assignments
         ]
-        $ \a -> isRoutable (v4 a) `shouldBe` False
+      $ \a -> isRoutable (v4 a) `shouldBe` False
 
     it "accepts the addresses just outside the benchmarking range" $ do
       isRoutable (v4 (198, 17, 255, 1)) `shouldBe` True
       isRoutable (v4 (198, 20, 0, 1)) `shouldBe` True
 
-    it "refuses the reserved IPv6 ranges" $
-      forM_
+    it "refuses the reserved IPv6 ranges"
+      $ forM_
         [ (0xff02, 0, 0, 0, 0, 0, 0, 1), -- multicast
           (0xfec0, 0, 0, 0, 0, 0, 0, 1), -- site-local
           (0x2001, 0x0db8, 0, 0, 0, 0, 0, 1) -- documentation
         ]
-        $ \a -> isRoutable (v6 a) `shouldBe` False
+      $ \a -> isRoutable (v6 a) `shouldBe` False
 
     it "refuses the ORCHID ranges, as Bitcoin Core does" $
       -- RFC 4843: 2001:10::/28; RFC 7343: 2001:20::/28

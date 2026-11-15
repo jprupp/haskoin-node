@@ -1,6 +1,9 @@
 -- | Full node connected to scripted remote peers over in-memory connections.
 module Haskoin.Node.PeerMgrSpec (spec) where
 
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.MVar
+import Control.Concurrent.STM
 import Control.Monad (forever, void, when)
 import Data.Time.Clock (diffUTCTime, getCurrentTime)
 import Haskoin
@@ -9,8 +12,6 @@ import Haskoin.Node.Test
 import Network.Socket (SockAddr (..))
 import System.Random (randomIO)
 import Test.Hspec
-import UnliftIO
-import UnliftIO.Concurrent (threadDelay)
 
 -- | Node connected to a single remote running the given script. Each
 -- connection attempt runs the script again with the attempt number.

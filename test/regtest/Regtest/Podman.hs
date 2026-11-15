@@ -19,6 +19,7 @@ module Regtest.Podman
   )
 where
 
+import Control.Concurrent (threadDelay)
 import Control.Exception (bracket)
 import Control.Monad (unless, void)
 import Data.Char (isHexDigit, isSpace)
@@ -28,8 +29,7 @@ import System.Directory (findExecutable)
 import System.Exit (ExitCode (..))
 import System.Process (readProcessWithExitCode)
 import System.Random (randomRIO)
-import UnliftIO (timeout)
-import UnliftIO.Concurrent (threadDelay)
+import System.Timeout (timeout)
 
 data Impl = BitcoinCore | BitcoinCashNode
   deriving stock (Eq, Show)

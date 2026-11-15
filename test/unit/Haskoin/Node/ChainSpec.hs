@@ -3,6 +3,8 @@
 -- | Header chain process driven by fake peers.
 module Haskoin.Node.ChainSpec (spec) where
 
+import Control.Concurrent.Async (link, withAsync)
+import Control.Concurrent.STM
 import Control.Monad (forM_, forever, void)
 import Data.Text (Text)
 import Data.Time.Clock (NominalDiffTime)
@@ -14,7 +16,6 @@ import Haskoin.Node.Test
 import NQE
 import Test.HUnit (assertFailure)
 import Test.Hspec hiding (pending)
-import UnliftIO
 
 data ChainTest = ChainTest
   { chain :: !Chain,

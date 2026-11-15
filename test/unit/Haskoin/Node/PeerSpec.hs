@@ -1,25 +1,28 @@
 -- | Peer process talking to a scripted remote over an in-memory connection.
 module Haskoin.Node.PeerSpec (spec) where
 
-import Control.Concurrent.Async (ExceptionInLinkedThread (..))
 import Conduit (sinkNull, yieldMany)
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async
+import Control.Concurrent.MVar
+import Control.Concurrent.STM
+import Control.Exception (evaluate, fromException)
 import Control.Monad (forM_, forever)
+import Control.Monad.IO.Class (liftIO)
 import Data.ByteString qualified as B
-import Data.Serialize (putWord32le, runPut)
 import Data.Int (Int64)
+import Data.Serialize (putWord32le, runPut)
 import Data.Word (Word32)
 import Haskoin
 import Haskoin.Node
 import Haskoin.Node.Peer.Lock (Lock (..))
 import Haskoin.Node.Test
 import NQE
+import System.Mem (getAllocationCounter)
 import Test.HUnit (assertFailure)
 import Test.Hspec hiding (pending)
 import Test.Hspec.QuickCheck (prop)
 import Test.QuickCheck (Positive (..), ioProperty)
-import UnliftIO
-import UnliftIO.Concurrent (threadDelay)
-import System.Mem (getAllocationCounter)
 
 data PeerTest = PeerTest
   { peer :: !Peer,

@@ -12,6 +12,9 @@
 module Haskoin.NodeSpec (spec) where
 
 import Conduit
+import Control.Concurrent (threadDelay)
+import Control.Concurrent.Async
+import Control.Concurrent.STM
 import Control.Monad (forM_, forever, replicateM)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
@@ -23,17 +26,17 @@ import Data.Maybe (listToMaybe, mapMaybe)
 import Data.Serialize (decode, get, put, runGet, runPut)
 import Data.Time.Clock (NominalDiffTime)
 import Data.Time.Clock.POSIX (getPOSIXTime)
+import Data.Word (Word32, Word8)
 import Database.RocksDB qualified as R
 import Haskoin
 import Haskoin.Node
-import NQE
-import Data.Word (Word32, Word8)
 import Haskoin.Node.Test (eventually)
+import NQE
 import Network.Socket (PortNumber, SockAddr (..), tupleToHostAddress, tupleToHostAddress6)
+import System.IO.Temp (withSystemTempDirectory)
 import System.Random (randomIO)
+import System.Timeout (timeout)
 import Test.Hspec
-import UnliftIO
-import UnliftIO.Concurrent (threadDelay)
 
 data TestNode = TestNode
   { testMgr :: PeerMgr,
@@ -86,8 +89,8 @@ dummyPeerConnect react count net ad sa f = do
   s <- newInbox
   let s' = inboxToMailbox s
   withAsync (go r s') $ \_ -> do
-    let o = awaitForever (`send` r)
-        i = forever (receive s >>= yield)
+    let o = awaitForever (liftIO . (`send` r))
+        i = forever (liftIO (receive s) >>= yield)
     f (Conduits i o) :: IO ()
   where
     go :: Inbox ByteString -> Mailbox ByteString -> IO ()
@@ -98,12 +101,12 @@ dummyPeerConnect react count net ad sa f = do
           ver = buildVersion net nonce 0 ad rmt now
       runPut (putMessage net (MVersion ver)) `send` s
       runConduit $
-        forever (receive r >>= yield)
+        forever (liftIO (receive r) >>= yield)
           .| inc
           .| iterMC count_getheaders
           .| concatMapC react
           .| outc
-          .| awaitForever (`send` s)
+          .| awaitForever (liftIO . (`send` s))
     outc = mapMC $ return . either id (runPut . putMessage net)
     count_getheaders = \case
       MGetHeaders _ -> atomically (modifyTVar' count (+ 1))
@@ -326,17 +329,18 @@ spec = do
           threadDelay (6 * 1000 * 1000)
           tried <- readTVarIO attempts
           length (filter (`elem` sameGroup) tried) `shouldBe` 1
-    it "does not connect to a DNS seed result that is not routable" $
+    it "does not connect to a DNS seed result that is not routable"
+      $
       -- The seed of regtest is localhost, which resolves to loopback
       -- addresses. With no static peers, nothing else could be tried.
       withTestNodeOpts
         (defOpts allBlocks) {discover = True, staticPeers = []}
         net
         "seed-loopback"
-        $ \TestNode {..} -> do
-          -- the node tries a new address every 0.1 to 5 seconds
-          threadDelay (6 * 1000 * 1000)
-          readTVarIO attempts `shouldReturn` []
+      $ \TestNode {..} -> do
+        -- the node tries a new address every 0.1 to 5 seconds
+        threadDelay (6 * 1000 * 1000)
+        readTVarIO attempts `shouldReturn` []
     it "does not connect to private addresses that peers relay" $ do
       let v4 a b c d p = SockAddrInet p (tupleToHostAddress (a, b, c, d))
           v6 t p = SockAddrInet6 p 0 (tupleToHostAddress6 t) 0
@@ -376,7 +380,7 @@ spec = do
       -- take that as the end of the sync instead of asking again.
       withTestNodeBlocks [] net "no-headers" $ \TestNode {..} -> do
         _ <- waitForPeer nodeEvents
-        atomically $ readTVar getHeadersCount >>= checkSTM . (>= 1)
+        atomically $ readTVar getHeadersCount >>= check . (>= 1)
         threadDelay (1000 * 1000)
         readTVarIO getHeadersCount `shouldReturn` 1
     it "reports the headers as synced when the best header has the minimum chain work" $ do
