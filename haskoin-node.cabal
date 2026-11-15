@@ -73,7 +73,7 @@ library
     , nqe >=0.7.0 && <0.8
     , random >=1.2 && <1.4
     , rocksdb-haskell-jprupp >=2.6.1 && <2.9
-    , rocksdb-query >=0.6.1 && <0.7
+    , rocksdb-query >=0.6.1 && <0.8
     , stm ==2.5.*
     , streaming-commons ==0.2.*
     , string-conversions ==0.4.*

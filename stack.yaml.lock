@@ -23,23 +23,27 @@ packages:
     commit: 163232414cb621d6655f747479779bdf7b7da108
     git: https://github.com/jprupp/secp256k1-haskell.git
 - completed:
-    commit: ea7397a5c912c7e212e35ca3b6825a4a29b9dec9
+    commit: 91758715ca515cfa630b9aa266818cd1dfd1ed6a
     git: https://github.com/jprupp/rocksdb-haskell.git
     name: rocksdb-haskell-jprupp
     pantry-tree:
-      sha256: e568bdd39e3e1dbb81235d8c161f156e02241c28973d751de7ad6a02bc82901d
-      size: 1268
+      sha256: dafce4d87ccc501f61f271637b6398df299765ca69dcf7027b7dc7dba451d444
+      size: 1451
     version: 2.8.0
   original:
-    commit: ea7397a5c912c7e212e35ca3b6825a4a29b9dec9
+    commit: 91758715ca515cfa630b9aa266818cd1dfd1ed6a
     git: https://github.com/jprupp/rocksdb-haskell.git
 - completed:
-    hackage: rocksdb-query-0.6.1@sha256:46918664cceca0e69a91828eccc214f1f0ae88aa29825c31f8fc4d6b2b298496,1439
+    commit: 204071197eca749195aee71ec9f54052c81850f3
+    git: https://github.com/jprupp/rocksdb-query.git
+    name: rocksdb-query
     pantry-tree:
-      sha256: d71559aecf61da5ad2837d52d08e288384ca5a83e7fad74ab7ba872590c2a814
-      size: 384
+      sha256: b8f4b727fe3ec46bcf0e4b1614870a0b86939e312cb33c95e8f05b0b49f2b6a4
+      size: 706
+    version: 0.7.0
   original:
-    hackage: rocksdb-query-0.6.1
+    commit: 204071197eca749195aee71ec9f54052c81850f3
+    git: https://github.com/jprupp/rocksdb-query.git
 - completed:
     commit: 8278785ff64e25f1e4430d51fc0798912762b5f0
     git: https://github.com/jprupp/nqe.git

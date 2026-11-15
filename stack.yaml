@@ -12,8 +12,10 @@ extra-deps:
     commit: 163232414cb621d6655f747479779bdf7b7da108
   # rocksdb-haskell: not on Hackage yet; back to a version at the next release
   - git: https://github.com/jprupp/rocksdb-haskell.git
-    commit: ea7397a5c912c7e212e35ca3b6825a4a29b9dec9
-  - rocksdb-query-0.6.1
+    commit: 91758715ca515cfa630b9aa266818cd1dfd1ed6a
+  # rocksdb-query: not on Hackage yet; back to a version at the next release
+  - git: https://github.com/jprupp/rocksdb-query.git
+    commit: 204071197eca749195aee71ec9f54052c81850f3
   # nqe: not on Hackage yet; back to a version at the next release
   - git: https://github.com/jprupp/nqe.git
     commit: 8278785ff64e25f1e4430d51fc0798912762b5f0

@@ -174,7 +174,7 @@ extra-deps:
   - secp256k1-haskell-3.0.0
   - base16-2.0
   - rocksdb-haskell-jprupp-2.8.0
-  - rocksdb-query-0.6.1
+  - rocksdb-query-0.7.0
   - nqe-0.7.0
 ```
 

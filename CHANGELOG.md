@@ -22,7 +22,10 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   0.7.0 started its children with asynchronous exceptions masked, so a peer
   could be cancelled, or timed out, only where it blocked. With nqe 0.7.0
   each peer is an ordinary thread.
-- **Builds against rocksdb-haskell-jprupp 2.8** as well as 2.6 and 2.7.
+- **Builds against rocksdb-haskell-jprupp 2.8** as well as 2.6 and 2.7, and
+  against rocksdb-query 0.7 as well as 0.6. With 0.7 a list read from the
+  database takes one foreign call for a few hundred entries where it took
+  one for each, and a stack that does not grow with the list.
 - The tests no longer use unliftio. They take threads, STM, exceptions and
   timeouts from base, async and stm, and temporary directories from
   temporary. With that the unliftio package is gone from everything this
