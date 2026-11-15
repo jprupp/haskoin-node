@@ -56,15 +56,15 @@ packages:
     commit: 8278785ff64e25f1e4430d51fc0798912762b5f0
     git: https://github.com/jprupp/nqe.git
 - completed:
-    commit: e5525e9409633b04315cb27c1d0b8ae40c686c94
+    commit: 64a336ffd94d09a77ed8f9ab5cd3743dc4cf26d7
     git: https://github.com/jprupp/haskoin-core.git
     name: haskoin-core
     pantry-tree:
-      sha256: 871f5d6d0039fbe37e5efaf8fe01c49e12dcccb9f6a790d0b60a7d172bd2c312
-      size: 8861
+      sha256: 814812dae1032618f11f9bbe8039de7075fde0e9c3f06cff7476816d89a1b1af
+      size: 9002
     version: 2.0.0
   original:
-    commit: e5525e9409633b04315cb27c1d0b8ae40c686c94
+    commit: 64a336ffd94d09a77ed8f9ab5cd3743dc4cf26d7
     git: https://github.com/jprupp/haskoin-core.git
 snapshots:
 - completed:
