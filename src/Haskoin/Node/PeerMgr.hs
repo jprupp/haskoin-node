@@ -89,6 +89,7 @@ module Haskoin.Node.PeerMgr
     peerMgrAddrs,
     peerMgrVerAck,
     peerMgrSync,
+    peerMgrThen,
     getPeers,
     getOnlinePeer,
     ticklePeer,
@@ -627,6 +628,12 @@ peerMgrAddrs mgr p addrs = PeerAddrs p addrs `send` mgr.mailbox
 -- | Wait until the peer manager has handled every message sent to it before.
 peerMgrSync :: PeerMgr -> IO ()
 peerMgrSync mgr = Sync `query` mgr.mailbox
+
+-- | Run an action once the peer manager has handled every message sent to it
+-- before, without waiting for that. The non-blocking form of 'peerMgrSync'
+-- (see 'Haskoin.Node.Chain.chainThen').
+peerMgrThen :: PeerMgr -> STM () -> IO ()
+peerMgrThen mgr act = Sync (const act) `send` mgr.mailbox
 
 -- | Median of a list, or 'Nothing' if it is empty.
 median :: (Ord a, Fractional a) => [a] -> Maybe a

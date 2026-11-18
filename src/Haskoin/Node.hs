@@ -138,6 +138,8 @@ module Haskoin.Node
 where
 
 import Control.Concurrent.Async (link, withAsync)
+import Control.Concurrent.STM (atomically)
+import Data.Functor ((<&>))
 import Data.Time.Clock (NominalDiffTime)
 import Database.RocksDB (ColumnFamily, DB)
 import Haskoin
@@ -226,6 +228,25 @@ chainEvents mgr input output = loopForever $ do
 -- being disconnected. Inventory with blocks goes to the chain, which asks for
 -- headers if it does not know them.
 --
+-- This loop never waits for the chain. The chain can take seconds over a
+-- batch of headers, and a loop that waited for it held up the messages of
+-- every peer: blocks and pongs piled up behind the headers, and the
+-- application took peers that were delivering for stalled ones. A header or
+-- inventory message is instead handed to the chain with the rest of its
+-- handling, which runs when the chain is done with it (see 'chainThen'):
+-- it is published to the application then, and only then counts as handled
+-- for the peer's allowance. The backpressure still holds for the peer that
+-- sent it, the chain's mailbox holds at most 'maxPendingMessages' messages of
+-- each peer, and the messages of the other peers keep flowing. The chain
+-- handles its mailbox in order, so the headers of a peer are imported in the
+-- order they came. The application gets a header message only once the
+-- chain has its headers, so it can look them up; other messages of the same
+-- peer may reach it before.
+--
+-- Messages for the peer manager, which is quick, are handled the same way,
+-- except @version@ and @verack@: the loop waits for those, since whether the
+-- next message of that peer is taken depends on them.
+--
 -- Messages reach the application only from online peers, except @version@
 -- and @verack@, which are the handshake itself. Bitcoin Core ignores
 -- anything else a peer sends before the handshake is done, and so does the
@@ -238,37 +259,42 @@ peerEvents ch mgr input output = loopForever $ do
   case event of
     PeerConnected p -> do
       chainPeerConnected ch p
-      forward event
+      atomically (forward event)
     PeerDisconnected p -> do
       chainPeerDisconnected ch p
-      forward event
+      atomically (forward event)
     PeerMessage p m -> do
+      ticklePeer mgr p
+      online <- isOnline p
+      let done
+            | handshake m || online = forward event >> peerMessageDoneSTM p
+            | otherwise = peerMessageDoneSTM p
+          now = atomically done
+          later f = f done
       case m of
         MVersion v ->
-          peerMgrVersion mgr p v >> peerMgrSync mgr
+          peerMgrVersion mgr p v >> peerMgrSync mgr >> now
         MVerAck ->
-          peerMgrVerAck mgr p >> peerMgrSync mgr
+          peerMgrVerAck mgr p >> peerMgrSync mgr >> now
         MPing (Ping n) ->
-          peerMgrPing mgr p n >> peerMgrSync mgr
+          peerMgrPing mgr p n >> later (peerMgrThen mgr)
         MPong (Pong n) ->
-          peerMgrPong mgr p n >> peerMgrSync mgr
-        MAddr (Addr ns) ->
-          whenOnline p $ peerMgrAddrs mgr p (map snd ns) >> peerMgrSync mgr
-        MHeaders (Headers hs) ->
-          whenOnline p $ chainHeaders ch p (map fst hs) >> chainSync ch
-        MInv (Inv ivs) -> case [BlockHash iv.invHash | iv <- ivs, isBlock iv] of
-          [] -> return ()
-          bhs -> whenOnline p $ chainBlocksAnnounced ch p bhs >> chainSync ch
-        _ -> return ()
-      ticklePeer mgr p
-      if handshake m then forward event else whenOnline p (forward event)
-      peerMessageDone p
+          peerMgrPong mgr p n >> later (peerMgrThen mgr)
+        MAddr (Addr ns)
+          | online -> peerMgrAddrs mgr p (map snd ns) >> later (peerMgrThen mgr)
+        MHeaders (Headers hs)
+          | online -> chainHeaders ch p (map fst hs) >> later (chainThen ch)
+        MInv (Inv ivs)
+          | online,
+            bhs@(_ : _) <- [BlockHash iv.invHash | iv <- ivs, isBlock iv] ->
+              chainBlocksAnnounced ch p bhs >> later (chainThen ch)
+        _ -> now
   where
-    forward event = publish (PeerEvent event) output
-    whenOnline p act =
-      getOnlinePeer mgr p >>= \case
-        Just o | o.online -> act
-        _ -> return ()
+    forward event = publishSTM (PeerEvent event) output
+    isOnline p =
+      getOnlinePeer mgr p <&> \case
+        Just o -> o.online
+        _ -> False
     isBlock iv = iv.invType `elem` [InvBlock, InvWitnessBlock]
     handshake = \case
       MVersion _ -> True

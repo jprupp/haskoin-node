@@ -11,4 +11,4 @@ extra-deps:
   - rocksdb-haskell-jprupp-2.8.0
   - rocksdb-query-0.7.0
   - nqe-0.7.0
-  - haskoin-core-2.0.0
+  - haskoin-core-2.0.1

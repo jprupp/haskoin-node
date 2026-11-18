@@ -92,6 +92,7 @@ module Haskoin.Node.Chain
     chainHeaders,
     chainBlocksAnnounced,
     chainSync,
+    chainThen,
   )
 where
 
@@ -577,3 +578,13 @@ chainBlocksAnnounced ch p bhs = ChainBlocksAnnounced p bhs `send` ch.mailbox
 -- | Wait until the chain process has handled every message sent to it before.
 chainSync :: Chain -> IO ()
 chainSync ch = ChainSyncMsg `query` ch.mailbox
+
+-- | Run an action once the chain process has handled every message sent to
+-- it before, without waiting for that. "Haskoin.Node" uses it to finish a
+-- peer's headers or inventory message only when the chain has dealt with it,
+-- so that the backpressure of that one peer holds while the messages of all
+-- the other peers keep flowing. 'chainSync' would block the caller for as
+-- long as the chain is busy, and the chain can be busy for seconds while it
+-- imports headers.
+chainThen :: Chain -> STM () -> IO ()
+chainThen ch act = ChainSyncMsg (const act) `send` ch.mailbox

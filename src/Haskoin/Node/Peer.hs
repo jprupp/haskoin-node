@@ -69,6 +69,7 @@ module Haskoin.Node.Peer
     setBusy,
     setFree,
     peerMessageDone,
+    peerMessageDoneSTM,
     maxPendingMessages,
   )
 where
@@ -226,7 +227,11 @@ maxPendingMessages = 16
 -- | Tell the peer process that the node has finished handling one of the
 -- messages that it published, so that it may read another one.
 peerMessageDone :: Peer -> IO ()
-peerMessageDone p = atomically $ modifyTVar' p.pending (max 0 . subtract 1)
+peerMessageDone = atomically . peerMessageDoneSTM
+
+-- | 'peerMessageDone' in 'STM'.
+peerMessageDoneSTM :: Peer -> STM ()
+peerMessageDoneSTM p = modifyTVar' p.pending (max 0 . subtract 1)
 
 -- | Run peer process in current thread. The 'Peer' must be the one that
 -- 'wrapPeer' built with the mailbox of this inbox.

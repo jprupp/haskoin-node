@@ -392,7 +392,11 @@ minimum chain work of the network, and no peer is left to sync from.
 
 A peer may have at most 16 messages published and not yet handled by the node.
 Past that, the node stops reading its socket, so a fast peer fills its own TCP
-window instead of the node's memory. The node does not wait for your
+window instead of the node's memory. A header or inventory message counts as
+handled once the chain has dealt with it, and reaches your subscriber then. The
+node hands it to the chain and goes on with the messages of the other peers, so
+a peer that is still delivering blocks is never held up by the headers that
+another peer sent. The node does not wait for your
 subscriber, though: a subscription is an unbounded queue, and one that falls
 behind holds every event it has not read. Keep reading events, and hand slow
 work to another thread.

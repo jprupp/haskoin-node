@@ -4,7 +4,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.6.1] - 2026-11-18
+
+### Fixed
+- **Headers no longer hold up the messages of other peers.** The loop that
+  routes peer messages waited for the chain to import each `headers` message.
+  On Bitcoin Cash that took 20 seconds per message, and in that time no
+  message of any peer reached the application: blocks and pongs piled up, and
+  Haskoin Store took peers that were delivering for stalled ones. The loop now
+  hands headers and inventory to the chain and goes on. The rest of the
+  handling of that message, publishing it to the application and counting it
+  as handled for the peer's back-pressure, runs when the chain is done with
+  it. Ping, pong and address messages go to the peer manager the same way.
+  The application now gets a peer's header message after the chain has its
+  headers, and other messages of the same peer may reach it before.
+- Requires haskoin-core 2.0.1, which connects Bitcoin Cash headers about 60
+  times as fast.
+
+### Added
+- `chainThen` and `peerMgrThen` run an action once the chain or the peer
+  manager has handled every message sent to it before, without waiting.
+- `peerMessageDoneSTM`: `peerMessageDone` in `STM`.
+
 
 ## [2.6.0] - 2026-11-15
 
