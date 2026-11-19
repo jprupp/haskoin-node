@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- Accepts haskoin-core 2.1, which reads the token prefix of Bitcoin Cash
+  outputs (CashTokens). Nothing in haskoin-node changes: it passes outputs
+  on as they are.
+
 ## [2.6.1] - 2026-11-18
 
 ### Fixed
