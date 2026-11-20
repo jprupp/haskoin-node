@@ -1,3 +1,8 @@
+{-# OPTIONS_GHC -Wno-deprecations #-}
+
+-- testnet3 (btcTest) is deprecated in haskoin-core 3.0.0 but still works,
+-- and its witness rule is still tested here.
+
 -- | Whether a block holds the transactions its header commits to, against
 -- blocks mined by Bitcoin Core 32.1 and copies of them changed the ways a
 -- peer could change them.
