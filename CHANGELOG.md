@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 - Accepts haskoin-core 2.1, which reads the token prefix of Bitcoin Cash
   outputs (CashTokens). Nothing in haskoin-node changes: it passes outputs
   on as they are.
+- CI runs through the workflow that the Haskell packages of jprupp share in
+  [jprupp/tools](https://github.com/jprupp/tools), with the check of
+  `stack.yaml` for local paths (`check-stack-paths`) and the cache of the
+  Nix build kept per release of nixpkgs.
+- `scripts/check-local-deps.sh` is gone: `check-stack-paths`, from
+  jprupp/tools, replaces it.
 
 ## [2.6.1] - 2026-11-18
 
