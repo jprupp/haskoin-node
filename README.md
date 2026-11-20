@@ -661,17 +661,20 @@ There are two test suites, using [hspec](https://hspec.github.io/) and
 
 Set `HASKOIN_TEST_LOG` to see the node's logs while tests run.
 
-CI builds and tests every change with the OS libraries, with `stack --nix`,
-and against the regtest nodes. Its steps call the scripts in `scripts/`, which
-you can also run locally: `scripts/check-local-deps.sh` fails if `stack.yaml`
-points at a package outside the repository, which CI cannot build, and
-`scripts/install-system-libraries.sh` installs the C libraries on Ubuntu.
+CI builds and tests every change with the OS libraries and with
+`stack --nix`, through the workflow that the packages of this family share in
+[jprupp/tools](https://github.com/jprupp/tools), and runs the regtest suite in
+a job of its own. You can run its checks locally: `check-stack-paths`, from
+jprupp/tools, fails if `stack.yaml` points at a package outside the
+repository, which CI cannot build, and `scripts/install-system-libraries.sh`
+installs the C libraries on Ubuntu.
 
 ### Contributing
 
 Pull requests are welcome.
 
-- Format the code with [Ormolu](https://github.com/tweag/ormolu).
+- Format the code with [Ormolu](https://github.com/tweag/ormolu):
+  `haskell-format`, from [jprupp/tools](https://github.com/jprupp/tools).
 - Add tests for the behaviour you change.
 - Keep lines of code, including scripts, workflows and the examples in the
   documentation, shorter than 120 columns.

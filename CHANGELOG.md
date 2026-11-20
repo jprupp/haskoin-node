@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- CI runs through the workflow that the Haskell packages of jprupp share in
+  [jprupp/tools](https://github.com/jprupp/tools), with the check of
+  `stack.yaml` for local paths (`check-stack-paths`) and the cache of the
+  Nix build kept per release of nixpkgs.
+- `scripts/check-local-deps.sh` is gone: `check-stack-paths`, from
+  jprupp/tools, replaces it.
+
 ## [2.6.1] - 2026-11-18
 
 ### Fixed
