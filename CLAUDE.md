@@ -1,5 +1,27 @@
 # Instructions for Claude
 
+## Build and test
+
+- Build: `haskell-dev build`
+- All unit tests: `haskell-dev test`
+- One spec: `haskell-dev test PeerMgr` (a word of the module name;
+  `--match "/Haskoin.Node.Chain/"` narrows it)
+- Documentation: `haskell-dev docs`
+- The regtest suite, against real nodes in Podman, is not part of
+  `haskell-dev test`, which runs the `spec` suite: run it with
+  `stack test haskoin-node:regtest`.
+- `haskell-dev` is a script of [jprupp/tools](https://github.com/jprupp/tools),
+  shared with the other packages, and not a file of this repository. It must
+  be on the `PATH`. Its settings for this package are in `haskell-dev.toml`.
+  A change to the script itself is a change to jprupp/tools.
+- `stack build`, `stack test` and `stack haddock` are the release build. Do
+  not mix them with `haskell-dev` in one session: each switch compiles
+  everything again.
+- `haskell-dev` builds without optimisation. Never time code with it.
+- The unit tests take about 35 seconds in eight processes, against 104 in
+  one. Most of that is one group, `/Haskoin.Node/untrusted peers/`, which
+  takes 34 seconds alone; `haskell-dev` does not split a group.
+
 ## Keep the documentation up to date with every change
 
 Every change to this repository must update all the documentation it affects,
@@ -75,9 +97,15 @@ obvious, and no long chains of commands joined with `&&` or `;` on one line.
 
 ## Checks
 
-Build the documentation with `stack haddock --no-haddock-deps` and make sure it
-has no warnings about broken markup. CI builds it too, both with the OS
-libraries and with `stack --nix`.
+Build the documentation with `haskell-dev docs` and make sure it has no
+warnings about broken markup. The command ends with a check of the comments:
+a change must add nothing to what that check reports. It reports 31 problems
+on master after 2.6.1, all older than the check: 16 ambiguous names, 1 link
+to a name that its module does not export, 4 links to pages or anchors that
+do not exist, and 10 slashes to write `\/`. Keep the lines after
+`Documentation check` in a file before the change, and compare with `diff`
+after it. CI builds the documentation too, with `stack haddock`, both with
+the OS libraries and with `stack --nix`.
 
 List the lines of 120 columns or more with
 `git ls-files '*.hs' '*.yaml' '*.cabal' '*.md' | xargs grep -n '.\{120,\}'`,

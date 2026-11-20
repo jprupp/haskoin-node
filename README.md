@@ -628,6 +628,22 @@ stack haddock --no-haddock-deps    # build the API documentation
 On NixOS, or with `stack --nix`, the `nix` section of `stack.yaml` provides
 RocksDB and libsecp256k1.
 
+These commands build the library as it is released, with optimisation. For
+the time between two commits there is a faster loop: `haskell-dev`, from
+[jprupp/tools](https://github.com/jprupp/tools), on your `PATH`.
+
+```sh
+haskell-dev build          # build without optimisation
+haskell-dev test PeerMgr   # run the unit tests in several processes at once
+haskell-dev docs           # build the documentation and check its comments
+```
+
+`haskell-dev test` runs the `spec` suite, not `regtest`. `haskell-dev.toml`
+tells it which spec modules are slow, so that it shares them between the
+test processes. Do not mix the two kinds of build in one folder: the flags
+differ, so each switch compiles everything again. Never time code with
+`haskell-dev`.
+
 `package.yaml` is the source of the package description. Change it rather than
 `haskoin-node.cabal`, which [hpack](https://github.com/sol/hpack) generates.
 

@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   Nix build kept per release of nixpkgs.
 - `scripts/check-local-deps.sh` is gone: `check-stack-paths`, from
   jprupp/tools, replaces it.
+- `haskell-dev`, from jprupp/tools, is the fast loop of work on the code:
+  `build`, `test` and `docs`, without optimisation and with the unit tests
+  in several processes. What it needs to know about this package, the slow
+  spec modules, is in the new `haskell-dev.toml`.
+- `.gitignore` ignores `TAGS` and `dist-newstyle/` again, which ran
+  together on one line, and the documentation's work folder.
 
 ## [2.6.1] - 2026-11-18
 
