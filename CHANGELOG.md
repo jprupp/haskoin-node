@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+## [2.7.0] - 2026-11-22
+
+Peers on Unix sockets, and haskoin-core 3.0, for haskoin-store 2.0.0.
+
 ### Added
 - **Peers on Unix sockets.** A configured peer can be a Unix socket, written
   `unix:PATH` as Bitcoin Core writes the socket of a proxy, and
