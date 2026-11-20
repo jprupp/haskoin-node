@@ -1,6 +1,8 @@
 # Regtest image with official Bitcoin Core and Bitcoin Cash Node binaries.
 #
-# Build with:
+# The tests build it through podman-test (test/regtest/Regtest/Podman.hs),
+# tagged by a hash of this file and the script, so a change builds a new
+# image. To build it by hand:
 #   podman build -t haskoin-node-regtest test/regtest
 #
 # Hashes come from the official SHA256SUMS files published by each project:
@@ -25,11 +27,14 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # The script reads the versions and hashes above from the build arguments.
-COPY install-nodes.sh /usr/local/bin/install-nodes.sh
+# podman-test writes the files of the context without their modes, so the
+# copy makes the script executable.
+COPY --chmod=0755 install-nodes.sh /usr/local/bin/install-nodes.sh
 RUN /usr/local/bin/install-nodes.sh
 
-# Peer-to-peer ports for up to three nodes per container.
-EXPOSE 18444 18445 18446
+# Peer-to-peer ports for up to three nodes per container, which the tests
+# bridge to Unix sockets.
+EXPOSE 18444 18446 18448
 
 # Nodes are started with "podman exec" by the test suite.
 CMD ["sleep", "infinity"]

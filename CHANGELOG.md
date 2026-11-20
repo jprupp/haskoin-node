@@ -36,6 +36,16 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   spec modules, is in the new `haskell-dev.toml`.
 - `.gitignore` ignores `TAGS` and `dist-newstyle/` again, which ran
   together on one line, and the documentation's work folder.
+- The regtest tests run their containers through
+  [podman-test](https://github.com/jprupp/podman-test), in place of the code
+  of their own in `Regtest.Podman`: each container is in a pod with no
+  network, the peer-to-peer port of each of its nodes is bridged to a Unix
+  socket, and the node under test reaches the nodes as the peers
+  `unix:PATH`. Inside the container the ports are fixed, where they were
+  random. `PODMAN_TEST_SKIP` skips the tests, as `HASKOIN_NODE_SKIP_REGTEST`
+  still does, and the Containerfile makes its script executable as it
+  copies it, since podman-test writes the files of the context without
+  their modes.
 - The regtest tests are in the `spec` suite (`Haskoin.Node.RegtestSpec`),
   so that `stack test` and `haskell-dev test` run every test; the `regtest`
   suite is gone. They are still skipped without Podman or with

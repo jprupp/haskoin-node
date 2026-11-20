@@ -1,16 +1,17 @@
 -- | Test the library against Bitcoin Core and Bitcoin Cash Node in regtest
--- mode. Nodes run in Podman containers built from @test/regtest/Containerfile@
--- ("Regtest.Podman"). The tests are skipped when Podman cannot run, or when
--- @HASKOIN_NODE_SKIP_REGTEST@ is set.
+-- mode. Nodes run in Podman containers built from @test/regtest/Containerfile@,
+-- through podman-test ("Regtest.Podman"), and the node under test reaches
+-- them through Unix sockets, as the peers @unix:PATH@. The tests are
+-- skipped when Podman cannot run, or when @HASKOIN_NODE_SKIP_REGTEST@ or
+-- @PODMAN_TEST_SKIP@ is set.
 --
 -- They are part of the @spec@ suite, so that @stack test@ and @haskell-dev
 -- test@ run every test. Each node implementation is a group at the top of
 -- the module, which @haskell-dev@ (of jprupp/tools) runs in a process of its
--- own, at the same time as the other (@haskell-dev.toml@): the containers
--- have no names and publish random ports, so the two never meet. Each group
--- builds the image before its first test, which is quick once its layers are
--- cached, and only where the group runs: built while the spec is put
--- together, it would be built by every process, and by a listing too.
+-- own, at the same time as the other (@haskell-dev.toml@): each container
+-- is in a pod of its own with its own sockets, so the two never meet. The
+-- image is built by the first test that needs it, once for every process
+-- of the machine.
 module Haskoin.Node.RegtestSpec (spec) where
 
 import Control.Monad (forM_, replicateM_, void)
@@ -27,11 +28,10 @@ import Test.Hspec
 spec :: Spec
 spec = do
   skip <- runIO (isJust <$> lookupEnv "HASKOIN_NODE_SKIP_REGTEST")
-  available <- if skip then return False else runIO podmanAvailable
-  if
-    | skip -> skipped "HASKOIN_NODE_SKIP_REGTEST set"
-    | not available -> skipped "podman not available"
-    | otherwise -> regtests
+  usable <- if skip then return (Left "HASKOIN_NODE_SKIP_REGTEST set") else runIO podmanUsable
+  case usable of
+    Left why -> skipped why
+    Right () -> regtests
   where
     skipped why = describe "Regtest" $ it "runs the nodes in Podman" $ pendingWith why
 
@@ -67,7 +67,7 @@ withMinedNode impl n f =
 -- | The tests of each node implementation, a group at the top of the module.
 regtests :: Spec
 regtests = forM_ [BitcoinCore, BitcoinCashNode] $ \impl ->
-  beforeAll_ buildImage $ describe (implName impl) $ do
+  describe (implName impl) $ do
     let net = implNet impl
 
     it "completes the handshake" $ withMinedNode impl 1 $ \c ->

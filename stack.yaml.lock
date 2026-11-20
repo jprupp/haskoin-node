@@ -40,6 +40,17 @@ packages:
   original:
     hackage: nqe-0.7.0
 - completed:
+    commit: f5a07fcb676f4a99eee02e0be28b2a174b0af308
+    git: https://github.com/jprupp/podman-test.git
+    name: podman-test
+    pantry-tree:
+      sha256: 59e685b2694979fc019ac7e77945b163e575981f7599f8de7b02d95dc1c942e8
+      size: 958
+    version: 0.1.0
+  original:
+    commit: f5a07fcb676f4a99eee02e0be28b2a174b0af308
+    git: https://github.com/jprupp/podman-test.git
+- completed:
     commit: ce2f58c7388e2bc88674f260559a4b50cce935d0
     git: https://github.com/jprupp/haskoin-core.git
     name: haskoin-core

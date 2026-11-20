@@ -677,9 +677,13 @@ The tests are one suite, `spec`, using [hspec](https://hspec.github.io/) and
   `test/regtest/Containerfile`, whose script `test/regtest/install-nodes.sh`
   installs the official release binaries on Ubuntu after checking their SHA-256
   hashes. The image is built the first time the tests run, which needs
-  Internet access. Nodes use random ports, so runs do not collide, and a
-  container may use 2 GiB of memory. The tests are skipped if Podman is
-  missing or `HASKOIN_NODE_SKIP_REGTEST` is set.
+  Internet access. The containers run through
+  [podman-test](https://github.com/jprupp/podman-test), each in a pod with no
+  network: the peer-to-peer port of each node is bridged to a Unix socket of
+  the pod, and the node under test connects to it as the peer `unix:PATH`.
+  So runs never collide, and no port of the machine is taken. A container
+  may use 2 GiB of memory. The tests are skipped if Podman is missing, or if
+  `HASKOIN_NODE_SKIP_REGTEST` or `PODMAN_TEST_SKIP` is set.
 
   ```sh
   stack test --ta '--match /Haskoin.Node.Regtest/'   # only these

@@ -98,6 +98,7 @@ tests:
       - network
       - nqe
       - process
+      - podman-test
       - QuickCheck >= 2.14
       - random
       - rocksdb-haskell-jprupp

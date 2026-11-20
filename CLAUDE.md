@@ -9,8 +9,9 @@
 - Documentation: `haskell-dev docs`
 - Every test is in the one suite, `spec`, so that `stack test` and
   `haskell-dev test` run them all. The regtest tests
-  (`Haskoin.Node.RegtestSpec`) are skipped without Podman, or with
-  `HASKOIN_NODE_SKIP_REGTEST` set; keep any new kind of test in `spec`.
+  (`Haskoin.Node.RegtestSpec`) run their nodes through podman-test, and are
+  skipped without Podman, or with `HASKOIN_NODE_SKIP_REGTEST` or
+  `PODMAN_TEST_SKIP` set; keep any new kind of test in `spec`.
 - `haskell-dev` is a script of [jprupp/tools](https://github.com/jprupp/tools),
   shared with the other packages, and not a file of this repository. It must
   be on the `PATH`. Its settings for this package are in `haskell-dev.toml`.

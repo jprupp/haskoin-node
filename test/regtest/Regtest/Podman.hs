@@ -1,11 +1,24 @@
--- | Bitcoin Core and Bitcoin Cash Node regtest nodes in Podman containers.
+-- | Bitcoin Core and Bitcoin Cash Node regtest nodes in a Podman container,
+-- run by podman-test ("Test.Podman").
+--
+-- A container holds up to three nodes, which the tests start and stop with
+-- @podman exec@. The container is in a pod of its own with no network: each
+-- node's peer-to-peer port is bridged to a Unix socket of the pod, and the
+-- node under test connects to it as the peer @unix:PATH@. Tests that run at
+-- once each have their own sockets, so they never meet and take no port of
+-- the machine. Inside the container, where nothing else runs, the ports are
+-- fixed, and the nodes reach each other on @127.0.0.1@.
+--
+-- The image is built from @test\/regtest\/Containerfile@ and the script it
+-- runs, read from the package folder, where the tests run. podman-test
+-- tags it by a hash of both, and builds it once for every test process of
+-- the machine.
 module Regtest.Podman
   ( Impl (..),
     implName,
     implNet,
     Container (..),
-    podmanAvailable,
-    buildImage,
+    podmanUsable,
     withContainer,
     startNode,
     stopNode,
@@ -20,16 +33,28 @@ module Regtest.Podman
 where
 
 import Control.Concurrent (threadDelay)
-import Control.Exception (bracket)
 import Control.Monad (unless, void)
-import Data.Char (isHexDigit, isSpace)
-import Data.List (dropWhileEnd)
+import Data.ByteString qualified as B
+import Data.Char (isHexDigit)
 import Haskoin (Network, bchRegTest, btcRegTest)
-import System.Directory (findExecutable)
 import System.Exit (ExitCode (..))
-import System.Process (readProcessWithExitCode)
-import System.Random (randomRIO)
-import System.Timeout (timeout)
+import Test.Podman
+  ( Address (..),
+    ContainerSpec (..),
+    Endpoint (..),
+    Image (..),
+    ImageSpec (..),
+    Pod,
+    PodSpec (..),
+    address,
+    container,
+    containerName,
+    execWithin,
+    pod,
+    podmanUsable,
+    withPod,
+  )
+import Test.Podman.Command (podmanStatus)
 
 data Impl = BitcoinCore | BitcoinCashNode
   deriving stock (Eq, Show)
@@ -46,108 +71,64 @@ implDir :: Impl -> FilePath
 implDir BitcoinCore = "/opt/bitcoin-core/bin/"
 implDir BitcoinCashNode = "/opt/bchn/bin/"
 
--- | Running container with ports for up to three nodes.
+-- | A running container for up to three nodes, in its pod.
 data Container = Container
-  { cid :: !String,
-    impl :: !Impl,
-    -- | peer-to-peer port of each node inside the container
-    p2pPorts :: ![Int],
-    -- | RPC port of each node inside the container
-    rpcPorts :: ![Int]
+  { pod :: !Pod,
+    impl :: !Impl
   }
+
+-- | The peer-to-peer port of node number @i@ in the container. They are two
+-- apart, and the RPC ports are above them, because a node may listen on the
+-- port above its own for Tor.
+p2pPort :: Int -> Int
+p2pPort i = 18444 + 2 * i
+
+-- | The RPC port of node number @i@ in the container.
+rpcPort :: Int -> Int
+rpcPort i = 18454 + 2 * i
 
 -- | Number of nodes that can run in a container.
 maxNodes :: Int
 maxNodes = 3
 
-image :: String
-image = "localhost/haskoin-node-regtest:latest"
+-- | The name of the container in its pod.
+regtest :: String
+regtest = "regtest"
 
--- | Build context of the image: the directory with the Containerfile and the
--- @install-nodes.sh@ script it runs, relative to the package root.
-imageDir :: FilePath
-imageDir = "test/regtest"
+-- | The image of the nodes, from the Containerfile and its script in the
+-- package folder.
+nodeImage :: IO Image
+nodeImage = do
+  recipe <- B.readFile "test/regtest/Containerfile"
+  script <- B.readFile "test/regtest/install-nodes.sh"
+  return $
+    Built
+      ImageSpec
+        { name = "haskoin-node-regtest",
+          containerfile = recipe,
+          files = [("install-nodes.sh", script)]
+        }
 
--- | Run podman and return its standard output. Throws on failure or if it
--- takes longer than two minutes.
-podman :: [String] -> IO String
-podman = podmanWithin 120
-
--- | Run podman with a timeout in seconds.
-podmanWithin :: Int -> [String] -> IO String
-podmanWithin secs args =
-  timeout (secs * 1000000) (readProcessWithExitCode "podman" args "") >>= \case
-    Nothing ->
-      fail $
-        "podman " <> unwords args <> " timed out after " <> show secs <> "s"
-    Just (ExitSuccess, out, _) -> return (dropWhileEnd isSpace out)
-    Just (ExitFailure c, out, err) ->
-      fail $
-        "podman "
-          <> unwords args
-          <> " exited with "
-          <> show c
-          <> ": "
-          <> out
-          <> err
-
-podmanAvailable :: IO Bool
-podmanAvailable =
-  findExecutable "podman" >>= \case
-    Nothing -> return False
-    Just _ -> do
-      (c, _, _) <- readProcessWithExitCode "podman" ["info"] ""
-      return (c == ExitSuccess)
-
--- | Build the image. Cached layers make this quick after the first time.
-buildImage :: IO ()
-buildImage = void $ podmanWithin 1800 ["build", "--quiet", "--tag", image, imageDir]
-
--- | Run a container. Node ports inside it are random, and are published to
--- random ports on the loopback interface of the host. The container may use
--- 2 GiB of memory, for its three nodes at most, so that a node that runs away
--- fails its test instead of taking the memory of the machine.
+-- | Run a container, idle until the tests start its nodes, and remove it
+-- afterwards. Its pod is ready at once: the bridges listen on the sockets
+-- before any node does, and 'startNode' waits for its node. The container
+-- may use 2 GiB of memory, for its three nodes at most, so that a node that
+-- runs away fails its test instead of taking the memory of the machine.
 withContainer :: Impl -> (Container -> IO a) -> IO a
-withContainer impl = bracket start stop
-  where
-    start = do
-      ports <- randomPorts (2 * maxNodes)
-      let (p2p, rpc) = splitAt maxNodes ports
-      cid <-
-        podman $
-          ["run", "--detach", "--rm", "--memory", "2g"]
-            <> concat [["--publish", "127.0.0.1::" <> show p] | p <- p2p]
-            <> [image]
-      return Container {cid = cid, impl = impl, p2pPorts = p2p, rpcPorts = rpc}
-    stop :: Container -> IO ()
-    stop c = void $ podman ["rm", "--force", "--time", "0", c.cid]
-
--- | Distinct random ports. They are at least two apart because nodes may
--- also listen on the next port up for Tor.
-randomPorts :: Int -> IO [Int]
-randomPorts n = go []
-  where
-    go ps
-      | length ps == n = return (reverse ps)
-      | otherwise = do
-          p <- randomRIO (20000, 60000)
-          if any (\q -> abs (p - q) < 2) ps then go ps else go (p : ps)
-
-p2pPort :: Container -> Int -> Int
-p2pPort c i = c.p2pPorts !! i
-
-rpcPort :: Container -> Int -> Int
-rpcPort c i = c.rpcPorts !! i
+withContainer impl f = do
+  image <- nodeImage
+  let spec =
+        (container regtest image)
+          { memory = Just "2g",
+            endpoints = [Bridged ("p2p" <> show i) (p2pPort i) | i <- [0 .. maxNodes - 1]]
+          }
+  withPod (pod "regtest" [spec]) {ready = []} $ \p -> f Container {pod = p, impl}
 
 dataDir :: Int -> FilePath
 dataDir i = "/data/node" <> show i
 
 exec :: Container -> [String] -> IO String
-exec c args = podman (["exec", c.cid] <> args)
-
--- | Like 'exec' with a timeout in seconds.
-execWithin :: Int -> Container -> [String] -> IO String
-execWithin secs c args = podmanWithin secs (["exec", c.cid] <> args)
+exec c = execWithin 120 c.pod regtest
 
 -- | Start node number @i@ in the container with extra arguments. Data
 -- persists across restarts.
@@ -159,9 +140,9 @@ startNode c i extra = do
       "-regtest",
       "-daemon",
       "-datadir=" <> dataDir i,
-      "-port=" <> show (p2pPort c i),
-      "-bind=0.0.0.0:" <> show (p2pPort c i),
-      "-rpcport=" <> show (rpcPort c i),
+      "-port=" <> show (p2pPort i),
+      "-bind=0.0.0.0:" <> show (p2pPort i),
+      "-rpcport=" <> show (rpcPort i),
       "-listen=1",
       "-listenonion=0",
       "-fallbackfee=0.0002",
@@ -176,8 +157,7 @@ stopNode c i = do
   void $ cli c i ["stop"]
   let pidfile = dataDir i <> "/regtest/bitcoind.pid"
       wait n = do
-        (code, _, _) <-
-          readProcessWithExitCode "podman" ["exec", c.cid, "test", "-e", pidfile] ""
+        (code, _, _) <- podmanStatus 60 ["exec", containerName c.pod regtest, "test", "-e", pidfile]
         unless (code /= ExitSuccess || n > (300 :: Int)) $
           threadDelay 100000 >> wait (n + 1)
   wait 0
@@ -185,11 +165,11 @@ stopNode c i = do
 
 cli' :: Int -> Container -> Int -> [String] -> IO String
 cli' secs c i args =
-  execWithin secs c $
+  execWithin secs c.pod regtest $
     [ implDir c.impl <> "bitcoin-cli",
       "-regtest",
       "-datadir=" <> dataDir i,
-      "-rpcport=" <> show (rpcPort c i)
+      "-rpcport=" <> show (rpcPort i)
     ]
       <> args
 
@@ -199,15 +179,14 @@ cli = cli' 120
 
 -- | Address of node number @i@ for other nodes in the container.
 nodeAddress :: Container -> Int -> String
-nodeAddress c i = "127.0.0.1:" <> show (p2pPort c i)
+nodeAddress _ i = "127.0.0.1:" <> show (p2pPort i)
 
--- | Address and port on the host for node number @i@.
+-- | The peer of node number @i@ for the node under test: the Unix socket
+-- of the pod that is bridged to its peer-to-peer port, as @unix:PATH@.
 hostAddress :: Container -> Int -> IO String
-hostAddress c i = do
-  out <- podman ["port", c.cid, show (p2pPort c i) <> "/tcp"]
-  case lines out of
-    a : _ -> return a
-    [] -> fail $ "No port mapping for node " <> show i
+hostAddress c i = case address c.pod ("p2p" <> show i) of
+  UnixSocket path -> return ("unix:" <> path)
+  a -> fail ("The peer-to-peer endpoint of node " <> show i <> " is not a socket: " <> show a)
 
 -- | Regtest address valid for both implementations.
 mineAddress :: String
