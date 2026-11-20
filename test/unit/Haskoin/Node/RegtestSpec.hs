@@ -16,11 +16,16 @@ module Haskoin.Node.RegtestSpec (spec) where
 
 import Control.Monad (forM_, replicateM_, void)
 import Data.List (isInfixOf)
-import Data.Maybe (isJust)
+import Data.Maybe (isJust, mapMaybe)
+import Data.Set qualified as Set
 import Data.String (fromString)
 import Haskoin
+import Haskoin.Network.Protocol qualified as P
 import Haskoin.Node
+import Haskoin.Node qualified as NC (NodeConfig (..))
+import Haskoin.Node.Peer.Remote (Facts (..), newRemote, predict)
 import Haskoin.Node.Test
+import Network.Socket (SockAddr (..))
 import Regtest.Podman
 import System.Environment (lookupEnv)
 import Test.Hspec
@@ -162,6 +167,46 @@ regtests = forM_ [BitcoinCore, BitcoinCashNode] $ \impl ->
         Just [tx] <- getTxs net 10 p [txid]
         txHash tx `shouldBe` txid
 
+    -- The model of the node ("Haskoin.Node.Peer.Remote") is read from the
+    -- upstream source; these tests check it against the node itself.
+    it "hears the handshake that the model predicts" $ withMinedNode impl 1 $ \c ->
+      withRegtestNode c [0] $ \t -> do
+        heard <- handshakeHeard t
+        let zero = NetworkAddress 0 (sockToHostAddress (SockAddrInet 0 0))
+            ours = buildVersion net 0 0 zero zero 0
+            facts = Facts {now = 0, best = genesisNode net, known = mempty}
+            model = newRemote net Set.empty AddrIPv4 True 0 0
+            predicted = mapMaybe sent (fst (predict facts (MVersion ours) model))
+            sent e = case e.action of
+              P.Send m -> Just (msgType m)
+              _ -> Nothing
+        heard `shouldBe` upToVerAck predicted
+
+    it "asks for the mempool only where the node allows it" $
+      withMinedNode impl 1 $ \c ->
+        withRegtestNode c [0] $ \t -> do
+          p <- waitForPeer t
+          j <- judgeMessage p MMempool
+          -- Bitcoin Core offers no Bloom filters by default, and closes the
+          -- connection of a peer that asks for its mempool without them;
+          -- Bitcoin Cash Node offers them
+          case impl of
+            BitcoinCore -> j `shouldSatisfy` isRefused
+            BitcoinCashNode -> j `shouldBe` Allowed
+          MMempool `sendMessage` p
+          pingPeer 10 p `shouldReturn` True
+
+    it "asks a node that whitelisted it for its mempool" $ withContainer impl $ \c -> do
+      startNode c 0 ["-whitelist=mempool@0.0.0.0/0"]
+      _ <- mine c 0 1
+      addr <- hostAddress c 0
+      let granted cfg = cfg {NC.permissions = Set.singleton PermMempool}
+      withTestNode net [addr] withConnection (granted . setTimeout 600) $ \t -> do
+        p <- waitForPeer t
+        judgeMessage p MMempool `shouldReturn` Allowed
+        MMempool `sendMessage` p
+        pingPeer 10 p `shouldReturn` True
+
     it "pings a peer" $ withMinedNode impl 1 $ \c ->
       withRegtestNode c [0] $ \t -> do
         p <- waitForPeer t
@@ -207,3 +252,26 @@ regtests = forM_ [BitcoinCore, BitcoinCashNode] $ \impl ->
           expectNothingWithin 1 "peer disconnection" t.events $ \case
             PeerEvent (PeerDisconnected _) -> Just ()
             _ -> Nothing
+
+-- | The commands of the messages that the first peer sent, up to its
+-- verack, as the node heard them.
+handshakeHeard :: TestNode -> IO [MessageCommand]
+handshakeHeard t = go []
+  where
+    go acc =
+      receiveWithin 30 "the handshake of the peer" t.events Just >>= \case
+        PeerEvent (PeerMessage _ m)
+          | MVerAck <- m -> return (reverse (msgType m : acc))
+          | otherwise -> go (msgType m : acc)
+        _ -> go acc
+
+-- | The commands up to the first verack.
+upToVerAck :: [MessageCommand] -> [MessageCommand]
+upToVerAck cmds = case break (== MCVerAck) cmds of
+  (before, v : _) -> before <> [v]
+  (before, []) -> before
+
+isRefused :: Judgement -> Bool
+isRefused = \case
+  Refused _ _ -> True
+  _ -> False

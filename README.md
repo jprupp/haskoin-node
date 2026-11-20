@@ -79,6 +79,12 @@ a full node.
   written down as a pure state machine. A message that does not fit the current
   state is refused instead of handled by accident, and every rule is tested
   without a network.
+- **The rules of the other node, not guesses.** Bitcoin Core and Bitcoin
+  Cash Node decide what a peer may send, and much of it is in no BIP. Every
+  message to a peer is first judged by a model of the node at the other end,
+  the state machines that haskoin-core translates from the source of both
+  nodes. A message that the node would punish is not sent, and the log cites
+  the upstream line of the rule. See [What a peer allows](#what-a-peer-allows).
 - **Plain `IO`.** Every function runs in `IO`, with no monad transformers and
   no `MonadIO` or `MonadUnliftIO` constraints. Types say exactly what runs, GHC
   has nothing to specialise, and long-running loops cannot leak through an
@@ -100,6 +106,7 @@ a full node.
 | Header sync     | Headers downloaded from one peer at a time, with a deadline per turn, connected to the chain with the most work, stored in RocksDB; new blocks followed whether peers announce them with headers or inventory, announcing peers asked at once, and peers polled after a quiet period |
 | Events          | Best header changes, sync completion, peer connections and every message received              |
 | Data requests   | Fetch blocks and transactions from a peer, with a timeout; every block checked against its header's Merkle root and witness commitment |
+| Protocol model  | Every outgoing message judged by a model of the node at the other end (Bitcoin Core 32.1 or Bitcoin Cash Node 29.2.0, from haskoin-core): what the node would punish is not sent, and a request it would drop fails at once |
 | Protection      | Strict parsing, per-command size limits, linear-time reads, back-pressure, bounded address pool, explicit handshake states, connect timeout |
 
 ### What is not included
@@ -239,7 +246,8 @@ main =
                     timeout = 120,
                     maxPeerLife = 48 * 3600,
                     connect = withConnection,
-                    logger = logger
+                    logger = logger,
+                    permissions = mempty
                   }
           withNode cfg $ \_node -> forever $
             receive events >>= \case
@@ -506,6 +514,53 @@ machine taken. The version message gives such a peer the zero address, as
 Bitcoin Core does when it does not know one. A peer or a DNS seed can never
 give the node a Unix address: relayed addresses are IPv4 or IPv6.
 
+### What a peer allows
+
+Bitcoin Core and Bitcoin Cash Node punish a peer for things that no BIP
+mentions. Ask either for its mempool without being whitelisted, and unless
+it offers Bloom filters it closes the connection. haskoin-core translates
+both nodes into pure state machines (`Haskoin.Network.Protocol`), and every
+peer runs one, as a model of the node at the other end
+(`Haskoin.Node.Peer.Remote`). Each message is judged on its way out:
+
+- `Allowed`: the node takes it, and answers it if it is a request.
+- `Unanswered`: the node drops it without a word. `getData`, `getBlocks` and
+  `getTxs` give `Nothing` at once rather than wait for their timeout.
+- `Refused`: the node would add to this node's ban score, discourage it,
+  ban it, or close the connection. The peer process does not send it, and
+  logs a warning with the reason and the upstream line, such as
+  `not sending cmd "mempool": the node would disconnect (ProtocolViolation):
+  mempool request with bloom filters disabled (src/net_processing.cpp:5195)`.
+
+To ask before sending, use `judgeMessage`:
+
+```haskell
+judgeMessage peer MMempool >>= \case
+  Allowed -> MMempool `sendMessage` peer
+  verdict -> putStrLn ("Not asking: " <> T.unpack (judgementText verdict))
+```
+
+The model learns the options of the node from its version message: whether
+it offers Bloom filters, whether it is pruned, whether it relays
+transactions. What the node does not say is which permissions it gave this
+node with `-whitelist` or `-whitebind`. If you run the nodes of `peers`, say
+it in `permissions`:
+
+```haskell
+cfg {peers = ["127.0.0.1:8335"], permissions = Set.fromList [PermMempool, PermNoBan]}
+```
+
+The permissions apply to the configured peers only, since a peer found
+through discovery has granted none.
+
+The model knows the protocol exactly and the chain of the node only as well
+as this node does. It takes the node to have every block it is asked for, so
+it never fails a request on a guess that the node lacks a block. It also
+does not refuse a message over a disconnection that depends on the state of
+the node, such as an upload limit it reached. The haskoin-core report
+[`doc/protocol`](https://github.com/jprupp/haskoin-core/tree/master/doc/protocol)
+describes the rules of both nodes in prose.
+
 ### Logging
 
 `withLogger level` logs to standard error, one line per message, such as
@@ -537,6 +592,7 @@ An alert on errors is then an alert about the node, not about the network.
 | `maxPeerLife` | Seconds after which a peer is dropped, so that connections rotate         |
 | `connect`     | How to open a connection; usually `withConnection`                        |
 | `logger`      | Where to log; see `withLogger`                                            |
+| `permissions` | Permissions that the nodes of `peers` grant this node with `-whitelist` or `-whitebind`, such as `PermMempool`; see [What a peer allows](#what-a-peer-allows) |
 
 ## Module overview
 
@@ -545,7 +601,8 @@ An alert on errors is then an alert about the node, not about the network.
 | Part           | Contents                                                                    |
 | -------------- | --------------------------------------------------------------------------- |
 | Node           | `NodeConfig`, `NodeEvent`, `Node`, `withNode`, `withConnection`              |
-| Peers          | `Peer`, `PeerEvent`, `PeerException`, `sendMessage`, `getBlocks`, `getTxs`, `getData`, `pingPeer`, `killPeer`, `newOwner`, `reservePeer`, `releasePeer` |
+| Peers          | `Peer`, `PeerEvent`, `PeerException`, `sendMessage`, `judgeMessage`, `getBlocks`, `getTxs`, `getData`, `pingPeer`, `killPeer`, `newOwner`, `reservePeer`, `releasePeer`, `newPeer` |
+| Models of peers | `Judgement`, `judgementText`, `expectsReject`, `Permission`, `Permissions` |
 | Blocks         | `blockMutation`, `BlockMutation`, `witnessCheck`, `WitnessCheck`, `segWitHeight` |
 | Peer manager   | `PeerMgr`, `OnlinePeer`, `PeerState`, `Stage`, `DisconnectReason`, `getPeers`, `getOnlinePeer`, `toSockAddr`, `isRoutable` |
 | Chain          | `Chain`, `ChainEvent`, `chainGetBest`, `chainGetBlock`, `chainGetAncestor`, `chainGetParents`, `chainGetSplitBlock`, `chainBlockMain`, `chainIsSynced`, `chainRunHeaders` |
@@ -560,6 +617,7 @@ Every module is exposed and can be imported on its own:
 | -------------------------------- | ----------------------------------------------------------- |
 | `Haskoin.Node.Peer`              | The process that talks to one peer, and data requests       |
 | `Haskoin.Node.Peer.Request`      | State machine for receiving requested blocks and transactions |
+| `Haskoin.Node.Peer.Remote`       | The model of the node at the other end, which judges each message sent to it |
 | `Haskoin.Node.Peer.Lock`         | State machine for reserving a peer                          |
 | `Haskoin.Node.Block`             | Whether a block holds the transactions its header commits to |
 | `Haskoin.Node.PeerMgr`           | Finds, connects, ranks and drops peers                      |

@@ -15,7 +15,6 @@ import Data.Serialize (putWord32le, runPut)
 import Data.Word (Word32)
 import Haskoin
 import Haskoin.Node
-import Haskoin.Node.Peer.Lock (Lock (..))
 import Haskoin.Node.Test
 import NQE
 import System.Mem (getAllocationCounter)
@@ -57,8 +56,6 @@ withPeerTestKnowing net known f = do
     withPublisher $ \pub ->
       withSubscription pub $ \events -> do
         (inbox, mailbox) <- newMailbox
-        busy <- newTVarIO Free
-        pending <- newTVarIO 0
         let cfg =
               PeerConfig
                 { pub = pub,
@@ -66,9 +63,11 @@ withPeerTestKnowing net known f = do
                   label = "remote",
                   connect = memoryConnection net script,
                   logger = logger,
-                  lookupBlock = lookup_block
+                  lookupBlock = lookup_block,
+                  bestBlock = return (genesisNode net),
+                  remote = testRemote net
                 }
-            p = wrapPeer cfg busy pending mailbox
+        p <- newPeer cfg mailbox
         withAsync (peer cfg p inbox) $ \thread -> do
           remote <- within 5 "connection" (readMVar rv)
           f PeerTest {peer = p, events, remote, thread}
@@ -126,8 +125,6 @@ readAllocation size = do
         liftIO (forever (threadDelay maxBound))
   withTestLogger $ \logger -> withPublisher $ \pub -> do
     (inbox, mailbox) <- newMailbox
-    busy <- newTVarIO Free
-    pending <- newTVarIO 0
     let cfg =
           PeerConfig
             { pub = pub,
@@ -135,9 +132,12 @@ readAllocation size = do
               label = "remote",
               connect = \f -> f (Conduits src sinkNull),
               logger = logger,
-              lookupBlock = \_ -> return Nothing
+              lookupBlock = \_ -> return Nothing,
+              bestBlock = return (genesisNode btc),
+              remote = testRemote btc
             }
-    withAsync (peer cfg (wrapPeer cfg busy pending mailbox) inbox) $ \_ -> do
+    p <- newPeer cfg mailbox
+    withAsync (peer cfg p inbox) $ \_ -> do
       counter0 <- within 30 "first piece" (readMVar start)
       counter1 <- within 30 "message read" (readMVar end)
       -- the counter goes down as the thread allocates

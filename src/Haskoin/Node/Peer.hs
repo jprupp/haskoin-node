@@ -41,6 +41,12 @@
 --   receives. It is done here, once, so that 'getBlocks', 'getData' and the
 --   'PeerMessage' events all see only blocks that passed it.
 --
+-- * Every message on its way out is judged first by a model of the node at
+--   the other end ("Haskoin.Node.Peer.Remote"). One that the node would
+--   punish this node for is not sent, and is logged with the upstream line
+--   of the rule. A request in 'getData' that the node would drop without an
+--   answer fails at once.
+--
 -- * Reading pauses when the node falls behind ('maxPendingMessages'), so the
 --   speed of the node, not the speed of the peer, sets the pace.
 module Haskoin.Node.Peer
@@ -52,6 +58,7 @@ module Haskoin.Node.Peer
     Peer (..),
     PeerMessage (..),
     peer,
+    newPeer,
     wrapPeer,
     sendMessage,
     killPeer,
@@ -59,6 +66,7 @@ module Haskoin.Node.Peer
     getTxs,
     getData,
     pingPeer,
+    judgeMessage,
     Owner,
     newOwner,
     ownerName,
@@ -83,16 +91,20 @@ import Data.Bool (bool)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.Function (on)
-import Data.Maybe (isJust)
+import Data.Int (Int64)
+import Data.Map.Strict qualified as Map
+import Data.Maybe (catMaybes, isJust)
 import Data.Serialize (decode, runGet, runPut)
 import Data.String.Conversions (cs)
 import Data.Text (Text)
+import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Word (Word32)
 import Haskoin
 import Haskoin.Node.Block
 import Haskoin.Node.Logger
 import Haskoin.Node.Loop (loopForever)
 import Haskoin.Node.Peer.Lock
+import Haskoin.Node.Peer.Remote
 import Haskoin.Node.Peer.Request
 import NQE
 import System.Random
@@ -131,7 +143,13 @@ data PeerConfig = PeerConfig
     -- (see 'witnessCheck'). "Haskoin.Node" passes 'Haskoin.Node.chainGetBlock'.
     -- A function that always gives 'Nothing' still checks the Merkle root of
     -- every block, but not its witness data.
-    lookupBlock :: !(BlockHash -> IO (Maybe BlockNode))
+    lookupBlock :: !(BlockHash -> IO (Maybe BlockNode)),
+    -- | the best block header that the node has stored, which the model of
+    -- the peer takes for the tip of the peer ("Haskoin.Node.Peer.Remote").
+    -- "Haskoin.Node" passes 'Haskoin.Node.Chain.chainGetBest'.
+    bestBlock :: !(IO BlockNode),
+    -- | the model of the peer when the connection opens, from 'newRemote'
+    remote :: !Remote
   }
 
 -- | Events published about peers.
@@ -184,7 +202,11 @@ data Peer = Peer
     -- 'reservePeer'
     busy :: !(TVar (Lock Owner)),
     -- | messages from this peer that the node has not finished handling
-    pending :: !(TVar Int)
+    pending :: !(TVar Int),
+    -- | the model of the peer, which judges the messages sent to it
+    remote :: !(TVar Remote),
+    -- | what the node knows that a judgement of a message needs
+    facts :: !(Message -> IO Facts)
   }
 
 instance Eq Peer where
@@ -201,21 +223,71 @@ data PeerMessage
     SendMessage !Message
 
 -- | Build a 'Peer' handle from its configuration, its lock (which starts
--- 'Free'), its counter of pending messages, and the mailbox of its process.
+-- 'Free'), its counter of pending messages, its model, which starts as the
+-- @remote@ of the configuration, and the mailbox of its process.
 wrapPeer ::
   PeerConfig ->
   TVar (Lock Owner) ->
   TVar Int ->
+  TVar Remote ->
   Mailbox PeerMessage ->
   Peer
-wrapPeer cfg busy pending mbox =
+wrapPeer cfg busy pending remote mbox =
   Peer
     { mailbox = mbox,
       pub = cfg.pub,
       label = cfg.label,
       busy = busy,
-      pending = pending
+      pending = pending,
+      remote = remote,
+      facts = gatherFacts cfg
     }
+
+-- | A 'Peer' handle for a configuration and the mailbox of its process, as
+-- 'wrapPeer' builds it, with a free lock, no pending messages, and the model
+-- of the configuration.
+newPeer :: PeerConfig -> Mailbox PeerMessage -> IO Peer
+newPeer cfg mbox = do
+  busy <- newTVarIO Free
+  pending <- newTVarIO 0
+  remote <- newTVarIO cfg.remote
+  return (wrapPeer cfg busy pending remote mbox)
+
+-- | What the node knows that a judgement of a message needs: the time, its
+-- best header, and its headers of the blocks that the message names, up to
+-- 'factsLookups' of them. A block past that, or one that the node does not
+-- know, is taken to be at the tip, which changes no judgement of the
+-- protocol.
+gatherFacts :: PeerConfig -> Message -> IO Facts
+gatherFacts cfg m = do
+  t <- getPOSIXTime
+  best <- cfg.bestBlock
+  found <- forM (take factsLookups named) $ \h -> fmap (h,) <$> cfg.lookupBlock h
+  return
+    Facts
+      { now = floor (t * 1000000) :: Int64,
+        best = best,
+        known = Map.fromList (catMaybes found)
+      }
+  where
+    named = case m of
+      MGetData (GetData ivs) -> [BlockHash iv.invHash | iv <- ivs, isBlock iv.invType]
+      MGetHeaders gh -> gh.locator
+      MGetBlocks gb -> gb.locator
+      _ -> []
+    isBlock = (`elem` [InvBlock, InvWitnessBlock, InvMerkleBlock, InvCompactBlock])
+
+-- | Most block headers looked up to judge one message.
+factsLookups :: Int
+factsLookups = 64
+
+-- | What the peer would do with a message if it were sent now, without
+-- sending it. A message that the peer process sends is judged again then,
+-- with the model as it is at that time.
+judgeMessage :: Peer -> Message -> IO Judgement
+judgeMessage p m = do
+  f <- p.facts m
+  fst . judge f m <$> readTVarIO p.remote
 
 -- | Most messages from one peer that may wait for the node to handle them.
 -- When a peer gets this far ahead, the node stops reading from its socket
@@ -253,7 +325,7 @@ peer cfg@PeerConfig {label, net, pub, logger} p inbox =
       m <- liftIO $ do
         logDebug logger $ label <> " awaiting event..."
         receive inbox
-      dispatchMessage cfg m >>= bool (return ()) go
+      dispatchMessage cfg p m >>= bool (return ()) go
     peer_session ad = do
       let ins = ad.inboundConduit
           ons = ad.outboundConduit
@@ -272,18 +344,37 @@ peer cfg@PeerConfig {label, net, pub, logger} p inbox =
         n <- readTVar p.pending
         check (n < maxPendingMessages)
         writeTVar p.pending (n + 1)
+        case m of
+          MVersion v -> modifyTVar' p.remote (learnVersion v)
+          _ -> return ()
       publish (PeerMessage p m) pub
 
--- | Internal function to dispatch peer messages.
+-- | Internal function to dispatch peer messages. A message to send is judged
+-- by the model of the peer first, and dropped if the peer would punish the
+-- node for it ('Refused').
 dispatchMessage ::
   PeerConfig ->
+  Peer ->
   PeerMessage ->
   ConduitT i Message IO Bool
-dispatchMessage PeerConfig {label, logger} (SendMessage m) = do
-  liftIO $ logDebug logger (label <> " sending cmd " <> cs (show (msgType m)))
-  yield m
+dispatchMessage PeerConfig {label, logger} p (SendMessage m) = do
+  f <- liftIO (p.facts m)
+  j <- liftIO . atomically $ do
+    (j, r) <- judge f m <$> readTVar p.remote
+    case j of
+      Refused _ _ -> return ()
+      _ -> writeTVar p.remote r
+    return j
+  let cmd = cs (show (msgType m))
+  case j of
+    Refused _ _ ->
+      liftIO . logWarn logger $
+        label <> " not sending cmd " <> cmd <> ": " <> judgementText j
+    _ -> do
+      liftIO $ logDebug logger (label <> " sending cmd " <> cmd)
+      yield m
   return True
-dispatchMessage PeerConfig {label, logger} KillPeer = do
+dispatchMessage PeerConfig {label, logger} _ KillPeer = do
   liftIO $ logDebug logger (label <> " disconnecting")
   return False
 
@@ -464,21 +555,28 @@ getTxs net time p ths =
 -- single inventory fails to be retrieved, if they come out of order, or if
 -- timeout is reached.
 --
--- The first argument is the timeout in seconds. A ping is sent right after the
--- request; since peers answer in order, receiving the matching pong before all
--- items means that the peer will not send the rest. Unrelated messages that
+-- The first argument is the timeout in seconds. Each item is judged by the
+-- model of the peer first ("Haskoin.Node.Peer.Remote"): if the peer would
+-- refuse the request, or drop one of its items without an answer, the request
+-- gives 'Nothing' at once. A ping is sent right after the request; since
+-- peers answer in order, receiving the matching pong before all items means
+-- that the peer will not send the rest. Unrelated messages that
 -- arrive meanwhile are ignored. Transactions are returned as 'Left' and blocks
 -- as 'Right', in the order they were requested. "Haskoin.Node.Peer.Request"
 -- has the rules. Blocks are checked as 'getBlocks' says, and transactions as
 -- 'getTxs' says.
 getData ::
   Int -> Peer -> GetData -> IO (Maybe [Either Tx Block])
-getData seconds p gd@(GetData ivs) =
-  withSubscription p.pub $ \inb -> do
-    r <- randomIO
-    MGetData gd `sendMessage` p
-    MPing (Ping r) `sendMessage` p
-    join <$> timeout (seconds * 1000 * 1000) (step inb (newRequest r ivs))
+getData seconds p gd@(GetData ivs) = do
+  whole <- judgeMessage p (MGetData gd)
+  items <- mapM (judgeMessage p . MGetData . GetData . pure) ivs
+  if all (== Allowed) (whole : items)
+    then withSubscription p.pub $ \inb -> do
+      r <- randomIO
+      MGetData gd `sendMessage` p
+      MPing (Ping r) `sendMessage` p
+      join <$> timeout (seconds * 1000 * 1000) (step inb (newRequest r ivs))
+    else return Nothing
   where
     step inb = \case
       Complete items -> return (Just items)

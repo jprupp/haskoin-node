@@ -30,6 +30,7 @@ module Haskoin.Node.Address
     withConnection,
     connectTimeout,
     peerHostAddress,
+    seenAs,
   )
 where
 
@@ -47,7 +48,7 @@ import Data.Streaming.Network (clientSettingsTCP, getReadBufferSize, getSocketFa
 import Data.String.Conversions (cs)
 import Data.Time.Clock (NominalDiffTime)
 import Data.Word (Word16, Word8)
-import Haskoin (HostAddress, Network (..), sockToHostAddress)
+import Haskoin (AddressNetwork (..), HostAddress, Network (..), sockToHostAddress)
 import Haskoin.Node.Peer (Conduits (..), WithConnection)
 import Network.Socket
   ( AddrInfo (..),
@@ -264,6 +265,23 @@ peerHostAddress :: SockAddr -> HostAddress
 peerHostAddress = \case
   SockAddrUnix _ -> sockToHostAddress (SockAddrInet 0 0)
   sa -> sockToHostAddress sa
+
+-- | How the node at a socket address sees this node, for its model
+-- ("Haskoin.Node.Peer.Remote"): the network of the address, and whether it is
+-- a local one. Over the loopback interface or a Unix socket it is local,
+-- which some rules of the nodes treat apart. A Unix socket has no address
+-- network; it is given as IPv4, which the rules treat as they treat any other
+-- local address.
+seenAs :: SockAddr -> (AddressNetwork, Bool)
+seenAs = \case
+  SockAddrInet _ h -> (AddrIPv4, fst4 (hostAddressToTuple h) == 127)
+  SockAddrInet6 _ _ h _ -> case hostAddress6ToTuple h of
+    (0, 0, 0, 0, 0, 0, 0, 1) -> (AddrIPv6, True)
+    (0, 0, 0, 0, 0, 0xffff, hi, _) -> (AddrIPv6, hi `shiftR` 8 == 127)
+    _ -> (AddrIPv6, False)
+  SockAddrUnix _ -> (AddrIPv4, True)
+  where
+    fst4 (a, _, _, _) = a
 
 -- | Turn a socket address into a numeric host and a port, or 'Nothing' if it
 -- cannot be converted.

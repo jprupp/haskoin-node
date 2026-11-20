@@ -110,17 +110,19 @@ import Control.Monad (forM_, when, (<=<))
 import Data.Function (on)
 import Data.List (find, sort)
 import Data.Maybe (fromMaybe)
+import Data.Set qualified as Set
 import Data.String.Conversions (cs)
 import Data.Time.Clock
 import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
 import Data.Word (Word32, Word64)
 import GHC.Records (HasField (..))
 import Haskoin
-import Haskoin.Node.Address (NetGroup, isRoutable, netGroup, peerHostAddress, toHostService, toSockAddr)
+import Haskoin.Network.Protocol qualified as P
+import Haskoin.Node.Address (NetGroup, isRoutable, netGroup, peerHostAddress, seenAs, toHostService, toSockAddr)
 import Haskoin.Node.Logger
 import Haskoin.Node.Loop (loopForever)
 import Haskoin.Node.Peer
-import Haskoin.Node.Peer.Lock (Lock (..))
+import Haskoin.Node.Peer.Remote (newRemote)
 import Haskoin.Node.PeerMgr.Addresses
 import Haskoin.Node.PeerMgr.Handshake
 import Haskoin.Node.PeerMgr.Lifecycle
@@ -155,7 +157,15 @@ data PeerMgrConfig = PeerMgrConfig
     logger :: !Logger,
     -- | look up a stored block header; given to every peer as the
     -- @lookupBlock@ of its t'PeerConfig', to check the blocks it sends
-    lookupBlock :: !(BlockHash -> IO (Maybe BlockNode))
+    lookupBlock :: !(BlockHash -> IO (Maybe BlockNode)),
+    -- | the best stored block header; given to every peer as the
+    -- @bestBlock@ of its t'PeerConfig'
+    bestBlock :: !(IO BlockNode),
+    -- | the permissions that the nodes of @peers@ grant this node with
+    -- @-whitelist@ or @-whitebind@. The model of each such peer judges the
+    -- messages sent to it with them ("Haskoin.Node.Peer.Remote"). Peers
+    -- found any other way grant none.
+    permissions :: !P.Permissions
   }
 
 -- | Handle to a running peer manager. Obtain one with 'withPeerMgr', or from
@@ -524,6 +534,7 @@ connectPeer mgr sa = do
     | otherwise -> do
         logDebug mgr.config.logger ("Connecting to peer " <> cs (show sa))
         nonce <- randomIO
+        seed <- randomIO
         height <- readTVarIO mgr.best
         now <- getCurrentTime
         let net = mgr.config.net
@@ -531,6 +542,12 @@ connectPeer mgr sa = do
             rmt = NetworkAddress services (peerHostAddress sa)
             unix = floor (utcTimeToPOSIXSeconds now)
             ver = buildVersion net nonce height mgr.config.address rmt unix
+            (addrNet, local) = seenAs sa
+            granted
+              | source == Just Configured = mgr.config.permissions
+              | otherwise = Set.empty
+            opened = floor (utcTimeToPOSIXSeconds now * 1000000)
+            model = newRemote net granted addrNet local opened seed
             pc =
               PeerConfig
                 { pub = mgr.config.pub,
@@ -538,12 +555,12 @@ connectPeer mgr sa = do
                   label = cs (show sa),
                   connect = mgr.config.connect sa,
                   logger = withSource "Peer" mgr.config.logger,
-                  lookupBlock = mgr.config.lookupBlock
+                  lookupBlock = mgr.config.lookupBlock,
+                  bestBlock = mgr.config.bestBlock,
+                  remote = model
                 }
         (inbox, mailbox) <- newMailbox
-        busy <- newTVarIO Free
-        pending <- newTVarIO 0
-        let p = wrapPeer pc busy pending mailbox
+        p <- newPeer pc mailbox
         -- The peer manager handles messages one at a time, so the peer cannot
         -- die before it is in the list.
         a <- mgr.supervisor `addChild` withHousekeeping mgr p (peer pc p inbox)

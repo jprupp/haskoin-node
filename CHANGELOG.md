@@ -8,9 +8,41 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [2.7.0] - 2026-11-22
 
-Peers on Unix sockets, and haskoin-core 3.0, for haskoin-store 2.0.0.
+Peers on Unix sockets, a model of the node at the other end of each
+connection, and haskoin-core 3.0, for haskoin-store 2.0.0.
 
 ### Added
+- **A model of each peer's node.** Every connection runs the state machine
+  of haskoin-core's `Haskoin.Network.Protocol` for its network: Bitcoin
+  Core 32.1 or Bitcoin Cash Node 29.2.0, translated from their source, with
+  this node as the peer (`Haskoin.Node.Peer.Remote`). The peer process
+  judges every message before sending it. One that the node would punish
+  (ban score, discouragement, a ban, or a disconnection for a rule of the
+  protocol) is not sent, and the log says why, with the upstream line. A
+  request in `getData`, `getBlocks` or `getTxs` that the node would drop
+  without an answer gives `Nothing` at once rather than wait for the
+  timeout. `judgeMessage` asks without sending. The model takes the options
+  of the node from its version message (Bloom filters, pruning, blocks-only)
+  and plays the messages sent before it again with them. It takes the node
+  to have every block it is asked for, and leaves to happen what depends on
+  the guessed state of the node, such as its upload limit.
+- `permissions` in `NodeConfig` and `PeerMgrConfig`: the permissions that
+  the nodes of `peers` grant this node with `-whitelist` or `-whitebind`,
+  such as `PermMempool`. Nothing in the protocol tells a peer, so the
+  operator says it. Discovered peers grant none. `Permission` and
+  `Permissions` are re-exported from `Haskoin.Node`.
+- `expectsReject`: whether the node of a network answers a transaction that
+  it refuses with a `reject` message (BIP 61), as Bitcoin Cash Node does and
+  Bitcoin Core never does, asked of the model.
+- `newPeer` builds a `Peer` handle with a free lock, no pending messages and
+  the model of its configuration.
+- `seenAs` in `Haskoin.Node.Address`: the address network of a peer and
+  whether the node sees this node at a local address, for its model.
+- Tests: the model's rules for the mempool request, the handshake order,
+  filtered blocks and the replay after the version. In regtest, against
+  both nodes: the messages that the node sends up to its verack are the
+  ones that the model predicts, a mempool request goes only where the node
+  takes it, and a node that whitelists the store with `mempool` answers it.
 - **Peers on Unix sockets.** A configured peer can be a Unix socket, written
   `unix:PATH` as Bitcoin Core writes the socket of a proxy, and
   `withConnection` opens it. Neither Bitcoin Core nor Bitcoin Cash Node
@@ -23,11 +55,14 @@ Peers on Unix sockets, and haskoin-core 3.0, for haskoin-store 2.0.0.
   can never give a Unix address.
 
 ### Changed
-- Accepts haskoin-core 3.0, which reads the token prefix of Bitcoin Cash
-  outputs (CashTokens) and adds a field to `Network`. Nothing in
-  haskoin-node changes: it passes outputs on as they are, and builds no
-  `Network` of its own. Until 3.0 is on Hackage, `stack.yaml` pins a commit
-  of haskoin-core's master.
+- `PeerConfig` has two new fields, `bestBlock` and `remote` (the model when
+  the connection opens). `Peer` has two, `remote` and `facts`, and
+  `wrapPeer` takes the model's variable. Build a `Peer` with `newPeer`.
+- Needs haskoin-core 3.0, for its protocol machines. 3.0 also reads the
+  token prefix of Bitcoin Cash outputs (CashTokens) and adds a field to
+  `Network`, which change nothing here: haskoin-node passes outputs on as
+  they are, and builds no `Network` of its own. Until 3.0 is on Hackage,
+  `stack.yaml` pins a commit of haskoin-core's master.
 - CI runs through the workflow that the Haskell packages of jprupp share in
   [jprupp/tools](https://github.com/jprupp/tools), with the check of
   `stack.yaml` for local paths (`check-stack-paths`) and the cache of the

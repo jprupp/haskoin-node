@@ -561,7 +561,8 @@ withTestNodeOpts opts net str f =
               (NetworkAddress nodeNetwork anywhere)
               sa
               conn,
-          logger = Logger {level = LevelError, source = "", push = \_ -> return ()}
+          logger = Logger {level = LevelError, source = "", push = \_ -> return ()},
+          permissions = mempty
         }
     anywhere = sockToHostAddress (SockAddrInet 0 0)
     cfg = def {R.createIfMissing = True, R.errorIfExists = True}

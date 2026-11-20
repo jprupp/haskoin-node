@@ -123,6 +123,13 @@ module Haskoin.Node
     -- * Peers
     module Haskoin.Node.Peer,
 
+    -- * Models of peers
+    Judgement (..),
+    judgementText,
+    expectsReject,
+    P.Permission (..),
+    P.Permissions,
+
     -- * Blocks
     module Haskoin.Node.Block,
 
@@ -143,12 +150,14 @@ import Data.Functor ((<&>))
 import Data.Time.Clock (NominalDiffTime)
 import Database.RocksDB (ColumnFamily, DB)
 import Haskoin
+import Haskoin.Network.Protocol qualified as P
 import Haskoin.Node.Address (withConnection)
 import Haskoin.Node.Block
 import Haskoin.Node.Chain
 import Haskoin.Node.Logger
 import Haskoin.Node.Loop (loopForever)
 import Haskoin.Node.Peer
+import Haskoin.Node.Peer.Remote (Judgement (..), expectsReject, judgementText)
 import Haskoin.Node.PeerMgr
 import NQE
 import Network.Socket (SockAddr)
@@ -186,7 +195,15 @@ data NodeConfig = NodeConfig
     -- 'withConnection', but can be replaced to use a proxy or for testing
     connect :: !(SockAddr -> WithConnection),
     -- | log messages here
-    logger :: !Logger
+    logger :: !Logger,
+    -- | the permissions that the nodes of @peers@ grant this node with
+    -- @-whitelist@ or @-whitebind@, such as
+    -- 'Haskoin.Network.Protocol.PermMempool' to ask for their
+    -- mempool. Nothing in the protocol tells a peer its permissions, so the
+    -- operator who set them up says them here. Every message to a peer is
+    -- judged by a model of its node first, which knows these permissions
+    -- ("Haskoin.Node.Peer.Remote"). Peers that the node discovers grant none.
+    permissions :: !P.Permissions
   }
 
 -- | A running node, as given by 'withNode'. Use its fields to query and
@@ -343,5 +360,7 @@ withNode cfg action =
           maxPeerLife = cfg.maxPeerLife,
           connect = cfg.connect,
           logger = withSource "PeerMgr" cfg.logger,
-          lookupBlock = chainGetBlock chain
+          lookupBlock = chainGetBlock chain,
+          bestBlock = chainGetBest chain,
+          permissions = cfg.permissions
         }

@@ -3,6 +3,10 @@ module Haskoin.Node.Test
   ( -- * Logging
     withTestLogger,
 
+    -- * Models of peers
+    testRemote,
+    testFacts,
+
     -- * Timing
     within,
     eventually,
@@ -65,6 +69,7 @@ import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.List (elemIndex)
 import Data.Maybe (fromMaybe, listToMaybe, mapMaybe)
 import Data.Serialize (decode, encode, runGet, runPut)
+import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Time.Clock (NominalDiffTime)
 import Data.Time.Clock.POSIX (getPOSIXTime)
@@ -74,6 +79,7 @@ import Database.RocksDB qualified as R
 import Haskoin
 import Haskoin.Node
 import Haskoin.Node qualified as NC (NodeConfig (..))
+import Haskoin.Node.Peer.Remote qualified as Model
 import NQE
 import Network.Socket (SockAddr (..))
 import System.Environment (lookupEnv)
@@ -426,7 +432,8 @@ withTestNode net peers connect modify f =
                     timeout = 120,
                     maxPeerLife = 48 * 3600,
                     connect = connect,
-                    logger = logger
+                    logger = logger,
+                    permissions = Set.empty
                   }
           withNode (modify cfg) $ \n ->
             f TestNode {node = n, events = sub, net = net}
@@ -454,3 +461,24 @@ waitForBest :: Double -> TestNode -> (BlockNode -> Bool) -> IO BlockNode
 waitForBest s t f = do
   eventually s "best block header" $ f <$> chainGetBest t.node.chain
   chainGetBest t.node.chain
+
+-- | The model of a peer for a test that starts a peer process itself: a
+-- local connection, with no permissions, whose handshake is complete, as it
+-- is for every peer that "Haskoin.Node.PeerMgr" offers. The tests talk to the
+-- peer process without a handshake, and the model of a real node would drop
+-- their requests.
+testRemote :: Network -> Model.Remote
+testRemote net =
+  Model.learnVersion theirs $
+    foldl sendOne (Model.newRemote net Set.empty AddrIPv4 True 0 0) [MVersion ours, MVerAck]
+  where
+    facts = Model.Facts {now = 0, best = genesisNode net, known = mempty}
+    sendOne r m = snd (Model.judge facts m r)
+    zero = NetworkAddress 0 (sockToHostAddress (SockAddrInet 0 0))
+    ours = buildVersion net 1 0 zero zero 0
+    theirs = (buildVersion net 2 0 zero zero 0) {services = nodeNetwork .|. nodeWitness, relay = True}
+
+-- | What a test peer knows of the chain when it judges a message: only the
+-- genesis block.
+testFacts :: Network -> Message -> IO Model.Facts
+testFacts net _ = return Model.Facts {now = 0, best = genesisNode net, known = mempty}
