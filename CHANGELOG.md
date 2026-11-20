@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Added
+- **Peers on Unix sockets.** A configured peer can be a Unix socket, written
+  `unix:PATH` as Bitcoin Core writes the socket of a proxy, and
+  `withConnection` opens it. Neither Bitcoin Core nor Bitcoin Cash Node
+  listens on one, so something joins the socket to a node, such as socat or
+  the bridge of a test in a container: tests that run at once then reach
+  their nodes without taking a port of the machine. Such a peer is in the
+  local network group, and the version message gives it the zero address,
+  with the new `peerHostAddress`: haskoin-core's `sockToHostAddress` stops
+  the program on an address that is not IPv4 or IPv6. A peer or a DNS seed
+  can never give a Unix address.
+
 ### Changed
 - Accepts haskoin-core 3.0, which reads the token prefix of Bitcoin Cash
   outputs (CashTokens) and adds a field to `Network`. Nothing in

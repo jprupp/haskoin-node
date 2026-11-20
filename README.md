@@ -489,9 +489,22 @@ seed of haskoin-core is `localhost`, which is not, so list local peers in
 ### Custom connections
 
 `connect` decides how to open a connection. `withConnection` opens a plain TCP
-socket, and gives up if it does not open within five seconds (`connectTimeout`,
-as in Bitcoin Core). Replace it to go through a proxy, or to plug in mock peers
-in tests, as the test suite does.
+socket, or a Unix socket for a peer written `unix:PATH`, and gives up if it
+does not open within five seconds (`connectTimeout`, as in Bitcoin Core).
+Replace it to go through a proxy, or to plug in mock peers in tests, as the
+test suite does.
+
+### Peers on Unix sockets
+
+A peer in `peers` can be a Unix socket, written `unix:PATH`, as Bitcoin Core
+writes the socket of a proxy. Neither Bitcoin Core nor Bitcoin Cash Node
+listens on a Unix socket, so something joins the socket to a node: socat, or
+the bridge of a test that runs its node in a container, such as
+[podman-test](https://github.com/jprupp/podman-test). Tests that run at once
+then reach their nodes through sockets of their own, with no port of the
+machine taken. The version message gives such a peer the zero address, as
+Bitcoin Core does when it does not know one. A peer or a DNS seed can never
+give the node a Unix address: relayed addresses are IPv4 or IPv6.
 
 ### Logging
 
@@ -515,7 +528,7 @@ An alert on errors is then an alert about the node, not about the network.
 | `maxPeers`    | Maximum number of peers to connect to                                     |
 | `db`          | RocksDB handle for the headers                                            |
 | `cf`          | Column family for the headers, or `Nothing` for the default one           |
-| `peers`       | Static peers, as `host`, `host:port` or `[ipv6]:port`                     |
+| `peers`       | Static peers, as `host`, `host:port`, `[ipv6]:port` or `unix:PATH`        |
 | `discover`    | Use DNS seeds and addresses relayed by peers                              |
 | `address`     | This node's address, sent in version messages                             |
 | `net`         | Network constants from haskoin-core (`btc`, `bch`, `btcTest`, ...)        |

@@ -7,7 +7,15 @@
 -- Portability : POSIX
 --
 -- Peer addresses: parsing them, deciding which relayed addresses are worth
--- connecting to, and opening TCP connections.
+-- connecting to, and opening connections, over TCP or a Unix socket.
+--
+-- A configured peer may be a Unix socket, written @unix:PATH@ as Bitcoin
+-- Core writes the socket of a proxy. Neither Bitcoin Core nor Bitcoin Cash
+-- Node listens on one, so the socket is something that joins it to a node,
+-- such as socat, or the bridge of a test in a container: tests that run at
+-- once then reach their nodes without taking a port of the machine. A peer
+-- or a DNS seed can never give a Unix address, since relayed addresses are
+-- IPv4 or IPv6 and 'isRoutable' refuses everything else.
 --
 -- "Haskoin.Node.PeerMgr" re-exports 'toHostService', 'toSockAddr' and
 -- 'isRoutable', and "Haskoin.Node" re-exports 'withConnection', where they
@@ -21,13 +29,14 @@ module Haskoin.Node.Address
     netGroup,
     withConnection,
     connectTimeout,
+    peerHostAddress,
   )
 where
 
 import Conduit (liftIO, yield)
 import Control.Applicative ((<|>))
 import Control.Arrow (second)
-import Control.Exception (IOException, catch, finally)
+import Control.Exception (IOException, bracketOnError, catch, finally)
 import Control.Monad (unless)
 import Data.Bits (complement, shiftR, (.&.), (.|.))
 import Data.ByteString (ByteString)
@@ -38,18 +47,22 @@ import Data.Streaming.Network (clientSettingsTCP, getReadBufferSize, getSocketFa
 import Data.String.Conversions (cs)
 import Data.Time.Clock (NominalDiffTime)
 import Data.Word (Word16, Word8)
-import Haskoin (Network (..))
+import Haskoin (HostAddress, Network (..), sockToHostAddress)
 import Haskoin.Node.Peer (Conduits (..), WithConnection)
 import Network.Socket
   ( AddrInfo (..),
-    Family (AF_UNSPEC),
+    Family (AF_UNIX, AF_UNSPEC),
     NameInfoFlag (..),
     SockAddr (..),
+    SocketType (Stream),
     close,
+    connect,
+    defaultProtocol,
     getAddrInfo,
     getNameInfo,
     hostAddress6ToTuple,
     hostAddressToTuple,
+    socket,
     tupleToHostAddress6,
   )
 import Network.Socket.ByteString (recv)
@@ -83,13 +96,17 @@ toHostService str =
    in (host, srv)
 
 -- | Resolve a peer address given as in 'toHostService' into socket addresses,
--- using the default port of the network if none is given. Returns an empty list
--- if it cannot be resolved.
+-- using the default port of the network if none is given, or give the Unix
+-- socket of an address written @unix:PATH@. Returns an empty list if it
+-- cannot be resolved.
 --
 -- Only resolver failures, which are 'IOException's, are caught. Catching
 -- every exception would also swallow the asynchronous exception that cancels
 -- the thread doing the lookup, and the node could then never shut down.
 toSockAddr :: Network -> String -> IO [SockAddr]
+toSockAddr _ ('u' : 'n' : 'i' : 'x' : ':' : path)
+  | null path = return []
+  | otherwise = return [SockAddrUnix path]
 toSockAddr net str =
   resolve `catch` \(_ :: IOException) -> return []
   where
@@ -159,7 +176,8 @@ netGroup :: SockAddr -> NetGroup
 netGroup = \case
   SockAddrInet _ h -> v4 (hostAddressToTuple h)
   SockAddrInet6 _ _ h _ -> v6 (hostAddress6ToTuple h)
-  _ -> UnroutableGroup
+  -- a socket of this machine
+  SockAddrUnix _ -> LocalGroup
   where
     v4 t@(a, b, _, _)
       | a == 127 || a == 0 = LocalGroup
@@ -201,14 +219,15 @@ routable4 (a, b, c, _)
   | a >= 224 = False -- multicast and reserved
   | otherwise = True
 
--- | Longest wait for a TCP connection to open: @DEFAULT_CONNECT_TIMEOUT@ in
+-- | Longest wait for a connection to open: @DEFAULT_CONNECT_TIMEOUT@ in
 -- Bitcoin Core 32.1, 5 seconds.
 connectTimeout :: NominalDiffTime
 connectTimeout = 5
 
--- | Open a TCP connection to a peer address and pass its conduits to a
--- function. The connection is closed when the function returns. Calls 'error'
--- if the address cannot be converted into a host and port.
+-- | Open a connection to a peer address, over TCP or to a Unix socket, and
+-- pass its conduits to a function. The connection is closed when the
+-- function returns. Calls 'error' if a TCP address cannot be converted into
+-- a host and port.
 --
 -- Opening the connection fails with an 'IOException' after 'connectTimeout'.
 -- Without the limit, an address that drops connection requests held a slot
@@ -217,22 +236,34 @@ connectTimeout = 5
 -- because the peer process reads its mailbox only once the connection is
 -- open.
 withConnection :: SockAddr -> WithConnection
-withConnection sa f =
-  fromSockAddr sa >>= \case
-    Nothing -> error $ "Invalid address " <> show sa
-    Just (host, port) ->
-      timeout micros (getSocketFamilyTCP host port AF_UNSPEC) >>= \case
+withConnection sa f = case sa of
+  SockAddrUnix _ -> opened (bracketOnError (socket AF_UNIX Stream defaultProtocol) close (\s -> s <$ connect s sa))
+  _ ->
+    fromSockAddr sa >>= \case
+      Nothing -> error $ "Invalid address " <> show sa
+      Just (host, port) -> opened (fst <$> getSocketFamilyTCP host port AF_UNSPEC)
+  where
+    opened open =
+      timeout micros open >>= \case
         Nothing -> ioError (userError ("Connection to " <> show sa <> " timed out"))
-        Just (s, _) ->
+        Just s ->
           f Conduits {inboundConduit = source s, outboundConduit = sinkSocket s}
             `finally` close s
-  where
     micros = floor (connectTimeout * 1000000)
     -- Pieces of the size that the TCP client of streaming-commons reads.
     size = getReadBufferSize (clientSettingsTCP 0 "")
     source s = do
       bs <- liftIO (recv s size)
       unless (B.null bs) (yield bs >> source s)
+
+-- | The address of a peer as the version message carries it: the zero
+-- address for a Unix socket, which has none, as Bitcoin Core sends when it
+-- does not know the address. haskoin-core's 'sockToHostAddress' takes only
+-- IPv4 and IPv6 addresses, and stops the program on any other.
+peerHostAddress :: SockAddr -> HostAddress
+peerHostAddress = \case
+  SockAddrUnix _ -> sockToHostAddress (SockAddrInet 0 0)
+  sa -> sockToHostAddress sa
 
 -- | Turn a socket address into a numeric host and a port, or 'Nothing' if it
 -- cannot be converted.

@@ -164,7 +164,8 @@ data NodeConfig = NodeConfig
     db :: !DB,
     -- | database column family
     cf :: !(Maybe ColumnFamily),
-    -- | static list of peers to connect to
+    -- | static list of peers to connect to, as 'toHostService' reads them,
+    -- or a Unix socket written @unix:PATH@ ('toSockAddr')
     peers :: ![String],
     -- | activate peer discovery
     discover :: !Bool,

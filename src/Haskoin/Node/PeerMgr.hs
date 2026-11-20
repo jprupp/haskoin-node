@@ -116,7 +116,7 @@ import Data.Time.Clock.POSIX (utcTimeToPOSIXSeconds)
 import Data.Word (Word32, Word64)
 import GHC.Records (HasField (..))
 import Haskoin
-import Haskoin.Node.Address (NetGroup, isRoutable, netGroup, toHostService, toSockAddr)
+import Haskoin.Node.Address (NetGroup, isRoutable, netGroup, peerHostAddress, toHostService, toSockAddr)
 import Haskoin.Node.Logger
 import Haskoin.Node.Loop (loopForever)
 import Haskoin.Node.Peer
@@ -528,7 +528,7 @@ connectPeer mgr sa = do
         now <- getCurrentTime
         let net = mgr.config.net
             services = if net.segWit then 8 else 0
-            rmt = NetworkAddress services (sockToHostAddress sa)
+            rmt = NetworkAddress services (peerHostAddress sa)
             unix = floor (utcTimeToPOSIXSeconds now)
             ver = buildVersion net nonce height mgr.config.address rmt unix
             pc =

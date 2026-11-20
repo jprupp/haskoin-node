@@ -1,16 +1,21 @@
 module Haskoin.Node.AddressSpec (spec) where
 
+import Conduit (await, runConduit, yield, (.|))
+import Control.Concurrent.Async (withAsync)
 import Control.Exception (IOException, bracket, try)
 import Control.Monad (forM_)
+import Data.ByteString.Char8 qualified as C
+import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.Time.Clock (diffUTCTime, getCurrentTime)
 import Data.Word (Word16, Word8)
-import Haskoin (Network (..), btcRegTest)
-import Haskoin.Node (toHostService, toSockAddr)
-import Haskoin.Node.Address (NetGroup (..), isRoutable, netGroup, withConnection)
+import Haskoin (Network (..), btcRegTest, sockToHostAddress)
+import Haskoin.Node (Conduits (..), toHostService, toSockAddr)
+import Haskoin.Node.Address (NetGroup (..), isRoutable, netGroup, peerHostAddress, withConnection)
 import Network.Socket
-  ( Family (AF_INET),
+  ( Family (AF_INET, AF_UNIX),
     SockAddr (..),
     SocketType (Stream),
+    accept,
     bind,
     close,
     connect,
@@ -21,6 +26,8 @@ import Network.Socket
     tupleToHostAddress,
     tupleToHostAddress6,
   )
+import Network.Socket.ByteString (recv, sendAll)
+import System.IO.Temp (withSystemTempDirectory)
 import Test.Hspec
 import Test.Hspec.QuickCheck (prop)
 
@@ -87,6 +94,42 @@ spec = do
           end <- getCurrentTime
           either (\(_ :: IOException) -> True) (const False) r `shouldBe` True
           end `diffUTCTime` start `shouldSatisfy` (\d -> d >= 4.5 && d < 8)
+
+  describe "Unix sockets" $ do
+    it "reads unix:PATH as a Unix socket, and an empty path as nothing" $ do
+      toSockAddr btcRegTest "unix:/run/node/p2p.sock" `shouldReturn` [SockAddrUnix "/run/node/p2p.sock"]
+      toSockAddr btcRegTest "unix:" `shouldReturn` []
+
+    it "never takes a Unix socket for an address worth relaying, and groups it as local" $ do
+      isRoutable (SockAddrUnix "/run/node/p2p.sock") `shouldBe` False
+      netGroup (SockAddrUnix "/run/node/p2p.sock") `shouldBe` LocalGroup
+
+    it "gives the zero address of a Unix socket for the version message" $ do
+      peerHostAddress (SockAddrUnix "/run/node/p2p.sock") `shouldBe` sockToHostAddress (SockAddrInet 0 0)
+      peerHostAddress (v4 (45, 1, 2, 3)) `shouldBe` sockToHostAddress (v4 (45, 1, 2, 3))
+
+    it "opens a connection to a Unix socket, which carries bytes both ways" $
+      withSystemTempDirectory "haskoin-node-unix" $ \dir -> do
+        let path = dir <> "/peer.sock"
+            listener = do
+              s <- socket AF_UNIX Stream defaultProtocol
+              bind s (SockAddrUnix path)
+              listen s 1
+              return s
+            -- answer what the node sends with the same bytes
+            echo srv = bracket (fst <$> accept srv) close $ \c -> recv c 64 >>= sendAll c
+        bracket listener close $ \srv ->
+          withAsync (echo srv) $ \_ -> do
+            got <- newIORef Nothing
+            withConnection (SockAddrUnix path) $ \conduits -> do
+              runConduit (yield (C.pack "version") .| conduits.outboundConduit)
+              runConduit (conduits.inboundConduit .| await) >>= writeIORef got
+            readIORef got `shouldReturn` Just (C.pack "version")
+
+    it "fails to open a connection to a Unix socket that is not there" $
+      withSystemTempDirectory "haskoin-node-unix" $ \dir -> do
+        r <- try (withConnection (SockAddrUnix (dir <> "/nobody.sock")) (\_ -> return ()))
+        either (\(_ :: IOException) -> True) (const False) r `shouldBe` True
 
   describe "network groups" $ do
     -- 45.1.2.3 is 0x2d010203.
