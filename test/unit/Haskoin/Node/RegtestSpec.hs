@@ -1,7 +1,17 @@
 -- | Test the library against Bitcoin Core and Bitcoin Cash Node in regtest
--- mode. Nodes run in Podman containers built from the Containerfile in this
--- directory. Set HASKOIN_NODE_SKIP_REGTEST to skip.
-module Main (main) where
+-- mode. Nodes run in Podman containers built from @test/regtest/Containerfile@
+-- ("Regtest.Podman"). The tests are skipped when Podman cannot run, or when
+-- @HASKOIN_NODE_SKIP_REGTEST@ is set.
+--
+-- They are part of the @spec@ suite, so that @stack test@ and @haskell-dev
+-- test@ run every test. Each node implementation is a group at the top of
+-- the module, which @haskell-dev@ (of jprupp/tools) runs in a process of its
+-- own, at the same time as the other (@haskell-dev.toml@): the containers
+-- have no names and publish random ports, so the two never meet. Each group
+-- builds the image before its first test, which is quick once its layers are
+-- cached, and only where the group runs: built while the spec is put
+-- together, it would be built by every process, and by a listing too.
+module Haskoin.Node.RegtestSpec (spec) where
 
 import Control.Monad (forM_, replicateM_, void)
 import Data.List (isInfixOf)
@@ -14,14 +24,16 @@ import Regtest.Podman
 import System.Environment (lookupEnv)
 import Test.Hspec
 
-main :: IO ()
-main = do
-  skip <- isJust <$> lookupEnv "HASKOIN_NODE_SKIP_REGTEST"
-  available <- podmanAvailable
+spec :: Spec
+spec = do
+  skip <- runIO (isJust <$> lookupEnv "HASKOIN_NODE_SKIP_REGTEST")
+  available <- if skip then return False else runIO podmanAvailable
   if
-    | skip -> hspec $ it "regtest" $ pendingWith "HASKOIN_NODE_SKIP_REGTEST set"
-    | not available -> hspec $ it "regtest" $ pendingWith "podman not available"
-    | otherwise -> buildImage >> hspec spec
+    | skip -> skipped "HASKOIN_NODE_SKIP_REGTEST set"
+    | not available -> skipped "podman not available"
+    | otherwise -> regtests
+  where
+    skipped why = describe "Regtest" $ it "runs the nodes in Podman" $ pendingWith why
 
 -- | Node connected to the given nodes in the container. The timeout is long
 -- so that the stall recovery poll does not hide announcement handling bugs.
@@ -52,9 +64,10 @@ withMinedNode impl n f =
     _ <- mine c 0 n
     f c
 
-spec :: Spec
-spec = forM_ [BitcoinCore, BitcoinCashNode] $ \impl ->
-  describe (implName impl) $ do
+-- | The tests of each node implementation, a group at the top of the module.
+regtests :: Spec
+regtests = forM_ [BitcoinCore, BitcoinCashNode] $ \impl ->
+  beforeAll_ buildImage $ describe (implName impl) $ do
     let net = implNet impl
 
     it "completes the handshake" $ withMinedNode impl 1 $ \c ->

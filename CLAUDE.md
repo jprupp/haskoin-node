@@ -3,13 +3,14 @@
 ## Build and test
 
 - Build: `haskell-dev build`
-- All unit tests: `haskell-dev test`
+- All tests: `haskell-dev test`, those against real nodes in Podman too
 - One spec: `haskell-dev test PeerMgr` (a word of the module name;
   `--match "/Haskoin.Node.Chain/"` narrows it)
 - Documentation: `haskell-dev docs`
-- The regtest suite, against real nodes in Podman, is not part of
-  `haskell-dev test`, which runs the `spec` suite: run it with
-  `stack test haskoin-node:regtest`.
+- Every test is in the one suite, `spec`, so that `stack test` and
+  `haskell-dev test` run them all. The regtest tests
+  (`Haskoin.Node.RegtestSpec`) are skipped without Podman, or with
+  `HASKOIN_NODE_SKIP_REGTEST` set; keep any new kind of test in `spec`.
 - `haskell-dev` is a script of [jprupp/tools](https://github.com/jprupp/tools),
   shared with the other packages, and not a file of this repository. It must
   be on the `PATH`. Its settings for this package are in `haskell-dev.toml`.
@@ -18,9 +19,12 @@
   not mix them with `haskell-dev` in one session: each switch compiles
   everything again.
 - `haskell-dev` builds without optimisation. Never time code with it.
-- The unit tests take about 35 seconds in eight processes, against 104 in
-  one. Most of that is one group, `/Haskoin.Node/untrusted peers/`, which
-  takes 34 seconds alone; `haskell-dev` does not split a group.
+- The tests take about 50 seconds in eight processes, against more than two
+  minutes in one, and about 1.1 GB more memory with the containers. The
+  longest groups are those of the nodes, `/Haskoin.Node.Regtest/Bitcoin Cash
+  Node/` at about 50 seconds and Bitcoin Core at 33, and
+  `/Haskoin.Node/untrusted peers/` at about 35; `haskell-dev` does not split
+  a group.
 
 ## Keep the documentation up to date with every change
 

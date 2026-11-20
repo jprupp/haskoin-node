@@ -77,37 +77,15 @@ tests:
     source-dirs:
       - test/unit
       - test/common
+      # the Podman helpers of Haskoin.Node.RegtestSpec, next to the
+      # Containerfile of their image
+      - test/regtest
     ghc-options: -threaded -rtsopts -with-rtsopts=-N
     build-tools:
       - hspec-discover
     dependencies:
       - async
       - base64
-      - bytestring
-      - cereal
-      - conduit
-      - data-default
-      - haskoin-core
-      - haskoin-node
-      - hspec >= 2.10
-      - HUnit
-      - network
-      - nqe
-      - QuickCheck >= 2.14
-      - random
-      - rocksdb-haskell-jprupp
-      - stm
-      - temporary
-      - text
-      - time
-  regtest:
-    main: Main.hs
-    source-dirs:
-      - test/regtest
-      - test/common
-    ghc-options: -threaded -rtsopts -with-rtsopts=-N
-    dependencies:
-      - async
       - bytestring
       - cereal
       - conduit
@@ -120,6 +98,7 @@ tests:
       - network
       - nqe
       - process
+      - QuickCheck >= 2.14
       - random
       - rocksdb-haskell-jprupp
       - stm

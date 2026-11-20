@@ -24,6 +24,11 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
   spec modules, is in the new `haskell-dev.toml`.
 - `.gitignore` ignores `TAGS` and `dist-newstyle/` again, which ran
   together on one line, and the documentation's work folder.
+- The regtest tests are in the `spec` suite (`Haskoin.Node.RegtestSpec`),
+  so that `stack test` and `haskell-dev test` run every test; the `regtest`
+  suite is gone. They are still skipped without Podman or with
+  `HASKOIN_NODE_SKIP_REGTEST` set, and CI still runs them in a job of their
+  own. The container of the nodes may use 2 GiB of memory.
 
 ## [2.6.1] - 2026-11-18
 

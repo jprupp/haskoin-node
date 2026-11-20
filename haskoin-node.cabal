@@ -82,46 +82,6 @@ library
     , transformers ==0.6.*
   default-language: GHC2024
 
-test-suite regtest
-  type: exitcode-stdio-1.0
-  main-is: Main.hs
-  other-modules:
-      Regtest.Podman
-      Haskoin.Node.Test
-      Paths_haskoin_node
-  hs-source-dirs:
-      test/regtest
-      test/common
-  default-extensions:
-      DuplicateRecordFields
-      MultiWayIf
-      NoFieldSelectors
-      OverloadedRecordDot
-      OverloadedStrings
-  ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wpartial-fields -Wredundant-constraints -Wunused-packages -threaded -rtsopts -with-rtsopts=-N
-  build-depends:
-      HUnit
-    , async
-    , base >=4.20 && <5
-    , bytestring
-    , cereal
-    , conduit
-    , data-default
-    , directory
-    , haskoin-core
-    , haskoin-node
-    , hspec >=2.10
-    , network
-    , nqe
-    , process
-    , random
-    , rocksdb-haskell-jprupp
-    , stm
-    , temporary
-    , text
-    , time
-  default-language: GHC2024
-
 test-suite spec
   type: exitcode-stdio-1.0
   main-is: Spec.hs
@@ -137,12 +97,15 @@ test-suite spec
       Haskoin.Node.PeerMgr.LifecycleSpec
       Haskoin.Node.PeerMgrSpec
       Haskoin.Node.PeerSpec
+      Haskoin.Node.RegtestSpec
       Haskoin.NodeSpec
       Haskoin.Node.Test
+      Regtest.Podman
       Paths_haskoin_node
   hs-source-dirs:
       test/unit
       test/common
+      test/regtest
   default-extensions:
       DuplicateRecordFields
       MultiWayIf
@@ -160,11 +123,13 @@ test-suite spec
     , cereal
     , conduit
     , data-default
+    , directory
     , haskoin-core
     , haskoin-node
     , hspec >=2.10
     , network
     , nqe
+    , process
     , random
     , rocksdb-haskell-jprupp
     , stm

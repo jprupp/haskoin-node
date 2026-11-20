@@ -634,12 +634,12 @@ the time between two commits there is a faster loop: `haskell-dev`, from
 
 ```sh
 haskell-dev build          # build without optimisation
-haskell-dev test PeerMgr   # run the unit tests in several processes at once
+haskell-dev test PeerMgr   # run the tests in several processes at once
 haskell-dev docs           # build the documentation and check its comments
 ```
 
-`haskell-dev test` runs the `spec` suite, not `regtest`. `haskell-dev.toml`
-tells it which spec modules are slow, so that it shares them between the
+`haskell-dev test` runs every test, those against real nodes too, in about
+50 seconds. `haskell-dev.toml` tells it which spec modules are slow, so that it shares them between the
 test processes. Do not mix the two kinds of build in one folder: the flags
 differ, so each switch compiles everything again. Never time code with
 `haskell-dev`.
@@ -650,37 +650,35 @@ differ, so each switch compiles everything again. Never time code with
 The package also builds with [Cabal](https://www.haskell.org/cabal)
 (`cabal build`, `cabal test`).
 
-There are two test suites, using [hspec](https://hspec.github.io/) and
-[QuickCheck](https://hackage.haskell.org/package/QuickCheck):
+The tests are one suite, `spec`, using [hspec](https://hspec.github.io/) and
+[QuickCheck](https://hackage.haskell.org/package/QuickCheck), and
+`stack test` runs all of them:
 
-- `spec` (`test/unit`) tests the state machines with properties, and runs the
-  peer, peer manager, chain and node against in-memory mock peers. It needs no
-  Internet access.
-
-  ```sh
-  stack test haskoin-node:spec
-  ```
-
-- `regtest` (`test/regtest`) runs the node against
+- The unit tests (`test/unit`) test the state machines with properties, and
+  run the peer, peer manager, chain and node against in-memory mock peers.
+  They need no Internet access.
+- The regtest tests (`Haskoin.Node.RegtestSpec`) run the node against
   [Bitcoin Core](https://bitcoincore.org) and
   [Bitcoin Cash Node](https://bitcoincashnode.org) in regression test mode. The
   nodes run in a [Podman](https://podman.io) container built from
   `test/regtest/Containerfile`, whose script `test/regtest/install-nodes.sh`
   installs the official release binaries on Ubuntu after checking their SHA-256
-  hashes. The image is built the first time
-  the suite runs. Nodes use random ports, so runs do not collide. The suite is
-  skipped if Podman is missing or `HASKOIN_NODE_SKIP_REGTEST` is set.
+  hashes. The image is built the first time the tests run, which needs
+  Internet access. Nodes use random ports, so runs do not collide, and a
+  container may use 2 GiB of memory. The tests are skipped if Podman is
+  missing or `HASKOIN_NODE_SKIP_REGTEST` is set.
 
   ```sh
-  stack test haskoin-node:regtest
+  stack test --ta '--match /Haskoin.Node.Regtest/'   # only these
+  HASKOIN_NODE_SKIP_REGTEST=1 stack test               # all but these
   ```
 
 Set `HASKOIN_TEST_LOG` to see the node's logs while tests run.
 
 CI builds and tests every change with the OS libraries and with
 `stack --nix`, through the workflow that the packages of this family share in
-[jprupp/tools](https://github.com/jprupp/tools), and runs the regtest suite in
-a job of its own. You can run its checks locally: `check-stack-paths`, from
+[jprupp/tools](https://github.com/jprupp/tools), without the regtest tests,
+and runs those in a job of its own. You can run its checks locally: `check-stack-paths`, from
 jprupp/tools, fails if `stack.yaml` points at a package outside the
 repository, which CI cannot build, and `scripts/install-system-libraries.sh`
 installs the C libraries on Ubuntu.

@@ -4,9 +4,10 @@ name: CI
 # with Nix, with the Haddock documentation, by the shared workflow of
 # jprupp/tools: .github/workflows/haskell-stack.yml there says more.
 #
-# The two jobs there skip the regtest suite, which the regtest job here runs:
-# it starts Bitcoin Core and Bitcoin Cash Node in Podman, which takes longer
-# and needs to download the node binaries.
+# The two jobs there skip the regtest tests (Haskoin.Node.RegtestSpec, in the
+# spec suite), which the regtest job here runs: they start Bitcoin Core and
+# Bitcoin Cash Node in Podman, which takes longer and needs to download the
+# node binaries.
 
 on:
   push:
@@ -47,7 +48,7 @@ jobs:
           key: stack-os-${{ runner.os }}-${{ hashFiles('stack.yaml', 'stack.yaml.lock', '**/package.yaml') }}
           restore-keys: stack-os-${{ runner.os }}-
 
-      # The suite builds the image from test/regtest/Containerfile, which
+      # The tests build the image from test/regtest/Containerfile, which
       # downloads the official binaries and checks their hashes.
-      - name: Run the regtest suite
-        run: stack --no-nix test --install-ghc haskoin-node:regtest
+      - name: Run the regtest tests
+        run: stack --no-nix test --install-ghc haskoin-node:spec --ta '--match /Haskoin.Node.Regtest/'

@@ -10,4 +10,7 @@ slow-specs = [
   "Haskoin.Node.Chain",
   "Haskoin.Node.Peer",
   "Haskoin.Node.PeerMgr",
+  # one group for each node implementation, each in containers of its own,
+  # without names and with random ports
+  "Haskoin.Node.Regtest",
 ]

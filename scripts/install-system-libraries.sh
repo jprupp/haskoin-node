@@ -4,7 +4,7 @@
 # jprupp/tools installs the same packages for the other jobs.
 #
 # Any arguments name extra packages to install along with them, for example
-# podman for the regtest suite.
+# podman for the regtest tests (Haskoin.Node.RegtestSpec).
 set -euo pipefail
 
 packages=(

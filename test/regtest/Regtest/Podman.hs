@@ -104,7 +104,9 @@ buildImage :: IO ()
 buildImage = void $ podmanWithin 1800 ["build", "--quiet", "--tag", image, imageDir]
 
 -- | Run a container. Node ports inside it are random, and are published to
--- random ports on the loopback interface of the host.
+-- random ports on the loopback interface of the host. The container may use
+-- 2 GiB of memory, for its three nodes at most, so that a node that runs away
+-- fails its test instead of taking the memory of the machine.
 withContainer :: Impl -> (Container -> IO a) -> IO a
 withContainer impl = bracket start stop
   where
@@ -113,7 +115,7 @@ withContainer impl = bracket start stop
       let (p2p, rpc) = splitAt maxNodes ports
       cid <-
         podman $
-          ["run", "--detach", "--rm"]
+          ["run", "--detach", "--rm", "--memory", "2g"]
             <> concat [["--publish", "127.0.0.1::" <> show p] | p <- p2p]
             <> [image]
       return Container {cid = cid, impl = impl, p2pPorts = p2p, rpcPorts = rpc}
