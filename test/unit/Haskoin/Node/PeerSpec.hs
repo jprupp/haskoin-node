@@ -1,13 +1,13 @@
 -- | Peer process talking to a scripted remote over an in-memory connection.
 module Haskoin.Node.PeerSpec (spec) where
 
-import Conduit (sinkNull, yieldMany)
+import Conduit (await, sinkNull, yieldMany)
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async
 import Control.Concurrent.MVar
 import Control.Concurrent.STM
 import Control.Exception (evaluate, fromException)
-import Control.Monad (forM_, forever)
+import Control.Monad (forM_, forever, when)
 import Control.Monad.IO.Class (liftIO)
 import Data.ByteString qualified as B
 import Data.Int (Int64)
@@ -333,6 +333,35 @@ spec = do
       expectStopped t
       eventually 5 "connection closed" (readTVarIO t.remote.closed)
 
+    it "disconnects when told to while blocked writing to a peer that stopped reading" $
+      withTestLogger $ \logger -> withPublisher $ \pub -> do
+        (inbox, mailbox) <- newMailbox
+        writing <- newEmptyMVar
+        let stuck = do
+              -- the first write never returns, as on a full socket
+              _ <- await
+              liftIO (putMVar writing () >> forever (threadDelay maxBound))
+            silent = liftIO (forever (threadDelay maxBound))
+            cfg =
+              PeerConfig
+                { pub = pub,
+                  net = net,
+                  label = "remote",
+                  connect = \f -> f (Conduits silent stuck),
+                  logger = logger,
+                  lookupBlock = \_ -> return Nothing,
+                  bestBlock = return (genesisNode net),
+                  remote = testRemote net
+                }
+        p <- newPeer cfg mailbox
+        withAsync (peer cfg p inbox) $ \thread -> do
+          MPing (Ping 1) `sendMessage` p
+          within 5 "writer to block" (readMVar writing)
+          killPeer p
+          within 5 "peer process to stop" (waitCatch thread) >>= \case
+            Right () -> return ()
+            Left e -> assertFailure ("Unexpected error: " <> show e)
+
   describe "peer data requests" $ do
     let serve :: PeerTest -> (Message -> [Message]) -> IO a -> IO a
         serve t f =
@@ -344,6 +373,65 @@ spec = do
             Just m -> mapM_ (remoteSend t.remote) (f m) >> remote_loop t f
         pong (MPing (Ping n)) = [MPong (Pong n)]
         pong _ = []
+
+    it "gives nothing at once when the peer disconnects during a request" $
+      -- the remote never answers
+      withPeerTest net $ \t ->
+        withAsync (getBlocks net 30 t.peer [bhash b0]) $ \request -> do
+          _ <- remoteReceiveMatch 5 "request" t.remote $ \case
+            MGetData _ -> Just ()
+            _ -> Nothing
+          publish (PeerDisconnected t.peer) t.peer.pub
+          within 5 "request to end" (wait request) `shouldReturn` Nothing
+
+    it "gives nothing at once for a ping when the peer disconnects" $
+      withPeerTest net $ \t ->
+        withAsync (pingPeer 30 t.peer) $ \ping -> do
+          _ <- remoteReceiveMatch 5 "ping" t.remote $ \case
+            MPing _ -> Just ()
+            _ -> Nothing
+          publish (PeerDisconnected t.peer) t.peer.pub
+          within 5 "ping to end" (wait ping) `shouldReturn` False
+
+    it "gives nothing at once for a request to a peer that was told to disconnect" $
+      withPeerTest net $ \t -> do
+        killPeer t.peer
+        within 5 "request to end" (getBlocks net 30 t.peer [bhash b0]) `shouldReturn` Nothing
+
+    it "runs overlapping requests on one peer without mixing their answers" $
+      withPeerTest net $ \t -> do
+        -- answered in turn, the second request would see the block of the
+        -- first one ahead of its own first block, and fail
+        let f = \case
+              MGetData (GetData ivs) -> [MBlock b | iv <- ivs, b <- blocks, block_iv b == iv]
+              m -> pong m
+        serve t f $
+          withAsync (getBlocks net 10 t.peer [bhash (blocks !! 1)]) $ \first ->
+            withAsync (getBlocks net 10 t.peer [bhash b0, bhash (blocks !! 1)]) $ \second -> do
+              within 15 "first request" (wait first) `shouldReturn` Just [blocks !! 1]
+              within 15 "second request" (wait second) `shouldReturn` Just [b0, blocks !! 1]
+
+    it "ignores the late answers of a request that timed out" $
+      withPeerTest net $ \t -> do
+        -- the first request times out before the peer answers it; the
+        -- answers come then, ahead of those of the second request, which
+        -- asks for the same blocks in another order
+        slow <- newMVar True
+        let answer m = do
+              late <- modifyMVar slow (\x -> return (False, x))
+              case m of
+                MGetData (GetData ivs) -> do
+                  when late (threadDelay 1500000)
+                  return [MBlock b | iv <- ivs, b <- blocks, block_iv b == iv]
+                _ -> return (pong m)
+            loop =
+              remoteReceive t.remote >>= \case
+                Nothing -> return ()
+                Just m -> answer m >>= mapM_ (remoteSend t.remote) >> loop
+        withAsync loop $ \_ -> do
+          getBlocks net 1 t.peer [bhash b0, bhash (blocks !! 1)] `shouldReturn` Nothing
+          getBlocks net 10 t.peer [bhash (blocks !! 1), bhash b0]
+            `shouldReturn` Just [blocks !! 1, b0]
 
     it "gives nothing and drops a peer whose block does not match its header" $
       withPeerTest net $ \t -> do

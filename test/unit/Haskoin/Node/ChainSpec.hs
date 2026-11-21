@@ -49,10 +49,25 @@ newFakePeer ct label = do
   busy <- newTVarIO Free
   pending <- newTVarIO 0
   remote <- newTVarIO (testRemote ct.net)
+  closing <- newTVarIO False
+  requestLock <- newTMVarIO ()
+  owed <- newTVarIO Nothing
   let facts = testFacts ct.net
   return
     FakePeer
-      { peer = Peer {mailbox, pub = ct.peerPub, label, busy, pending, remote, facts},
+      { peer =
+          Peer
+            { mailbox,
+              pub = ct.peerPub,
+              label,
+              busy,
+              pending,
+              remote,
+              facts,
+              closing,
+              requestLock,
+              owed
+            },
         inbox
       }
 

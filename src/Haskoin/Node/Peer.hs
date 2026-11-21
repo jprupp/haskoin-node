@@ -49,6 +49,37 @@
 --
 -- * Reading pauses when the node falls behind ('maxPendingMessages'), so the
 --   speed of the node, not the speed of the peer, sets the pace.
+--
+-- = Threads and the state they share
+--
+-- A peer process is two threads: the writer, which takes commands from the
+-- mailbox and writes them to the socket, and the reader, which reads the
+-- socket and publishes what it reads. Other threads touch the 'Peer' handle:
+-- whoever sends messages, the router of "Haskoin.Node", and requests. Each
+-- piece of state is changed in one place or in one transaction:
+--
+-- * The model of the peer (@remote@) is judged and changed in the
+--   transaction that queues a message ('sendMessage'), and by the reader in
+--   the transaction that counts a version message it read. The model keeps
+--   its own clock, so threads that read the time in another order than they
+--   commit cannot make it go back ("Haskoin.Node.Peer.Remote").
+--
+-- * The allowance of pending messages (@pending@) goes up in the reader, in
+--   one transaction with the wait for room, and down once for each message
+--   published, in the router ('peerMessageDone').
+--
+-- * Whether the peer is closing (@closing@) is set by 'killPeer' and when the
+--   process ends, and the process races its connection against it. A writer
+--   blocked in a write to a peer that stopped reading never looks at its
+--   mailbox, so a request to disconnect cannot wait behind it there.
+--
+-- * Requests ('getData') run one at a time on a peer, under a lock, and the
+--   nonce of the ping that ends the last one (@owed@) is set as that ping is
+--   queued and cleared by the reader, in the transaction that counts its
+--   pong. A new request knows from it whether answers to an earlier one may
+--   still come ("Haskoin.Node.Peer.Request").
+--
+-- docs\/concurrency.md in the repository has the whole picture.
 module Haskoin.Node.Peer
   ( PeerConfig (..),
     PeerEvent (..),
@@ -59,7 +90,6 @@ module Haskoin.Node.Peer
     PeerMessage (..),
     peer,
     newPeer,
-    wrapPeer,
     sendMessage,
     killPeer,
     getBlocks,
@@ -83,9 +113,9 @@ module Haskoin.Node.Peer
 where
 
 import Conduit
-import Control.Concurrent.Async (link, withAsync)
+import Control.Concurrent.Async (link, race_, withAsync)
 import Control.Concurrent.STM
-import Control.Exception (Exception, throwIO)
+import Control.Exception (Exception, bracket_, finally, throwIO)
 import Control.Monad
 import Data.Bool (bool)
 import Data.ByteString (ByteString)
@@ -98,7 +128,7 @@ import Data.Serialize (decode, runGet, runPut)
 import Data.String.Conversions (cs)
 import Data.Text (Text)
 import Data.Time.Clock.POSIX (getPOSIXTime)
-import Data.Word (Word32)
+import Data.Word (Word32, Word64)
 import Haskoin
 import Haskoin.Node.Block
 import Haskoin.Node.Logger
@@ -206,7 +236,16 @@ data Peer = Peer
     -- | the model of the peer, which judges the messages sent to it
     remote :: !(TVar Remote),
     -- | what the node knows that a judgement of a message needs
-    facts :: !(Message -> IO Facts)
+    facts :: !(Message -> IO Facts),
+    -- | whether the process is told to stop, or has stopped; the process
+    -- races its connection against it
+    closing :: !(TVar Bool),
+    -- | held by the request that is running on the peer ('getData'), so that
+    -- requests do not see each other's answers
+    requestLock :: !(TMVar ()),
+    -- | the nonce of the ping that ends the last request on the peer, until
+    -- the reader reads its pong
+    owed :: !(TVar (Maybe Word64))
   }
 
 instance Eq Peer where
@@ -217,7 +256,8 @@ instance Show Peer where
 
 -- | Incoming messages that a peer accepts.
 data PeerMessage
-  = -- | disconnect from the peer
+  = -- | disconnect from the peer, once the messages queued before it are
+    -- sent; 'killPeer' queues it, but does not wait for it
     KillPeer
   | -- | send a network message to the peer
     SendMessage !Message
@@ -226,36 +266,34 @@ data PeerMessage
     -- logs it, in the order of the messages that it sends
     NotSent !Message !Judgement
 
--- | Build a 'Peer' handle from its configuration, its lock (which starts
--- 'Free'), its counter of pending messages, its model, which starts as the
--- @remote@ of the configuration, and the mailbox of its process.
-wrapPeer ::
-  PeerConfig ->
-  TVar (Lock Owner) ->
-  TVar Int ->
-  TVar Remote ->
-  Mailbox PeerMessage ->
-  Peer
-wrapPeer cfg busy pending remote mbox =
-  Peer
-    { mailbox = mbox,
-      pub = cfg.pub,
-      label = cfg.label,
-      busy = busy,
-      pending = pending,
-      remote = remote,
-      facts = gatherFacts cfg
-    }
-
--- | A 'Peer' handle for a configuration and the mailbox of its process, as
--- 'wrapPeer' builds it, with a free lock, no pending messages, and the model
--- of the configuration.
+-- | A 'Peer' handle for a configuration and the mailbox of its process,
+-- with a free lock, no pending messages, the model of the configuration, and
+-- no request.
+--
+-- The handle holds the state that the threads of the process and its users
+-- share, so there is one way to make it: the @wrapPeer@ of earlier releases,
+-- which took some of that state from the caller, is gone.
 newPeer :: PeerConfig -> Mailbox PeerMessage -> IO Peer
 newPeer cfg mbox = do
   busy <- newTVarIO Free
   pending <- newTVarIO 0
   remote <- newTVarIO cfg.remote
-  return (wrapPeer cfg busy pending remote mbox)
+  closing <- newTVarIO False
+  requestLock <- newTMVarIO ()
+  owed <- newTVarIO Nothing
+  return
+    Peer
+      { mailbox = mbox,
+        pub = cfg.pub,
+        label = cfg.label,
+        busy = busy,
+        pending = pending,
+        remote = remote,
+        facts = gatherFacts cfg,
+        closing = closing,
+        requestLock = requestLock,
+        owed = owed
+      }
 
 -- | What the node knows that a judgement of a message needs: the time, its
 -- best header, and its headers of the blocks that the message names, up to
@@ -301,6 +339,18 @@ maxPendingMessages = 16
 
 -- | Tell the peer process that the node has finished handling one of the
 -- messages that it published, so that it may read another one.
+--
+-- Call it exactly once for each 'PeerMessage', from one consumer of the
+-- events of the peer: in a node, the router of "Haskoin.Node" does, and the
+-- machine it runs ("Haskoin.Node.Router") disposes of every message exactly
+-- once. A second call for the same message would let the peer get one more
+-- message ahead of the node than 'maxPendingMessages'; a missing call would
+-- stop the peer for good once it misses 'maxPendingMessages' of them. The
+-- count never goes below zero, so a stray call cannot make room for more
+-- than the allowance, but it is a fault of the caller, not a case to rely
+-- on. A token in each message to make a second call impossible was
+-- considered, and left out: it would change 'PeerEvent' for every consumer,
+-- for a rule that one place keeps.
 peerMessageDone :: Peer -> IO ()
 peerMessageDone = atomically . peerMessageDoneSTM
 
@@ -309,20 +359,28 @@ peerMessageDoneSTM :: Peer -> STM ()
 peerMessageDoneSTM p = modifyTVar' p.pending (max 0 . subtract 1)
 
 -- | Run peer process in current thread. The 'Peer' must be the one that
--- 'wrapPeer' built with the mailbox of this inbox.
+-- 'newPeer' built with the mailbox of this inbox.
 --
 -- Opens the connection, then reads and publishes messages from the peer while
 -- sending the messages that arrive in the inbox. Returns when 'killPeer' is
 -- called or the connection is closed, and throws if the peer sends invalid
 -- data.
+--
+-- The connection runs in a race against the @closing@ flag of the peer,
+-- which 'killPeer' sets: the process stops at once, even when its writer is
+-- blocked in a write to a peer that stopped reading. The flag is set when
+-- the process ends, however it ends, so that requests started after that
+-- give up at once.
 peer ::
   PeerConfig ->
   Peer ->
   Inbox PeerMessage ->
   IO ()
 peer cfg@PeerConfig {label, net, pub, logger} p inbox =
-  cfg.connect peer_session
+  race_ (cfg.connect peer_session) closed
+    `finally` atomically (writeTVar p.closing True)
   where
+    closed = atomically (readTVar p.closing >>= check)
     -- Commands from the mailbox, as a stream of messages to send.
     go = do
       m <- liftIO $ do
@@ -349,6 +407,10 @@ peer cfg@PeerConfig {label, net, pub, logger} p inbox =
         writeTVar p.pending (n + 1)
         case m of
           MVersion v -> modifyTVar' p.remote (learnVersion v)
+          -- the last request on the peer is no longer owed its pong; this
+          -- comes before the pong is published, so a request that reads
+          -- @owed@ after it subscribed sees the pong if it still waits
+          MPong (Pong k) -> modifyTVar' p.owed (\o -> if o == Just k then Nothing else o)
           _ -> return ()
       publish (PeerMessage p m) pub
 
@@ -439,10 +501,18 @@ inPeerConduit PeerConfig {label, net, logger, lookupBlock} = loopForever $ do
 outPeerConduit :: (Monad m) => Network -> ConduitT Message ByteString m ()
 outPeerConduit net = awaitForever $ yield . runPut . putMessage net
 
--- | Ask a peer to disconnect. The peer process stops after sending any messages
--- queued before this one.
+-- | Tell a peer to disconnect. The peer process stops at once: messages
+-- queued before may not be sent.
+--
+-- It sets the @closing@ flag that the process races its connection against,
+-- and queues 'KillPeer' too, in the same transaction, for those that watch
+-- the mailbox. It used to queue 'KillPeer' only, which waited behind every
+-- message queued before it, and forever behind a write to a peer that
+-- stopped reading.
 killPeer :: Peer -> IO ()
-killPeer p = KillPeer `send` p.mailbox
+killPeer p = atomically $ do
+  writeTVar p.closing True
+  KillPeer `sendSTM` p.mailbox
 
 -- | Send a network message to peer. Returns as soon as the message is queued.
 --
@@ -453,11 +523,19 @@ killPeer p = KillPeer `send` p.mailbox
 sendMessage :: Message -> Peer -> IO ()
 sendMessage m p = do
   f <- p.facts m
-  atomically $ do
-    (j, r) <- judge f m <$> readTVar p.remote
-    case j of
-      Refused _ _ -> NotSent m j `sendSTM` p.mailbox
-      _ -> writeTVar p.remote r >> SendMessage m `sendSTM` p.mailbox
+  void (atomically (queueMessage f m p))
+
+-- | Judge a message with the given facts and queue it, in one transaction.
+-- Gives whether it is sent: 'False' for a message that the peer would punish
+-- the node for, which goes to the process as 'NotSent'. The model clamps the
+-- time of the facts to the latest it has seen, so facts read before the
+-- transaction cannot make its clock go back.
+queueMessage :: Facts -> Message -> Peer -> STM Bool
+queueMessage f m p = do
+  (j, r) <- judge f m <$> readTVar p.remote
+  case j of
+    Refused _ _ -> NotSent m j `sendSTM` p.mailbox >> return False
+    _ -> writeTVar p.remote r >> SendMessage m `sendSTM` p.mailbox >> return True
 
 -- | Try to reserve a peer for a long conversation, such as syncing headers
 -- or downloading blocks. Returns 'True' if the peer was free and the owner now
@@ -512,8 +590,9 @@ setFree = void . releasePeer legacyOwner
 -- Every block returned has passed 'blockMutation': its transactions hash to
 -- the Merkle root of its header, and, when the node knows its parent, its
 -- witness data matches the commitment in its coinbase. A peer that sends a
--- block that fails is disconnected, and the request then gives 'Nothing'
--- when it times out. The blocks are not validated otherwise: their
+-- block that fails is disconnected, and the request then gives 'Nothing' as
+-- soon as its disconnection is published (or at its timeout, for a peer that
+-- no peer manager runs, which publishes none). The blocks are not validated otherwise: their
 -- transactions may still be invalid.
 getBlocks ::
   Network ->
@@ -557,30 +636,52 @@ getTxs net time p ths =
     ivs = map (InvVector c . (.get)) ths
 
 -- | Request transactions and/or blocks from peer. Return 'Nothing' if any
--- single inventory fails to be retrieved, if they come out of order, or if
--- timeout is reached.
+-- single inventory fails to be retrieved, if they come out of order, if the
+-- peer disconnects, or if timeout is reached.
 --
--- The first argument is the timeout in seconds. Each item is judged by the
--- model of the peer first ("Haskoin.Node.Peer.Remote"): if the peer would
--- refuse the request, or drop one of its items without an answer, the request
--- gives 'Nothing' at once. A ping is sent right after the request; since
--- peers answer in order, receiving the matching pong before all items means
--- that the peer will not send the rest. Unrelated messages that
--- arrive meanwhile are ignored. Transactions are returned as 'Left' and blocks
--- as 'Right', in the order they were requested. "Haskoin.Node.Peer.Request"
--- has the rules. Blocks are checked as 'getBlocks' says, and transactions as
--- 'getTxs' says.
+-- The first argument is the timeout in seconds, which counts from the call,
+-- including any wait for an earlier request on the same peer. Each item is
+-- judged by the model of the peer first ("Haskoin.Node.Peer.Remote"): if the
+-- peer would refuse the request, or drop one of its items without an answer,
+-- the request gives 'Nothing' at once. A ping is sent right after the
+-- request; since peers answer in order, receiving the matching pong before
+-- all items means that the peer will not send the rest. Unrelated messages
+-- that arrive meanwhile are ignored, and so are blocks, transactions and
+-- notfound messages for items that the request did not ask for.
+-- Transactions are returned as 'Left' and blocks as 'Right', in the order
+-- they were requested. "Haskoin.Node.Peer.Request" has the rules. Blocks are
+-- checked as 'getBlocks' says, and transactions as 'getTxs' says.
+--
+-- Requests on one peer run one at a time, under a lock of the peer: two at
+-- once would each take the other's blocks for its own and fail. A request
+-- that ended before the pong of its ping came back leaves that nonce behind,
+-- and the next request ignores what the peer sends until that pong, which
+-- answers the earlier request. A request ends as soon as
+-- 'PeerDisconnected' comes for its peer, and at once if the peer is
+-- closing when it starts.
 getData ::
   Int -> Peer -> GetData -> IO (Maybe [Either Tx Block])
 getData seconds p gd@(GetData ivs) = do
   whole <- judgeMessage p (MGetData gd)
   items <- mapM (judgeMessage p . MGetData . GetData . pure) ivs
   if all (== Allowed) (whole : items)
-    then withSubscription p.pub $ \inb -> do
-      r <- randomIO
-      MGetData gd `sendMessage` p
-      MPing (Ping r) `sendMessage` p
-      join <$> timeout (seconds * 1000 * 1000) (step inb (newRequest r ivs))
+    then fmap join . timeout (seconds * 1000 * 1000) . withRequestLock p $
+      withSubscription p.pub $ \inb ->
+        readTVarIO p.closing >>= \case
+          True -> return Nothing
+          False -> do
+            r <- randomIO
+            let request = MGetData gd
+                ping = MPing (Ping r)
+            fr <- p.facts request
+            fp <- p.facts ping
+            stale <- atomically $ do
+              stale <- readTVar p.owed
+              _ <- queueMessage fr request p
+              sent <- queueMessage fp ping p
+              when sent $ writeTVar p.owed (Just r)
+              return stale
+            step inb (newRequest stale r ivs)
     else return Nothing
   where
     step inb = \case
@@ -588,22 +689,34 @@ getData seconds p gd@(GetData ivs) = do
       Failed _ -> return Nothing
       Continue req -> filterReceive p inb >>= step inb . stepRequest req
 
+-- | Run a request while holding the request lock of a peer.
+withRequestLock :: Peer -> IO a -> IO a
+withRequestLock p =
+  bracket_ (atomically (takeTMVar p.requestLock)) (atomically (putTMVar p.requestLock ()))
+
 -- | Ping a peer and await response. Return 'False' if response not received
--- before timeout. The first argument is the timeout in seconds.
+-- before timeout, or at once if the peer disconnects or is closing. The
+-- first argument is the timeout in seconds.
 pingPeer :: Int -> Peer -> IO Bool
 pingPeer time p =
-  fmap isJust . withSubscription p.pub $ \sub -> do
-    r <- randomIO
-    MPing (Ping r) `sendMessage` p
-    receiveMatchS time sub $ \case
-      PeerMessage p' (MPong (Pong r'))
-        | p == p' && r == r' -> Just ()
-      _ -> Nothing
+  withSubscription p.pub $ \sub ->
+    readTVarIO p.closing >>= \case
+      True -> return False
+      False -> do
+        r <- randomIO
+        MPing (Ping r) `sendMessage` p
+        fmap (== Just True) . receiveMatchS time sub $ \case
+          PeerMessage p' (MPong (Pong r'))
+            | p == p' && r == r' -> Just True
+          PeerDisconnected p'
+            | p == p' -> Just False
+          _ -> Nothing
 
--- | Receive the next message from the given peer, discarding events about other
--- peers.
-filterReceive :: Peer -> Inbox PeerEvent -> IO Message
+-- | Receive the next message from the given peer, or its disconnection,
+-- discarding events about other peers.
+filterReceive :: Peer -> Inbox PeerEvent -> IO RequestInput
 filterReceive p inb =
   receive inb >>= \case
-    PeerMessage p' m | p == p' -> return m
+    PeerMessage p' m | p == p' -> return (Received m)
+    PeerDisconnected p' | p == p' -> return Disconnected
     _ -> filterReceive p inb

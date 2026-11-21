@@ -79,6 +79,12 @@ a full node.
   written down as a pure state machine. A message that does not fit the current
   state is refused instead of handled by accident, and every rule is tested
   without a network.
+- **Races ruled out by construction.** Every concurrent protocol, from the
+  threads of one connection to the routing of events, is a pure state
+  machine; the threads only carry out what it decides. Each piece of state has
+  one owner, or changes in one STM transaction per decision, or keeps its
+  order through a single queue. [docs/concurrency.md](docs/concurrency.md)
+  says which, protocol by protocol.
 - **The rules of the other node, not guesses.** Bitcoin Core and Bitcoin
   Cash Node decide what a peer may send, and much of it is in no BIP. Every
   message to a peer is first judged by a model of the node at the other end,
@@ -363,9 +369,12 @@ The rules for talking to peers are pure state machines, each in its own module:
 | `Haskoin.Node.Chain.Sync`        | Which peer to ask for headers, and when headers count as synced |
 | `Haskoin.Node.Peer.Request`      | Receiving requested blocks and transactions                    |
 | `Haskoin.Node.Peer.Lock`         | Who may hold a peer for a long conversation                    |
+| `Haskoin.Node.Router`            | The order of each peer's events: announced before its messages |
 
 The processes store the state and carry out what a transition says. Time is an
 input to the transitions, so every timing rule is tested without waiting.
+[docs/concurrency.md](docs/concurrency.md) has, for every thread, what it owns
+and why no two threads get in each other's way.
 
 `Haskoin.Node.Block` is a pure check of another kind: whether the
 transactions of a block are the ones its header commits to. Every block a peer
@@ -387,7 +396,10 @@ Everything is published to the `Publisher NodeEvent` in the configuration:
 | `PeerEvent (PeerMessage peer msg)`      | An online peer sent a message: `MInv`, `MBlock`, `MTx` and so on |
 
 Messages are published only from peers that are online, except `version` and
-`verack`, which are the handshake itself. A block in an `MBlock` message has
+`verack`, which are the handshake itself. For each peer, `PeerConnected` comes
+before any other message of the peer, and `PeerDisconnected` after all of
+them, even when the peer sends right behind its handshake: the node holds such
+messages until the announcement has gone out (`Haskoin.Node.Router`). A block in an `MBlock` message has
 passed `blockMutation`: its transactions hash to the Merkle root of its header,
 and its witness data matches its coinbase when the node knows its parent.
 Nothing else about it is checked, and a transaction in an `MTx` message is not
@@ -440,17 +452,23 @@ case ps of
 
 `getBlocks`, `getTxs` and `getData` return `Nothing` if the peer does not send
 everything, in order, before the timeout in seconds. Unrelated messages that the
-peer sends in between are ignored. `pingPeer` measures a round trip.
+peer sends in between are ignored. If the peer disconnects, they return
+`Nothing` at once. Requests on one peer run one after the other, and the
+timeout counts the wait: two at once would take each other's blocks for their
+own. The late answers of a request that timed out do not disturb the next one.
+`pingPeer` measures a round trip, and gives `False` at once if the peer
+disconnects.
 
 A block that `getBlocks` returns holds the transactions its header commits to.
 A peer that sends another block under the requested header is disconnected,
-and the request gives `Nothing` when it times out. The transactions are not
+and the request gives `Nothing`. The transactions are not
 validated otherwise. A transaction from `getTxs` is matched by its id, which
 does not cover its witness, so treat its witness data as unauthenticated until
 you find the transaction in a block.
 
 `getPeers` leaves out peers that are being disconnected, even before their
-connection closes.
+connection closes. `killPeer` closes a connection at once, without sending the
+messages still queued for it, even when the peer has stopped reading.
 
 For a conversation that spans many messages, such as downloading a long run of
 blocks, reserve the peer first so that no other task uses it at the same time.
@@ -619,6 +637,7 @@ Every module is exposed and can be imported on its own:
 | `Haskoin.Node.Peer.Request`      | State machine for receiving requested blocks and transactions |
 | `Haskoin.Node.Peer.Remote`       | The model of the node at the other end, which judges each message sent to it |
 | `Haskoin.Node.Peer.Lock`         | State machine for reserving a peer                          |
+| `Haskoin.Node.Router`            | State machine for the order of each peer's events           |
 | `Haskoin.Node.Block`             | Whether a block holds the transactions its header commits to |
 | `Haskoin.Node.PeerMgr`           | Finds, connects, ranks and drops peers                      |
 | `Haskoin.Node.PeerMgr.Lifecycle` | State machine for the life of a connection                  |
@@ -670,6 +689,9 @@ Every module is exposed and can be imported on its own:
   gossip cannot crowd out the seeds. When the room for one is full, a new
   address replaces one that has failed to connect.
 - A connection that does not open within five seconds is given up.
+- A peer that stops reading cannot keep its slot: a connection told to close
+  closes at once, even with a write blocked, and the peer manager cancels the
+  process of one still there `timeout` seconds later.
 - An address whose connection fails waits twice as long after each failure
   before it is tried again, up to ten minutes. A relayed address whose peer
   broke the protocol is not tried again for a day. Static peers are never

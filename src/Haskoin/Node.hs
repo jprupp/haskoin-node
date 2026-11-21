@@ -59,7 +59,11 @@
 -- * __Processes with one job each.__ The peer manager, the chain and every
 --   peer connection are separate NQE processes. Each owns its state and is fed
 --   by messages, which keeps the concurrency easy to reason about and lets a
---   failing peer die without disturbing the rest.
+--   failing peer die without disturbing the rest. What each thread does is
+--   decided by a pure state machine, and the order in which the events of a
+--   peer are passed on is one too ("Haskoin.Node.Router"). docs\/concurrency.md
+--   in the repository says, for every thread, what it owns and why threads
+--   cannot race.
 --
 -- * __Plain 'IO'.__ Every function runs in 'IO', without monad transformers
 --   or @MonadIO@ and @MonadUnliftIO@ constraints. The types say exactly what
@@ -146,6 +150,7 @@ where
 
 import Control.Concurrent.Async (link, withAsync)
 import Control.Concurrent.STM (atomically)
+import Control.Monad (foldM)
 import Data.Functor ((<&>))
 import Data.Time.Clock (NominalDiffTime)
 import Database.RocksDB (ColumnFamily, DB)
@@ -159,6 +164,7 @@ import Haskoin.Node.Loop (loopForever)
 import Haskoin.Node.Peer
 import Haskoin.Node.Peer.Remote (Judgement (..), expectsReject, judgementText)
 import Haskoin.Node.PeerMgr
+import Haskoin.Node.Router qualified as R
 import NQE
 import Network.Socket (SockAddr)
 
@@ -238,6 +244,21 @@ chainEvents mgr input output = loopForever $ do
 -- | Route events from peers to the peer manager and chain, and publish them
 -- to the application.
 --
+-- = Order
+--
+-- The messages of a peer come from the thread that reads its socket, and its
+-- announcements, 'PeerConnected' and 'PeerDisconnected', from the peer
+-- manager. This loop keeps the order of the two with the pure machine of
+-- "Haskoin.Node.Router": the chain and the application see 'PeerConnected'
+-- before any message of the peer past its handshake, and 'PeerDisconnected'
+-- after all of them. Messages that arrive between the end of the handshake
+-- and the announcement are held, in order, until the announcement comes
+-- through the queue. Before, they were passed on at once, ahead of the
+-- announcement, and the chain dropped the headers of a peer it did not know
+-- yet.
+--
+-- = Handling
+--
 -- A message from a peer is handled to completion before the peer may send
 -- another one past its small allowance of pending messages (see
 -- 'maxPendingMessages'), so that the node's own queues cannot grow faster
@@ -263,28 +284,63 @@ chainEvents mgr input output = loopForever $ do
 --
 -- Messages for the peer manager, which is quick, are handled the same way,
 -- except @version@ and @verack@: the loop waits for those, since whether the
--- next message of that peer is taken depends on them.
+-- next message of that peer is taken depends on them. Once the peer manager
+-- has handled one, the loop asks it whether it announced the peer, and if
+-- so starts holding the messages of the peer until the announcement comes.
 --
 -- Messages reach the application only from online peers, except @version@
--- and @verack@, which are the handshake itself. Bitcoin Core ignores
--- anything else a peer sends before the handshake is done, and so does the
--- node: a peer whose version may still be refused cannot feed the
--- application blocks and transactions.
+-- and @verack@, which are the handshake itself and come before
+-- 'PeerConnected'. Bitcoin Core ignores anything else a peer sends before
+-- the handshake is done, and so does the node: a peer whose version may
+-- still be refused cannot feed the application blocks and transactions.
+-- Pings are answered from the start.
+--
+-- Each message is disposed of exactly once, by one of the actions of the
+-- machine, and gives back the allowance of its peer exactly once.
 peerEvents ::
   Chain -> PeerMgr -> Inbox PeerEvent -> Publisher NodeEvent -> IO ()
-peerEvents ch mgr input output = loopForever $ do
-  event <- receive input
-  case event of
-    PeerConnected p -> do
-      chainPeerConnected ch p
-      atomically (forward event)
-    PeerDisconnected p -> do
-      chainPeerDisconnected ch p
-      atomically (forward event)
-    PeerMessage p m -> do
-      ticklePeer mgr p
-      online <- isOnline p
-      let done
+peerEvents ch mgr input output = go R.newRouter
+  where
+    go !router = do
+      event <- receive input
+      router' <- route router $ case event of
+        PeerConnected p -> R.Connected p
+        PeerDisconnected p -> R.Disconnected p
+        PeerMessage p m -> R.Arrived p m
+      go router'
+    route router i = do
+      let (router', actions) = R.stepRouter i router
+      foldM perform router' actions
+    perform router = \case
+      R.Announce p -> do
+        chainPeerConnected ch p
+        atomically (forward (PeerConnected p))
+        return router
+      R.Retire p -> do
+        chainPeerDisconnected ch p
+        atomically (forward (PeerDisconnected p))
+        return router
+      R.Discard p _ -> do
+        atomically (peerMessageDoneSTM p)
+        return router
+      R.Early p m -> do
+        ticklePeer mgr p
+        handle False p m
+        -- the handshake may be complete now; if the peer manager announced
+        -- the peer, hold its next messages until the announcement comes
+        if handshake m
+          then do
+            announced <- maybe False (.state.announced) <$> getOnlinePeer mgr p
+            if announced then route router (R.HandshakeDone p) else return router
+          else return router
+      R.Deliver p m -> do
+        ticklePeer mgr p
+        online <- isOnline p
+        handle online p m
+        return router
+    handle online p m = do
+      let event = PeerMessage p m
+          done
             | handshake m || online = forward event >> peerMessageDoneSTM p
             | otherwise = peerMessageDoneSTM p
           now = atomically done
@@ -307,7 +363,6 @@ peerEvents ch mgr input output = loopForever $ do
             bhs@(_ : _) <- [BlockHash iv.invHash | iv <- ivs, isBlock iv] ->
               chainBlocksAnnounced ch p bhs >> later (chainThen ch)
         _ -> now
-  where
     forward event = publishSTM (PeerEvent event) output
     isOnline p =
       getOnlinePeer mgr p <&> \case

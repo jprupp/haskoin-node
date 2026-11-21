@@ -55,10 +55,66 @@ connection, and haskoin-core 3.0, for haskoin-store 2.0.0.
   the program on an address that is not IPv4 or IPv6. A peer or a DNS seed
   can never give a Unix address.
 
+### Fixed
+- **A peer is announced before its messages.** A peer's messages come from
+  its reader and its announcement from the peer manager, through one queue
+  with no order between them. Messages sent right behind the handshake could
+  reach the chain and the application before `PeerConnected`, and the chain
+  dropped the headers of a peer it did not know yet. The router now runs a
+  pure machine (`Haskoin.Node.Router`) that holds such messages until the
+  announcement comes through the queue: for each peer, `PeerConnected` comes
+  before any message past the handshake, and `PeerDisconnected` after all
+  of them.
+- **A disconnection always ends.** `killPeer` queued `KillPeer` behind the
+  messages to send, and a writer blocked on a peer that stopped reading
+  never took it: the connection kept its slot and network group forever,
+  and `PeerDisconnected` never came. The process now races its connection
+  against a `closing` flag that `killPeer` sets, and the peer manager
+  cancels the thread of a process that is still there a timeout after it
+  was told to disconnect (the new `Abort` action of
+  `Haskoin.Node.PeerMgr.Lifecycle`). `killPeer` no longer sends the
+  messages queued before it.
+- **Requests end when their peer goes.** `getData`, `getBlocks`, `getTxs`
+  and `pingPeer` give `Nothing` or `False` at once when `PeerDisconnected`
+  comes for their peer, or when the peer is closing as they start, rather
+  than wait for the timeout.
+- **Requests on one peer no longer disturb each other.** Two at once took
+  each other's blocks and failed as out of order, and so did a request after
+  one that timed out, from its late answers. Requests now run one at a time
+  per peer, the timeout counting the wait, and a request first ignores what
+  the peer sends until the pong of the request before it, if that is still
+  owed.
+- **The model of a peer never sees time go back.** Two threads sending at
+  once read the clock before their transactions and could commit in the
+  other order. The model keeps the latest time it has seen, and judges with
+  the later of that and the time of the facts (`remoteClock`).
+
 ### Changed
+- **Every concurrent protocol is a pure machine.** The new
+  [docs/concurrency.md](docs/concurrency.md) says, for every thread, what it
+  owns, the machine that decides what it does, and why no two threads can
+  race. The README links it.
+- `Stage`: `Disconnecting` holds when the disconnection began, as
+  `Disconnecting reason time`. `PeerInput`: `GotHandshake` and `Refused`
+  take the time first. `PeerAction` has `Abort`.
+- `Haskoin.Node.Peer.Request`: `stepRequest` takes a `RequestInput`
+  (`Received` a message, or `Disconnected`), and `newRequest` takes first
+  the nonce of the ping that the request before it is still owed, if any.
+  A notfound or block for an item not asked for is ignored, as before; the
+  rule is now written down.
+- `Peer` has three new fields, `closing`, `requestLock` and `owed`.
+  `wrapPeer` is gone: `newPeer` is the one way to build a `Peer`.
+- `peerMessageDone` documents its invariant: once for each message, by one
+  consumer. The router disposes of every message exactly once.
+- Tests: QuickCheck properties of the router over arbitrary interleavings of
+  three peers, of the abort of a disconnection, of requests after an owed
+  pong and of the model's clock; a peer process that stops while its writer
+  is blocked; requests that end when their peer goes; overlapping requests
+  and the late answers of a request that timed out; and a node that
+  publishes a peer before the burst it sends right behind its handshake.
 - `PeerConfig` has two new fields, `bestBlock` and `remote` (the model when
-  the connection opens). `Peer` has two, `remote` and `facts`, and
-  `wrapPeer` takes the model's variable. Build a `Peer` with `newPeer`.
+  the connection opens). `Peer` has two, `remote` and `facts`. Build a
+  `Peer` with `newPeer`.
   `PeerMessage` has a new constructor, `NotSent`, for a message that the
   model refused, which the peer process logs.
 - **Tests of an honest peer run against real nodes.** What the mock peers

@@ -55,7 +55,10 @@
 --
 -- * __A dropped peer is gone at once.__ A peer told to disconnect is no longer
 --   offered by 'getPeers' and its messages are no longer routed, even before
---   its connection closes.
+--   its connection closes. Its process stops at once ('killPeer'), and one
+--   that is still there a timeout later has its thread cancelled (the
+--   'Abort' of "Haskoin.Node.PeerMgr.Lifecycle"), so that a peer that stopped
+--   reading cannot keep its slot.
 --
 -- * __Bad addresses wait.__ An address that fails is tried again later each
 --   time, and one whose peer broke the protocol is not tried again for a long
@@ -102,11 +105,11 @@ module Haskoin.Node.PeerMgr
 where
 
 import Control.Applicative ((<|>))
-import Control.Concurrent (threadDelay)
-import Control.Concurrent.Async (Async, ExceptionInLinkedThread (..), link, withAsync)
+import Control.Concurrent (forkIO, threadDelay)
+import Control.Concurrent.Async (Async, ExceptionInLinkedThread (..), cancel, link, withAsync)
 import Control.Concurrent.STM
 import Control.Exception (SomeException, fromException)
-import Control.Monad (forM_, when, (<=<))
+import Control.Monad (forM_, void, when, (<=<))
 import Data.Function (on)
 import Data.List (find, sort)
 import Data.Maybe (fromMaybe)
@@ -263,7 +266,7 @@ instance HasField "verack" OnlinePeer Bool where
   getField o = case o.state.stage of
     Handshaking h -> hasVerAck h
     Online _ _ -> True
-    Disconnecting _ -> False
+    Disconnecting _ _ -> False
 
 -- | Time and nonce of the ping awaiting an answer, if any.
 instance HasField "ping" OnlinePeer (Maybe (UTCTime, Word64)) where
@@ -331,10 +334,13 @@ dispatch mgr = \case
   PeerVersion p v -> do
     logDebug mgr.config.logger ("Received version from peer " <> p.label)
     nonces <- map (.nonce) <$> readTVarIO mgr.peers
-    peerInput mgr p $ either Refused (GotHandshake . GotVersion) (checkVersion mgr.config.net nonces v)
+    now <- getCurrentTime
+    peerInput mgr p $
+      either (Refused now) (GotHandshake now . GotVersion) (checkVersion mgr.config.net nonces v)
   PeerVerAck p -> do
     logDebug mgr.config.logger ("Received version ack from peer " <> p.label)
-    peerInput mgr p (GotHandshake GotVerAck)
+    now <- getCurrentTime
+    peerInput mgr p (GotHandshake now GotVerAck)
   PeerPong p n -> do
     now <- getCurrentTime
     peerInput mgr p (GotPong now n)
@@ -377,6 +383,13 @@ peerInput mgr p input = do
           mgr.config.logger
           ("Disconnecting peer " <> p.label <> ": " <> cs (show r))
         killPeer p
+      Abort r -> do
+        logWarn
+          mgr.config.logger
+          ("Cancelling peer " <> p.label <> ", which did not stop in time: " <> cs (show r))
+        -- in a thread of its own, since 'cancel' waits for the thread to end
+        -- and the peer manager must not
+        void (forkIO (cancel o.async))
 
 -- | Record that a peer just sent a message, so that it is not disconnected for
 -- being idle. "Haskoin.Node" calls this for every message received.
@@ -446,9 +459,9 @@ peerDied mgr a e = do
 connectionOutcome :: PeerState -> Maybe SomeException -> Outcome
 connectionOutcome st e =
   case (st.stage, peerException =<< e) of
-    (Disconnecting TooOld, _) -> Disconnected
-    (Disconnecting (Rejected _), _) -> Misbehaved
-    (Disconnecting _, _) -> Failed
+    (Disconnecting TooOld _, _) -> Disconnected
+    (Disconnecting (Rejected _) _, _) -> Misbehaved
+    (Disconnecting _ _, _) -> Failed
     (_, Just ConnectionClosed)
       | st.announced -> Disconnected
       | otherwise -> Failed

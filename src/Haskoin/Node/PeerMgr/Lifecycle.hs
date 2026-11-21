@@ -20,11 +20,22 @@
 --   exactly like an online one until its process died: it was still offered
 --   to applications, still had its messages routed, and could be told to
 --   disconnect again. 'Disconnecting' makes that window explicit, and every
---   input in it is ignored.
+--   input in it is ignored but the clock.
+--
+-- * __A disconnection always ends.__ Telling a peer process to disconnect
+--   is a request, and a process can fail to carry it out: one blocked in a
+--   write to a peer that stopped reading never looked at its mailbox, and
+--   the connection kept its slot and its network group forever, with no
+--   'Haskoin.Node.Peer.PeerDisconnected'. So 'Disconnecting' records when it
+--   began, and a 'Tick' more than the timeout later gives 'Abort': the peer
+--   manager cancels the thread of the process, which then dies like any
+--   other, and its end is handled as usual. 'Abort' comes again after each
+--   further timeout until the process is gone, so a cancellation that did not
+--   take is tried again.
 --
 -- * __Time is an input.__ The rules about silence, pings and age depend on
---   the clock. Instead of reading it, 'stepPeer' takes the time in 'Tick',
---   'Heard' and 'GotPong'. Every timing rule can then be tested by passing
+--   the clock. Instead of reading it, 'stepPeer' takes the time in every
+--   input. Every timing rule can then be tested by passing
 --   times, without waiting.
 --
 -- * __Randomness is an input.__ A ping needs a fresh nonce. 'Tick' carries
@@ -61,8 +72,9 @@ data Stage
   | -- | the handshake is complete; holds the version of the peer and the ping
     -- awaiting an answer, with the time it was sent and its nonce
     Online !Version !(Maybe (UTCTime, Word64))
-  | -- | the peer was told to disconnect, for the given reason
-    Disconnecting !DisconnectReason
+  | -- | the peer was told to disconnect, for the given reason, at the given
+    -- time, or the time of its last 'Abort'
+    Disconnecting !DisconnectReason !UTCTime
   deriving stock (Eq, Show)
 
 -- | Why the node disconnects from a peer.
@@ -108,10 +120,11 @@ data Limits = Limits
 data PeerInput
   = -- | the peer sent a message at the given time
     Heard !UTCTime
-  | -- | the peer sent a handshake message
-    GotHandshake !HandshakeEvent
-  | -- | the version of the peer was refused (see 'checkVersion')
-    Refused !HandshakeError
+  | -- | the peer sent a handshake message, handled at the given time
+    GotHandshake !UTCTime !HandshakeEvent
+  | -- | the version of the peer was refused (see 'checkVersion'), at the
+    -- given time
+    Refused !UTCTime !HandshakeError
   | -- | the peer answered a ping with the given nonce at the given time
     GotPong !UTCTime !Word64
   | -- | the clock ticked; holds the time, and a nonce for a ping if one is due
@@ -128,6 +141,9 @@ data PeerAction
     SendPing !Word64
   | -- | tell the peer process to disconnect
     Disconnect !DisconnectReason
+  | -- | the peer process was told to disconnect more than the timeout ago
+    -- and is still there: cancel its thread
+    Abort !DisconnectReason
   deriving stock (Eq, Show)
 
 -- | A connection opened at the given time, with our version sent.
@@ -146,15 +162,22 @@ newPeerState now =
 -- On a 'Tick', the checks come in this order: the connection is too old, the
 -- peer has been silent too long, the handshake took too long, a ping went
 -- unanswered too long. If none applies and no ping is pending, a ping is sent.
+--
+-- While 'Disconnecting', only a 'Tick' counts: once more than the timeout has
+-- passed since the disconnection began, or since the last 'Abort', it gives
+-- 'Abort'.
 stepPeer :: Limits -> PeerInput -> PeerState -> (PeerState, [PeerAction])
 stepPeer limits input st =
   case (st.stage, input) of
-    (Disconnecting _, _) -> (st, [])
+    (Disconnecting r began, Tick now _)
+      | now `diffUTCTime` began > limits.timeout ->
+          (st {stage = Disconnecting r now}, [Abort r])
+    (Disconnecting _ _, _) -> (st, [])
     (_, Heard t) -> (st {lastHeard = t}, [])
-    (_, Refused e) -> disconnect (Rejected e)
-    (Handshaking h, GotHandshake e) -> handshake h e
-    (Online _ _, GotHandshake (GotVersion _)) -> disconnect (Rejected DuplicateVersion)
-    (Online _ _, GotHandshake GotVerAck) -> disconnect (Rejected DuplicateVerAck)
+    (_, Refused t e) -> disconnect t (Rejected e)
+    (Handshaking h, GotHandshake t e) -> handshake t h e
+    (Online _ _, GotHandshake t (GotVersion _)) -> disconnect t (Rejected DuplicateVersion)
+    (Online _ _, GotHandshake t GotVerAck) -> disconnect t (Rejected DuplicateVerAck)
     (Online v (Just (sent, n)), GotPong t n')
       | n == n' ->
           ( st
@@ -165,23 +188,23 @@ stepPeer limits input st =
           )
     (_, GotPong _ _) -> (st, [])
     (stage, Tick now nonce)
-      | now `since` st.connected > limits.maxLife -> disconnect TooOld
-      | now `since` st.lastHeard > limits.timeout -> disconnect Silent
+      | now `since` st.connected > limits.maxLife -> disconnect now TooOld
+      | now `since` st.lastHeard > limits.timeout -> disconnect now Silent
       | Handshaking _ <- stage,
         now `since` st.connected > limits.timeout ->
-          disconnect HandshakeTimeout
+          disconnect now HandshakeTimeout
       | Online _ (Just (sent, _)) <- stage,
         now `since` sent > limits.timeout ->
-          disconnect NoPong
+          disconnect now NoPong
       | Online v Nothing <- stage ->
           (st {stage = Online v (Just (now, nonce))}, [SendPing nonce])
       | otherwise -> (st, [])
   where
     since = diffUTCTime
-    disconnect r = (st {stage = Disconnecting r}, [Disconnect r])
-    handshake h e =
+    disconnect t r = (st {stage = Disconnecting r t}, [Disconnect r])
+    handshake t h e =
       case stepHandshake h e of
-        Left err -> disconnect (Rejected err)
+        Left err -> disconnect t (Rejected err)
         Right (Established v, acts) ->
           (st {stage = Online v Nothing, announced = True}, map action acts)
         Right (h', acts) -> (st {stage = Handshaking h'}, map action acts)
@@ -200,7 +223,7 @@ stageVersion :: PeerState -> Maybe Version
 stageVersion st = case st.stage of
   Handshaking h -> handshakeVersion h
   Online v _ -> Just v
-  Disconnecting _ -> Nothing
+  Disconnecting _ _ -> Nothing
 
 -- | The ping awaiting an answer: when it was sent, and its nonce.
 pendingPing :: PeerState -> Maybe (UTCTime, Word64)

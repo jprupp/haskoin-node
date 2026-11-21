@@ -151,6 +151,29 @@ spec = do
       v.version `shouldBe` 70012
       v.startHeight `shouldBe` 650000
       v.timestamp `shouldBe` 1700000000
+  describe "order of peer events" $ do
+    it "publishes a peer as connected before the messages it sends right after its handshake" $ do
+      -- the mock peer sends a burst right behind its verack, which used to
+      -- reach the application ahead of the announcement of the peer
+      let burst = [Right (MOther "zz" (B.singleton i)) | i <- [1 .. 12]]
+          react = \case
+            MVersion _ -> Right MVerAck : burst
+            MPing (Ping n) -> [Right (MPong (Pong n))]
+            _ -> []
+          early = \case
+            MVersion _ -> True
+            MVerAck -> True
+            _ -> False
+      withTestNodeOpts (defOpts allBlocks) {react = react} net "burst-after-handshake" $
+        \TestNode {..} -> do
+          let next = receive nodeEvents >>= judgeEvent
+              judgeEvent = \case
+                PeerEvent (PeerConnected _) -> return Nothing
+                PeerEvent (PeerMessage _ m) | not (early m) -> return (Just (msgType m))
+                _ -> next
+          timeout (10 * 1000 * 1000) next `shouldReturn` Just Nothing
+          payloads <- timeout (10 * 1000 * 1000) . mapM (const (otherPayload nodeEvents)) $ burst
+          payloads `shouldBe` Just [B.singleton i | i <- [1 .. 12]]
   describe "untrusted peers" $ do
     it "disconnects a peer that sends more than 2000 headers"
       $ withTestNodeOpts
@@ -365,6 +388,13 @@ manyHeaders :: Network -> Int -> Message
 manyHeaders net n =
   MHeaders . Headers $
     map (,VarInt 0) (appendBlocks net 0 net.genesisHeader n)
+
+-- | The payload of the next unknown message that the node publishes.
+otherPayload :: Inbox NodeEvent -> IO ByteString
+otherPayload events =
+  receive events >>= \case
+    PeerEvent (PeerMessage _ (MOther "zz" payload)) -> return payload
+    _ -> otherPayload events
 
 -- | Wait for a peer to be announced, failing after a while.
 waitForPeer :: Inbox NodeEvent -> IO Peer

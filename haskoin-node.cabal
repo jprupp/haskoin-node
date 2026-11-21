@@ -28,6 +28,7 @@ extra-source-files:
 extra-doc-files:
     README.md
     CHANGELOG.md
+    docs/concurrency.md
 
 source-repository head
   type: git
@@ -51,6 +52,7 @@ library
       Haskoin.Node.PeerMgr.Addresses
       Haskoin.Node.PeerMgr.Handshake
       Haskoin.Node.PeerMgr.Lifecycle
+      Haskoin.Node.Router
   hs-source-dirs:
       src
   default-extensions:
@@ -100,6 +102,7 @@ test-suite spec
       Haskoin.Node.PeerMgrSpec
       Haskoin.Node.PeerSpec
       Haskoin.Node.RegtestSpec
+      Haskoin.Node.RouterSpec
       Haskoin.NodeSpec
       Haskoin.Node.Test
       Regtest.Podman

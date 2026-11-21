@@ -1,6 +1,7 @@
 module Haskoin.Node.Peer.RemoteSpec (spec) where
 
 import Data.Bits ((.|.))
+import Data.Int (Int64)
 import Data.Set qualified as Set
 import Data.Word (Word64)
 import Haskoin
@@ -9,6 +10,8 @@ import Haskoin.Node (buildVersion)
 import Haskoin.Node.Peer.Remote
 import Network.Socket (SockAddr (..))
 import Test.Hspec
+import Test.Hspec.QuickCheck (prop)
+import Test.QuickCheck ((.&&.), (===))
 
 spec :: Spec
 spec = do
@@ -59,6 +62,22 @@ spec = do
       let iv = InvVector InvMerkleBlock (headerHash btc.genesisHeader).get
       fst (judge (facts btc) (MGetData (GetData [iv])) (handshaken btc Set.empty plain))
         `shouldSatisfy` refused
+
+  describe "the clock of the model" $ do
+    -- two threads that send to a peer at once read the clock, then commit
+    -- in either order: the facts of a later commit can be older
+    prop "never goes back, whatever the order of the times of the facts" $ \(ts :: [Int64]) ->
+      let start = handshaken btc Set.empty plain
+          tick r t = snd (judge (facts btc) {now = t} MSendHeaders r)
+          clocks = map remoteClock (scanl tick start ts)
+       in and (zipWith (<=) clocks (drop 1 clocks))
+            .&&. clocks === scanl max (remoteClock start) ts
+    it "starts at the time the connection opened" $
+      remoteClock (newRemote btc Set.empty AddrIPv4 False 1234 7) `shouldBe` 1234
+    it "keeps its time when the facts are older" $ do
+      let r = snd (judge (facts btc) MSendHeaders (handshaken btc Set.empty plain))
+          r' = snd (judge (facts btc) {now = 5} MSendHeaders r)
+      remoteClock r' `shouldBe` remoteClock r
 
   describe "the answer to a refused transaction" $ do
     it "is a reject on Bitcoin Cash Node" $ expectsReject bch ours `shouldBe` True

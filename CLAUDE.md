@@ -52,6 +52,16 @@ change touches:
 If a change needs no documentation update, say so explicitly when you report
 the change, with the reason.
 
+## Concurrency
+
+`docs/concurrency.md` says, for every thread, what state it owns, the pure
+machine that decides what it does, and why no two threads can race. Read the
+part about a protocol before you change it, and keep it true: a change to a
+thread, to the state it shares, or to a machine of a concurrent protocol
+updates it in the same commit. A new concurrent protocol gets a pure machine
+in a module of its own, with QuickCheck properties that drive it through
+arbitrary sequences of events.
+
 ## How to write documentation here
 
 Documentation explains the purpose and spirit of the code, not only its

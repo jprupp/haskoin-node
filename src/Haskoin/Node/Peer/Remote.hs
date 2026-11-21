@@ -49,6 +49,17 @@
 --   happen. A message is refused only for what the rules decide whatever the
 --   chain holds.
 --
+-- = Time only goes forward
+--
+-- The machine has timers, and it reads the time of each message from its
+-- t'Facts'. Two threads that send to one peer at once read the clock first,
+-- and commit their judgements one after the other in a transaction, in an
+-- order that need not be the order of their clocks. The machine would then
+-- see time go backwards. So a t'Remote' keeps the latest time it has seen
+-- ('remoteClock'), and 'judge' and 'predict' use the later of that and the
+-- time of the facts: the clamp is part of the transition, and so of the one
+-- transaction that judges and commits a message.
+--
 -- = Why not a list of rules here
 --
 -- haskoin-node used to know such rules one at a time, written where they were
@@ -64,6 +75,7 @@ module Haskoin.Node.Peer.Remote
     remoteConnection,
     learnVersion,
     learnedVersion,
+    remoteClock,
 
     -- * Judging messages
     Facts (..),
@@ -103,7 +115,10 @@ data Remote = Remote
     -- options that the version gives
     replay :: ![(P.Env, Message)],
     -- | the state of the machine
-    connection :: !P.Connection
+    connection :: !P.Connection,
+    -- | the latest time that the machine has seen, which no later judgement
+    -- goes below
+    clock :: !P.Micros
   }
 
 -- | A model for a connection to a node of this network. This node opened
@@ -128,7 +143,8 @@ newRemote net perms addrNet local opened seed =
       setup = s,
       version = Nothing,
       replay = [],
-      connection = P.start m s
+      connection = P.start m s,
+      clock = opened
     }
   where
     m = P.machine net
@@ -152,6 +168,12 @@ remoteSetup r = r.setup
 -- "Haskoin.Network.Protocol.BitcoinCashNode".
 remoteConnection :: Remote -> P.Connection
 remoteConnection r = r.connection
+
+-- | The latest time that the machine has seen, in microseconds: the time
+-- the connection opened, or the latest time of the facts of a message judged
+-- since. Every judgement takes the later of this and the time of its facts.
+remoteClock :: Remote -> P.Micros
+remoteClock r = r.clock
 
 -- | The version message of the node, once 'learnVersion' has seen it.
 learnedVersion :: Remote -> Maybe Version
@@ -186,7 +208,8 @@ learnVersion v r
           o {BCHN.peerBloomFilters = bloom, BCHN.prune = pruned, BCHN.blocksOnly = blocksOnly}
 
 -- | What this node knows of the chain when it judges a message: the time,
--- its best header, and its headers of the blocks that the message names.
+-- its best header, and its headers of the blocks that the message names. A
+-- time earlier than the 'remoteClock' of the model counts as that clock.
 data Facts = Facts
   { now :: !P.Micros,
     best :: !BlockNode,
@@ -221,11 +244,16 @@ judge facts out r = let (effects, r') = predict facts out r in (classify effects
 -- | What the node would do with a message, effect by effect, and the model
 -- as it is after the node got it: what 'judge' decides from. The tests use
 -- it to compare the model with a running node.
+--
+-- The machine sees the later of the time of the facts and 'remoteClock', and
+-- the model keeps it as its clock, so that the time the machine sees never
+-- goes back, whatever order the threads that read the clock commit in.
 predict :: Facts -> Message -> Remote -> ([P.Effect], Remote)
 predict facts out r =
-  (effects, r {connection = c, replay = replay'})
+  (effects, r {connection = c, replay = replay', clock = t})
   where
-    env = factsEnv (P.networkOf r.machine) facts
+    t = max r.clock facts.now
+    env = factsEnv (P.networkOf r.machine) facts {now = t}
     (c, effects) = P.step env r.connection (P.Receive out)
     replay' = case r.version of
       Nothing -> (env, out) : r.replay

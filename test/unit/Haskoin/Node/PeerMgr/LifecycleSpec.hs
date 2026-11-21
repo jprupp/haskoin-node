@@ -37,7 +37,7 @@ feed st0 = foldl' go (st0, [])
 
 -- | A connection that completed the handshake.
 online :: [PeerInput]
-online = [GotHandshake (GotVersion version), GotHandshake GotVerAck]
+online = [GotHandshake t0 (GotVersion version), GotHandshake t0 GotVerAck]
 
 -- | A random input.
 newtype Input = Input PeerInput
@@ -48,8 +48,8 @@ instance Arbitrary Input where
     Input
       <$> oneof
         [ Heard <$> time,
-          GotHandshake <$> elements [GotVersion version, GotVerAck],
-          Refused <$> elements [NotFullNode, NotWitnessNode, ConnectedToSelf],
+          GotHandshake <$> time <*> elements [GotVersion version, GotVerAck],
+          Refused <$> time <*> elements [NotFullNode, NotWitnessNode, ConnectedToSelf],
           GotPong <$> time <*> nonce,
           Tick <$> time <*> nonce
         ]
@@ -68,21 +68,21 @@ spec = describe "connection lifecycle" $ do
       actions `shouldBe` [ReplyVerAck, Announce]
 
     it "accepts the verack first" $
-      snd (run [GotHandshake GotVerAck, GotHandshake (GotVersion version)])
+      snd (run [GotHandshake t0 GotVerAck, GotHandshake t0 (GotVersion version)])
         `shouldBe` [ReplyVerAck, Announce]
 
     it "disconnects a peer that repeats a handshake message once online" $
-      snd (run (online <> [GotHandshake GotVerAck]))
+      snd (run (online <> [GotHandshake t0 GotVerAck]))
         `shouldBe` [ReplyVerAck, Announce, Disconnect (Rejected DuplicateVerAck)]
 
     it "disconnects a peer whose version was refused" $ do
-      let (st, actions) = run [Refused ConnectedToSelf]
+      let (st, actions) = run [Refused t0 ConnectedToSelf]
       actions `shouldBe` [Disconnect (Rejected ConnectedToSelf)]
-      st.stage `shouldBe` Disconnecting (Rejected ConnectedToSelf)
+      st.stage `shouldBe` Disconnecting (Rejected ConnectedToSelf) t0
 
     it "disconnects a peer that does not complete the handshake in time" $
       -- chatter keeps the peer from being silent, but not from timing out
-      snd (run [GotHandshake GotVerAck, Heard (at 9), Tick (at 11) 1])
+      snd (run [GotHandshake t0 GotVerAck, Heard (at 9), Tick (at 11) 1])
         `shouldBe` [Disconnect HandshakeTimeout]
 
   describe "pings" $ do
@@ -134,11 +134,47 @@ spec = describe "connection lifecycle" $ do
     it "rotates before checking anything else" $
       snd (run [Tick (at 101) 1]) `shouldBe` [Disconnect TooOld]
 
+  describe "disconnection" $ do
+    it "waits a timeout for the peer process to stop" $
+      snd (run [Refused (at 1) NotFullNode, Tick (at 5) 1, Tick (at 11) 2])
+        `shouldBe` [Disconnect (Rejected NotFullNode)]
+
+    it "aborts a peer process that has not stopped a timeout after it was told to" $ do
+      -- a peer that stopped reading leaves its writer blocked, and the
+      -- process never sees that it was told to disconnect
+      let (st, actions) = run [Refused (at 1) NotFullNode, Tick (at 12) 2]
+      actions `shouldBe` [Disconnect (Rejected NotFullNode), Abort (Rejected NotFullNode)]
+      st.stage `shouldBe` Disconnecting (Rejected NotFullNode) (at 12)
+
+    it "aborts again after each further timeout" $
+      drop 1 (snd (run [Refused (at 1) NotFullNode, Tick (at 12) 2, Tick (at 20) 3, Tick (at 23) 4]))
+        `shouldBe` [Abort (Rejected NotFullNode), Abort (Rejected NotFullNode)]
+
+    it "stamps a disconnection by the clock with the time of the tick" $
+      fst (run (online <> [Tick (at 11) 1])) `shouldSatisfy` \st ->
+        st.stage == Disconnecting Silent (at 11)
+
   describe "properties" $ do
-    prop "ignores everything once disconnecting" $ \(ins :: [Input]) ->
+    prop "only aborts once disconnecting" $ \(ins :: [Input]) ->
       let inputs = [i | Input i <- ins]
-       in let (st, _) = run [Refused NotFullNode]
-           in snd (feed st inputs) === []
+       in let (st, _) = run [Refused t0 NotFullNode]
+           in all (== Abort (Rejected NotFullNode)) (snd (feed st inputs))
+
+    prop "aborts a disconnection that has not ended a timeout after it began" $ \(ins :: [Input]) ->
+      let inputs = [i | Input i <- ins]
+       in case (run inputs) of
+            (st@PeerState {stage = Disconnecting r began}, _) ->
+              snd (stepPeer limits (Tick (11 `addUTCTime` began) 1) st) === [Abort r]
+            _ -> property True
+
+    prop "aborts only after telling the peer to disconnect, for the same reason" $ \(ins :: [Input]) ->
+      let inputs = [i | Input i <- ins]
+          ok told = \case
+            [] -> True
+            Disconnect r : rest -> ok (Just r) rest
+            Abort r : rest -> told == Just r && ok told rest
+            _ : rest -> ok told rest
+       in ok Nothing (snd (run inputs))
 
     prop "announces a peer at most once, and remembers it" $ \(ins :: [Input]) ->
       let inputs = [i | Input i <- ins]
@@ -157,6 +193,6 @@ spec = describe "connection lifecycle" $ do
       let inputs = [i | Input i <- ins]
        in let (st, _) = run inputs
               disconnecting = case st.stage of
-                Disconnecting _ -> True
+                Disconnecting _ _ -> True
                 _ -> False
            in isOnline st === (st.announced && not disconnecting)

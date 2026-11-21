@@ -18,6 +18,7 @@ tested-with: GHC == 9.12.4
 extra-doc-files:
   - README.md
   - CHANGELOG.md
+  - docs/concurrency.md
 extra-source-files:
   - test/regtest/Containerfile
   - test/regtest/install-nodes.sh
