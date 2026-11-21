@@ -14,4 +14,4 @@ extra-deps:
   - git: https://github.com/jprupp/podman-test.git
     commit: 607ddbe2c503b67a25581ed9e167f94fdf27c785
   - git: https://github.com/jprupp/haskoin-core.git
-    commit: 91c4a092bdec9802dac13137249a551ab909989b
+    commit: 51661822f03719e2de3f735fb590f2849925413d
