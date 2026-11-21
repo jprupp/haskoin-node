@@ -344,41 +344,6 @@ spec = do
             Just m -> mapM_ (remoteSend t.remote) (f m) >> remote_loop t f
         pong (MPing (Ping n)) = [MPong (Pong n)]
         pong _ = []
-        honest = \case
-          MGetData (GetData ivs) ->
-            [MBlock b | iv <- ivs, b <- blocks, block_iv b == iv]
-          m -> pong m
-
-    it "downloads blocks" $ withPeerTest net $ \t -> serve t honest $ do
-      r <- getBlocks net 5 t.peer (map bhash (take 3 blocks))
-      r `shouldBe` Just (take 3 blocks)
-
-    it "ignores unrelated messages while downloading" $
-      withPeerTest net $ \t -> do
-        let noisy = \case
-              MGetData (GetData ivs) ->
-                concat
-                  [ [MBlock b, MPing (Ping 5), MInv (Inv [block_iv b])]
-                  | iv <- ivs,
-                    b <- blocks,
-                    block_iv b == iv
-                  ]
-              m -> pong m
-        serve t noisy $ do
-          r <- getBlocks net 5 t.peer (map bhash (take 3 blocks))
-          r `shouldBe` Just (take 3 blocks)
-
-    it "fails when a requested block is not found" $
-      withPeerTest net $ \t -> do
-        let f = \case
-              MGetData (GetData (iv : _)) -> [MNotFound (NotFound [iv])]
-              m -> pong m
-        serve t f $
-          getBlocks net 5 t.peer [bhash b0] `shouldReturn` Nothing
-
-    it "times out when the peer does not answer" $
-      withPeerTest net $ \t ->
-        getBlocks net 1 t.peer [bhash b0] `shouldReturn` Nothing
 
     it "gives nothing and drops a peer whose block does not match its header" $
       withPeerTest net $ \t -> do
@@ -390,15 +355,6 @@ spec = do
         expectFailure t $ \case
           MutatedBlock h BadMerkleRoot -> h == bhash b0
           _ -> False
-
-    it "returns a SegWit block that Bitcoin Core mined, with its witness" $
-      withPeerTestKnowing net [(parent302, 301)] $ \t -> do
-        let f = \case
-              MGetData _ -> [MBlock coreSegWitBlock]
-              m -> pong m
-        serve t f $
-          getBlocks net 5 t.peer [bhash coreSegWitBlock]
-            `shouldReturn` Just [coreSegWitBlock]
 
     it "gives nothing and drops a peer that stripped the witness of a SegWit block" $
       withPeerTestKnowing net [(parent302, 301)] $ \t -> do
@@ -432,20 +388,3 @@ spec = do
         serve t f $
           getBlocks net 5 t.peer [bhash coreSegWitBlock]
             `shouldReturn` Just [stripped coreSegWitBlock]
-
-    it "downloads transactions" $ withPeerTest net $ \t -> do
-      let txs = concatMap (.txs) blocks
-          tx_iv tx = InvVector InvWitnessTx (txHash tx).get
-          f = \case
-            MGetData (GetData ivs) ->
-              [MTx tx | iv <- ivs, tx <- txs, tx_iv tx == iv]
-            m -> pong m
-      serve t f $
-        getTxs net 5 t.peer (map txHash (take 2 txs))
-          `shouldReturn` Just (take 2 txs)
-
-    it "pings the peer" $ withPeerTest net $ \t -> do
-      serve t pong $ pingPeer 5 t.peer `shouldReturn` True
-
-    it "reports an unanswered ping" $ withPeerTest net $ \t ->
-      pingPeer 1 t.peer `shouldReturn` False

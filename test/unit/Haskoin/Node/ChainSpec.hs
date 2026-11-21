@@ -65,6 +65,7 @@ connectPeer ct label = do
 describeMessage :: PeerMessage -> String
 describeMessage KillPeer = "disconnection"
 describeMessage (SendMessage m) = show (commandToString (msgType m))
+describeMessage (NotSent m _) = "refused " <> show (commandToString (msgType m))
 
 -- | Next header request sent to the peer, skipping 'MSendHeaders'.
 expectGetHeaders :: FakePeer -> IO GetHeaders

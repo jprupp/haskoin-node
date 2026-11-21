@@ -15,8 +15,9 @@ connection, and haskoin-core 3.0, for haskoin-store 2.0.0.
 - **A model of each peer's node.** Every connection runs the state machine
   of haskoin-core's `Haskoin.Network.Protocol` for its network: Bitcoin
   Core 32.1 or Bitcoin Cash Node 29.2.0, translated from their source, with
-  this node as the peer (`Haskoin.Node.Peer.Remote`). The peer process
-  judges every message before sending it. One that the node would punish
+  this node as the peer (`Haskoin.Node.Peer.Remote`). `sendMessage`
+  judges every message as it queues it, so that the model sees the messages
+  in the order in which they go out. One that the node would punish
   (ban score, discouragement, a ban, or a disconnection for a rule of the
   protocol) is not sent, and the log says why, with the upstream line. A
   request in `getData`, `getBlocks` or `getTxs` that the node would drop
@@ -58,6 +59,21 @@ connection, and haskoin-core 3.0, for haskoin-store 2.0.0.
 - `PeerConfig` has two new fields, `bestBlock` and `remote` (the model when
   the connection opens). `Peer` has two, `remote` and `facts`, and
   `wrapPeer` takes the model's variable. Build a `Peer` with `newPeer`.
+  `PeerMessage` has a new constructor, `NotSent`, for a message that the
+  model refused, which the peer process logs.
+- **Tests of an honest peer run against real nodes.** What the mock peers
+  of the unit tests did as an honest node would, the regtest tests now
+  check against Bitcoin Core and Bitcoin Cash Node in Podman: a block as the
+  node keeps it, with its witness; a block of more than 2 MiB on Bitcoin
+  Cash; a peer that hangs (a node stopped with `SIGSTOP`), whose blocks and
+  pings give nothing and which is dropped; a peer kept past its longest
+  life; the pings of the node; a pruned node, refused; the wait before
+  trying a failed peer again; the minimum chain work; the parents of a
+  block; and no more requests for headers once the node has them all. The
+  mock versions are gone. Peers that break the rules stay scripted in
+  memory, since no real node does, and every peer of a test is named by a
+  Unix socket, not by an address and a port. Each node has two groups of
+  regtest tests, its chain and its one peer, which run at the same time.
 - Needs haskoin-core 3.0, for its protocol machines. 3.0 also reads the
   token prefix of Bitcoin Cash outputs (CashTokens) and adds a field to
   `Network`, which change nothing here: haskoin-node passes outputs on as

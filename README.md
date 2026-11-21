@@ -499,7 +499,7 @@ seed of haskoin-core is `localhost`, which is not, so list local peers in
 `connect` decides how to open a connection. `withConnection` opens a plain TCP
 socket, or a Unix socket for a peer written `unix:PATH`, and gives up if it
 does not open within five seconds (`connectTimeout`, as in Bitcoin Core).
-Replace it to go through a proxy, or to plug in mock peers in tests, as the
+Replace it to go through a proxy, or to plug in scripted peers in tests, as the
 test suite does.
 
 ### Peers on Unix sockets
@@ -726,8 +726,11 @@ The tests are one suite, `spec`, using [hspec](https://hspec.github.io/) and
 `stack test` runs all of them:
 
 - The unit tests (`test/unit`) test the state machines with properties, and
-  run the peer, peer manager, chain and node against in-memory mock peers.
-  They need no Internet access.
+  run the peer, peer manager, chain and node against peers scripted in
+  memory, which break the rules as no real node does: wrong magic,
+  oversized messages, forged blocks, a second `verack`. They need no
+  Internet access, and name their peers by Unix sockets, never by a port.
+  What an honest node does, the regtest tests show with real ones.
 - The regtest tests (`Haskoin.Node.RegtestSpec`) run the node against
   [Bitcoin Core](https://bitcoincore.org) and
   [Bitcoin Cash Node](https://bitcoincashnode.org) in regression test mode. The
@@ -739,8 +742,9 @@ The tests are one suite, `spec`, using [hspec](https://hspec.github.io/) and
   [podman-test](https://github.com/jprupp/podman-test), each in a pod with no
   network: the peer-to-peer port of each node is bridged to a Unix socket of
   the pod, and the node under test connects to it as the peer `unix:PATH`.
-  So runs never collide, and no port of the machine is taken. A container
-  may use 2 GiB of memory. The tests are skipped if Podman is missing, or if
+  So runs never collide, and no port of the machine is taken. A peer that
+  hangs is a node stopped with `SIGSTOP`. A container may use 2 GiB of
+  memory. The tests are skipped if Podman is missing, or if
   `HASKOIN_NODE_SKIP_REGTEST` or `PODMAN_TEST_SKIP` is set.
 
   ```sh

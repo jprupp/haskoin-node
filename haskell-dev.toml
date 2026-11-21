@@ -3,14 +3,15 @@
 
 # The spec modules that take most of the time of the tests. Each of their
 # groups is run apart, so that the test processes share them evenly. Their
-# groups can run at the same time: the mock peers are in memory, a socket
-# binds port 0, and a database is in a temporary folder of each process.
+# groups can run at the same time: the scripted peers are in memory, a
+# socket binds port 0, and a database is in a temporary folder of each
+# process.
 slow-specs = [
   "Haskoin.Node",
   "Haskoin.Node.Chain",
   "Haskoin.Node.Peer",
   "Haskoin.Node.PeerMgr",
-  # one group for each node implementation, each with pods of its own, whose
-  # nodes it reaches through sockets of the pod
+  # two groups for each node implementation, each with pods of its own,
+  # whose nodes it reaches through sockets of the pod
   "Haskoin.Node.Regtest",
 ]

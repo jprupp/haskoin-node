@@ -221,6 +221,10 @@ data PeerMessage
     KillPeer
   | -- | send a network message to the peer
     SendMessage !Message
+  | -- | a message that 'sendMessage' did not send, because the model of the
+    -- peer said that the peer would punish the node for it; the peer process
+    -- logs it, in the order of the messages that it sends
+    NotSent !Message !Judgement
 
 -- | Build a 'Peer' handle from its configuration, its lock (which starts
 -- 'Free'), its counter of pending messages, its model, which starts as the
@@ -281,9 +285,8 @@ gatherFacts cfg m = do
 factsLookups :: Int
 factsLookups = 64
 
--- | What the peer would do with a message if it were sent now, without
--- sending it. A message that the peer process sends is judged again then,
--- with the model as it is at that time.
+-- | What the peer would do with a message if it were queued now, after the
+-- messages queued before it, without queuing it.
 judgeMessage :: Peer -> Message -> IO Judgement
 judgeMessage p m = do
   f <- p.facts m
@@ -349,30 +352,21 @@ peer cfg@PeerConfig {label, net, pub, logger} p inbox =
           _ -> return ()
       publish (PeerMessage p m) pub
 
--- | Internal function to dispatch peer messages. A message to send is judged
--- by the model of the peer first, and dropped if the peer would punish the
--- node for it ('Refused').
+-- | Internal function to dispatch peer messages. 'sendMessage' judged each
+-- message as it queued it; one that the peer would punish the node for
+-- comes as 'NotSent', and is logged.
 dispatchMessage ::
   PeerConfig ->
   Peer ->
   PeerMessage ->
   ConduitT i Message IO Bool
-dispatchMessage PeerConfig {label, logger} p (SendMessage m) = do
-  f <- liftIO (p.facts m)
-  j <- liftIO . atomically $ do
-    (j, r) <- judge f m <$> readTVar p.remote
-    case j of
-      Refused _ _ -> return ()
-      _ -> writeTVar p.remote r
-    return j
-  let cmd = cs (show (msgType m))
-  case j of
-    Refused _ _ ->
-      liftIO . logWarn logger $
-        label <> " not sending cmd " <> cmd <> ": " <> judgementText j
-    _ -> do
-      liftIO $ logDebug logger (label <> " sending cmd " <> cmd)
-      yield m
+dispatchMessage PeerConfig {label, logger} _ (SendMessage m) = do
+  liftIO $ logDebug logger (label <> " sending cmd " <> cs (show (msgType m)))
+  yield m
+  return True
+dispatchMessage PeerConfig {label, logger} _ (NotSent m j) = do
+  liftIO . logWarn logger $
+    label <> " not sending cmd " <> cs (show (msgType m)) <> ": " <> judgementText j
   return True
 dispatchMessage PeerConfig {label, logger} _ KillPeer = do
   liftIO $ logDebug logger (label <> " disconnecting")
@@ -451,8 +445,19 @@ killPeer :: Peer -> IO ()
 killPeer p = KillPeer `send` p.mailbox
 
 -- | Send a network message to peer. Returns as soon as the message is queued.
+--
+-- The model of the peer judges the message as it is queued, in the same
+-- transaction, so that the model sees the messages in the order in which
+-- they go out ("Haskoin.Node.Peer.Remote"). A message that the peer would
+-- punish the node for is not sent; the peer process logs it.
 sendMessage :: Message -> Peer -> IO ()
-sendMessage m p = SendMessage m `send` p.mailbox
+sendMessage m p = do
+  f <- p.facts m
+  atomically $ do
+    (j, r) <- judge f m <$> readTVar p.remote
+    case j of
+      Refused _ _ -> NotSent m j `sendSTM` p.mailbox
+      _ -> writeTVar p.remote r >> SendMessage m `sendSTM` p.mailbox
 
 -- | Try to reserve a peer for a long conversation, such as syncing headers
 -- or downloading blocks. Returns 'True' if the peer was free and the owner now

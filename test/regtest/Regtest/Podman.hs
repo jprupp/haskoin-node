@@ -22,6 +22,8 @@ module Regtest.Podman
     withContainer,
     startNode,
     stopNode,
+    freezeNode,
+    thawNode,
     cli,
     hostAddress,
     nodeAddress,
@@ -162,6 +164,20 @@ stopNode c i = do
           threadDelay 100000 >> wait (n + 1)
   wait 0
   threadDelay 500000
+
+-- | Stop node number @i@ in its tracks, with @SIGSTOP@: its connections stay
+-- open and it answers nothing on them, as a peer that hangs does. Its RPC
+-- does not answer either until 'thawNode'.
+freezeNode :: Container -> Int -> IO ()
+freezeNode c i = signalNode c i "STOP"
+
+-- | Let node number @i@ go on after 'freezeNode', with @SIGCONT@.
+thawNode :: Container -> Int -> IO ()
+thawNode c i = signalNode c i "CONT"
+
+signalNode :: Container -> Int -> String -> IO ()
+signalNode c i sig =
+  void $ exec c ["sh", "-c", "kill -" <> sig <> " $(cat " <> dataDir i <> "/regtest/bitcoind.pid)"]
 
 cli' :: Int -> Container -> Int -> [String] -> IO String
 cli' secs c i args =

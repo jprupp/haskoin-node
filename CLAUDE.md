@@ -20,12 +20,16 @@
   not mix them with `haskell-dev` in one session: each switch compiles
   everything again.
 - `haskell-dev` builds without optimisation. Never time code with it.
-- The tests take about 50 seconds in eight processes, against more than two
-  minutes in one, and about 1.1 GB more memory with the containers. The
-  longest groups are those of the nodes, `/Haskoin.Node.Regtest/Bitcoin Cash
-  Node/` at about 50 seconds and Bitcoin Core at 33, and
+- The tests take about 70 seconds in eight processes, and about 1.1 GB more
+  memory with the containers. The longest groups are those of the nodes,
+  two for each: `/Haskoin.Node.Regtest/Bitcoin Cash Node, one peer/` at
+  about 67 seconds, with its block of more than 2 MiB, and
   `/Haskoin.Node/untrusted peers/` at about 35; `haskell-dev` does not split
-  a group.
+  a group, so a new slow test goes in a group of its own.
+- Test what an honest node does against a real one in
+  `Haskoin.Node.RegtestSpec`, not against a scripted peer: scripted peers in
+  memory are for peers that break the rules. Name a peer of a test by a Unix
+  socket (`unix:PATH`), never by an address and a port.
 
 ## Keep the documentation up to date with every change
 

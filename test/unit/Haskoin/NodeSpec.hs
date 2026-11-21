@@ -15,7 +15,7 @@ import Conduit
 import Control.Concurrent (threadDelay)
 import Control.Concurrent.Async
 import Control.Concurrent.STM
-import Control.Monad (forM_, forever, replicateM)
+import Control.Monad (forM_, forever)
 import Data.ByteString (ByteString)
 import Data.ByteString qualified as B
 import Data.ByteString.Base64 (decodeBase64Lenient)
@@ -30,6 +30,7 @@ import Data.Word (Word32, Word8)
 import Database.RocksDB qualified as R
 import Haskoin
 import Haskoin.Node
+import Haskoin.Node.Address (peerHostAddress)
 import Haskoin.Node.Test (eventually)
 import NQE
 import Network.Socket (PortNumber, SockAddr (..), tupleToHostAddress, tupleToHostAddress6)
@@ -72,8 +73,9 @@ defOpts blocks =
       setup = \_ -> return (),
       timeout = 120,
       discover = False,
-      -- IPv4, so that the mock peer is reachable without IPv6
-      staticPeers = ["127.0.0.1:17486"]
+      -- a name for the mock peer, which lives in memory ('dummyPeerConnect'):
+      -- a Unix socket, so that no address or port of the machine is named
+      staticPeers = ["unix:mock-peer"]
     }
 
 -- | Connect to a mock peer that reacts to messages like this.
@@ -97,7 +99,7 @@ dummyPeerConnect react count net ad sa f = do
     go r s = do
       nonce <- randomIO
       now <- round <$> getPOSIXTime
-      let rmt = NetworkAddress 0 (sockToHostAddress sa)
+      let rmt = NetworkAddress 0 (peerHostAddress sa)
           ver = buildVersion net nonce 0 ad rmt now
       runPut (putMessage net (MVersion ver)) `send` s
       runConduit $
@@ -142,45 +144,6 @@ spec :: Spec
 spec = do
   let net = bchRegTest
   describe "peer manager on test network" $ do
-    it "connects to a peer" $
-      withTestNode net "connect-one-peer" $ \TestNode {..} -> do
-        p <- waitForPeer nodeEvents
-        Just o <- getOnlinePeer testMgr p
-        fmap (.version) o.version `shouldSatisfy` maybe False (>= 70002)
-    it "downloads some blocks" $
-      withTestNode net "get-blocks" $ \TestNode {..} -> do
-        let h1 =
-              "3094ed3592a06f3d8e099eed2d9c1192329944f5df4a48acb29e08f12cfbb660"
-            h2 =
-              "0c89955fc5c9f98ecc71954f167b938138c90c6a094c4737f2e901669d26763f"
-        p <- waitForPeer nodeEvents
-        pbs <- getBlocks net 10 p [h1, h2]
-        (b1, b2) <- case pbs of
-          Just [b1, b2] -> return (b1, b2)
-          _ -> fail ("Expected two blocks, got " <> show pbs)
-        headerHash b1.header `shouldBe` h1
-        headerHash b2.header `shouldBe` h2
-        let ths b = map txHash b.txs
-            testMerkle b = buildMerkleRoot (ths b) `shouldBe` Right b.header.merkle
-        testMerkle b1
-        testMerkle b2
-    it "downloads a block larger than 2 MiB" $ do
-      -- On Bitcoin Cash a block message may be up to twice the block size,
-      -- while every other message is limited to 2 MiB (2097152 bytes).
-      let script = B.replicate 3000000 0x6a
-          tx = Tx 1 [TxIn nullOutPoint B.empty maxBound] [TxOut 0 script] [] 0
-          -- a header that commits to the transaction, or the node would
-          -- refuse the block as not the one its header names
-          root = either error id (buildMerkleRoot [txHash tx])
-          big = case allBlocks of
-            firstBlock : _ -> Block firstBlock.header {merkle = root} [tx]
-            [] -> error "no test blocks"
-      withTestNodeBlocks [big] net "big-block" $ \TestNode {..} -> do
-        p <- waitForPeer nodeEvents
-        pbs <- getBlocks net 10 p [headerHash big.header]
-        let scriptSizes =
-              [[B.length o.script | o <- t.outputs] | b <- concat pbs, t <- b.txs]
-        scriptSizes `shouldBe` [[3000000]]
     it "builds a version message with the given height and time" $ do
       let local = NetworkAddress nodeNetwork (sockToHostAddress (SockAddrInet 0 0))
           remote = NetworkAddress 0 (sockToHostAddress (SockAddrInet 8333 0x08080808))
@@ -189,17 +152,6 @@ spec = do
       v.startHeight `shouldBe` 650000
       v.timestamp `shouldBe` 1700000000
   describe "untrusted peers" $ do
-    it "imports a full batch of 2000 headers"
-      $ withTestNodeOpts
-        (defOpts allBlocks) {react = reactWhenOnline [Right (manyHeaders net 2000)]}
-        net
-        "full-batch"
-      $ \TestNode {..} -> do
-        bn <-
-          receiveMatch nodeEvents $ \case
-            ChainEvent (ChainBestBlock bn) | bn.height > 0 -> Just bn
-            _ -> Nothing
-        bn.height `shouldBe` 2000
     it "disconnects a peer that sends more than 2000 headers"
       $ withTestNodeOpts
         (defOpts allBlocks) {react = reactWhenOnline [Right (manyHeaders net 2001)]}
@@ -373,74 +325,6 @@ spec = do
       withTestNodeOpts (defOpts allBlocks) {setup = setup} net "purge-cf" $
         \TestNode {..} -> do
           R.get testDB k `shouldReturn` Just "keep"
-  describe "chain on test network" $ do
-    it "stops asking a peer that has no more headers" $
-      -- The peer answers getheaders with an empty headers message, as a
-      -- peer does when the node already has its whole chain. The node must
-      -- take that as the end of the sync instead of asking again.
-      withTestNodeBlocks [] net "no-headers" $ \TestNode {..} -> do
-        _ <- waitForPeer nodeEvents
-        atomically $ readTVar getHeadersCount >>= check . (>= 1)
-        threadDelay (1000 * 1000)
-        readTVarIO getHeadersCount `shouldReturn` 1
-    it "reports the headers as synced when the best header has the minimum chain work" $ do
-      -- Every regtest header has a work of 2. Genesis and one header on top
-      -- of it have 2 + 2 = 4, which is the minimum here.
-      fresh <- freshHeader net
-      let net4 = net {minimumChainWork = 4}
-      withTestNodeBlocks [Block fresh []] net4 "min-work-reached" $
-        \TestNode {..} -> do
-          receiveMatch nodeEvents $ \case
-            ChainEvent (ChainBestBlock bn) | bn.height == 1 -> Just ()
-            _ -> Nothing
-          chainSync testChain
-          chainIsSynced testChain `shouldReturn` True
-    it "does not report the headers as synced below the minimum chain work" $ do
-      -- Same chain with a work of 2 + 2 = 4, one short of a minimum of 5.
-      fresh <- freshHeader net
-      let net5 = net {minimumChainWork = 5}
-      withTestNodeBlocks [Block fresh []] net5 "min-work-missing" $
-        \TestNode {..} -> do
-          receiveMatch nodeEvents $ \case
-            ChainEvent (ChainBestBlock bn) | bn.height == 1 -> Just ()
-            _ -> Nothing
-          chainSync testChain
-          chainIsSynced testChain `shouldReturn` False
-    it "syncs some headers" $
-      withTestNode net "connect-sync" $ \TestNode {..} -> do
-        let bh =
-              "3bfa0c6da615fc45aa44ddea6854ac19d16f3ca167e0e21ac2cc262a49c9b002"
-            ah =
-              "7dc835a78a55fa76f9184dc4f6663a73e418c7afec789c5ae25e432fd7fc8467"
-        bn <-
-          receiveMatch nodeEvents $ \case
-            ChainEvent (ChainBestBlock bn)
-              | bn.height > 0 -> Just bn
-            _ -> Nothing
-        bb <- chainGetBest testChain
-        bb.height `shouldSatisfy` (== 15)
-        an <-
-          maybe (error "No ancestor found") return
-            =<< chainGetAncestor testChain 10 bn
-        headerHash bn.header `shouldBe` bh
-        headerHash an.header `shouldBe` ah
-    it "downloads some block parents" $
-      withTestNode net "parents" $ \TestNode {..} -> do
-        let hs =
-              [ "52e886df7b166d961ac2d3d2d561d806325d51a609dc0a5d9d5fcb65d47906d7",
-                "2537a081b9e2b24d217fac2886f387758cb3aa4e4956b3be7ed229bafbb71b0f",
-                "7c72f306215a296f9714320a497b1f2cb5f9b99f162d7e04333c243fac9a54d8"
-              ]
-        [_, bn] <-
-          replicateM 2 $
-            receiveMatch nodeEvents $ \case
-              ChainEvent (ChainBestBlock bn) -> Just bn
-              _ -> Nothing
-        bn.height `shouldBe` 15
-        ps <- chainGetParents testChain 12 bn
-        length ps `shouldBe` 3
-        forM_ (zip ps hs) $ \(p, h) ->
-          headerHash p.header `shouldBe` h
 
 -- | An IPv4 socket address.
 v4At :: (Word8, Word8, Word8, Word8) -> PortNumber -> SockAddr
@@ -482,19 +366,6 @@ manyHeaders net n =
   MHeaders . Headers $
     map (,VarInt 0) (appendBlocks net 0 net.genesisHeader n)
 
--- | Valid header on top of genesis that is dated now. The node only counts
--- its headers as synced when the best one is less than two hours old, and
--- the headers of the other fixtures are years old.
-freshHeader :: Network -> IO BlockHeader
-freshHeader net = do
-  now <- round <$> getPOSIXTime
-  let genesis = net.genesisHeader
-  return $
-    mineBlock
-      net
-      0
-      genesis {version = 4, prev = headerHash genesis, timestamp = now}
-
 -- | Wait for a peer to be announced, failing after a while.
 waitForPeer :: Inbox NodeEvent -> IO Peer
 waitForPeer inbox =
@@ -509,15 +380,6 @@ waitForPeer inbox =
 
 withLifted :: ((a -> IO b) -> IO b) -> (a -> IO b) -> IO b
 withLifted w m = withRunInIO $ \io -> w (io . m)
-
-withTestNode ::
-  Network -> String -> (TestNode -> IO a) -> IO a
-withTestNode = withTestNodeBlocks allBlocks
-
--- | Like 'withTestNode', with the mock peer serving these blocks.
-withTestNodeBlocks ::
-  [Block] -> Network -> String -> (TestNode -> IO a) -> IO a
-withTestNodeBlocks blocks = withTestNodeOpts (defOpts blocks)
 
 withTestNodeOpts ::
   TestOpts -> Network -> String -> (TestNode -> IO a) -> IO a
