@@ -38,6 +38,11 @@ or a `Limits` by hand: `OnlinePeer` has a new field, and `maxLife` of
     strangers.
 
 ### Added
+- `chainHasHeaders`: whether a peer is connected and headers are awaited
+  from none. Unlike `chainIsSynced` it does not ask that the best block be
+  recent, and it is not kept once true: it tells a node that is still
+  taking headers from one that has them, on a network where no block was
+  found for hours too.
 - `configured` in `OnlinePeer`: whether the peer is one of the
   configuration.
 

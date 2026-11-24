@@ -226,6 +226,24 @@ spec = forM_ [btcRegTest, bchRegTest] $ \net ->
         _ <- syncPeer ct "a" old
         chainIsSynced ct.chain `shouldReturn` False
 
+      it "has the headers of its peers when none is awaited, however old they are, and not without a peer" $
+        slow $ \ct -> do
+          -- nobody to have the headers of
+          chainHasHeaders ct.chain `shouldReturn` False
+          let old = mkHeaders net 0 net.genesisHeader 1500000000 10
+          _ <- syncPeer ct "a" old
+          chainHasHeaders ct.chain `shouldReturn` True
+          chainIsSynced ct.chain `shouldReturn` False
+
+      it "does not have the headers of its peers while a peer still sends them" $ slow $ \ct -> do
+        a <- connectPeer ct "a"
+        var <- newTVarIO main
+        -- the peer is asked, and has not answered
+        chainHasHeaders ct.chain `shouldReturn` False
+        withServer ct a var $ \_ -> do
+          _ <- waitHeight ct 4500
+          eventually 10 "the chain to have the headers of its peer" (chainHasHeaders ct.chain)
+
       it "stops asking a peer that sends no headers" $ slow $ \ct -> do
         a <- connectPeer ct "a"
         _ <- expectGetHeaders a

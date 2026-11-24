@@ -623,7 +623,7 @@ An alert on errors is then an alert about the node, not about the network.
 | Models of peers | `Judgement`, `judgementText`, `expectsReject`, `Permission`, `Permissions` |
 | Blocks         | `blockMutation`, `BlockMutation`, `witnessCheck`, `WitnessCheck`, `segWitHeight` |
 | Peer manager   | `PeerMgr`, `OnlinePeer`, `PeerState`, `Stage`, `DisconnectReason`, `getPeers`, `getOnlinePeer`, `toSockAddr`, `isRoutable` |
-| Chain          | `Chain`, `ChainEvent`, `chainGetBest`, `chainGetBlock`, `chainGetAncestor`, `chainGetParents`, `chainGetSplitBlock`, `chainBlockMain`, `chainIsSynced`, `chainRunHeaders` |
+| Chain          | `Chain`, `ChainEvent`, `chainGetBest`, `chainGetBlock`, `chainGetAncestor`, `chainGetParents`, `chainGetSplitBlock`, `chainBlockMain`, `chainIsSynced`, `chainHasHeaders`, `chainRunHeaders` |
 | Logging        | `Logger`, `LogLevel`, `withLogger`, `withSource`, `logDebug` ... `logError`  |
 
 The lower-level functions that feed messages to the peer manager and the chain

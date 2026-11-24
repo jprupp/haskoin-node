@@ -88,6 +88,7 @@ module Haskoin.Node.Chain
     chainPeerConnected,
     chainPeerDisconnected,
     chainIsSynced,
+    chainHasHeaders,
     chainBlockMain,
     chainHeaders,
     chainBlocksAnnounced,
@@ -563,6 +564,25 @@ chainBlockMain ch bh = do
 -- chain falls behind later.
 chainIsSynced :: Chain -> IO Bool
 chainIsSynced ch = (.beenInSync) <$> readTVarIO ch.state
+
+-- | Whether the chain has the headers of its peers: a peer is connected,
+-- and headers are awaited from none, neither the one that is being synced
+-- against nor one that waits its turn.
+--
+-- This is not 'chainIsSynced', which also asks that the best block be
+-- recent and have the work of the network, and which stays 'True' once it
+-- was. A network where no block was found for hours has no recent block,
+-- and a node that has every header of it is at its tip all the same. Use
+-- this to tell a node that is still taking headers, two thousand at a
+-- time, from one that has them: while they come, an application that
+-- imports the blocks catches up with the last header that the node has
+-- again and again, and is at no tip.
+--
+-- With no peer it is 'False': there is nobody to have the headers of.
+chainHasHeaders :: Chain -> IO Bool
+chainHasHeaders ch = do
+  s <- (.sync) <$> readTVarIO ch.state
+  return (not (null (connectedPeers s)) && isNothing (syncingPeer s) && null (queuedPeers s))
 
 -- | Peer sends a bunch of headers to the chain process. "Haskoin.Node" calls
 -- this for every headers message received from an online peer.
