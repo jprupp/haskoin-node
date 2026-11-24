@@ -23,7 +23,7 @@ version = buildVersion btcRegTest 7 0 (zeroAddress nodeNetwork) (zeroAddress 0) 
 
 -- | A ten second timeout and a hundred second maximum life.
 limits :: Limits
-limits = Limits {timeout = 10, maxLife = 100}
+limits = Limits {timeout = 10, maxLife = Just 100}
 
 -- | Feed inputs to a new connection, collecting the actions.
 run :: [PeerInput] -> (PeerState, [PeerAction])
@@ -130,6 +130,12 @@ spec = describe "connection lifecycle" $ do
       -- 100 seconds is the maximum life here; the peer is pinged instead
       drop 2 (snd (run (online <> [Heard (at 100), Tick (at 100) 1])))
         `shouldBe` [SendPing 1]
+
+    it "never rotates a peer that has no longest life, as a configured one" $ do
+      let kept = limits {maxLife = Nothing}
+          go (st, acc) i = let (st', as) = stepPeer kept i st in (st', acc <> as)
+          actions = snd (foldl' go (newPeerState t0, []) (online <> [Heard (at 100000), Tick (at 100001) 1]))
+      drop 2 actions `shouldBe` [SendPing 1]
 
     it "rotates before checking anything else" $
       snd (run [Tick (at 101) 1]) `shouldBe` [Disconnect TooOld]

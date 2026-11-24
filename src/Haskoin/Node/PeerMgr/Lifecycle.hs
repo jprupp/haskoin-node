@@ -111,8 +111,9 @@ data PeerState = PeerState
 data Limits = Limits
   { -- | longest silence, unanswered ping or handshake
     timeout :: !NominalDiffTime,
-    -- | longest connection, after which it is rotated
-    maxLife :: !NominalDiffTime
+    -- | longest connection, after which it is rotated; 'Nothing' for a
+    -- connection that is never rotated, as one to a configured peer
+    maxLife :: !(Maybe NominalDiffTime)
   }
   deriving stock (Eq, Show)
 
@@ -188,7 +189,7 @@ stepPeer limits input st =
           )
     (_, GotPong _ _) -> (st, [])
     (stage, Tick now nonce)
-      | now `since` st.connected > limits.maxLife -> disconnect now TooOld
+      | Just life <- limits.maxLife, now `since` st.connected > life -> disconnect now TooOld
       | now `since` st.lastHeard > limits.timeout -> disconnect now Silent
       | Handshaking _ <- stage,
         now `since` st.connected > limits.timeout ->

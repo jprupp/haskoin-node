@@ -108,7 +108,7 @@ a full node.
 | --------------- | ---------------------------------------------------------------------------------------------- |
 | Networks        | Every network of haskoin-core: Bitcoin and Bitcoin Cash mainnet, testnets and regtest           |
 | Peer discovery  | DNS seeds and addresses relayed by peers, or a static list of peers                             |
-| Peer management | Version handshake, ping-based latency, peers sorted by median ping, rotation after a maximum age, retry backoff and bans for bad addresses, random choice among learned addresses with one connection per network group |
+| Peer management | Version handshake, ping-based latency, peers sorted by median ping, rotation after a maximum age, retry backoff and bans for bad addresses, random choice among learned addresses with one connection per network group; configured peers kept: never rotated, tried again within ten seconds for ever, with a slot kept for each while it is away |
 | Header sync     | Headers downloaded from one peer at a time, with a deadline per turn, connected to the chain with the most work, stored in RocksDB; new blocks followed whether peers announce them with headers or inventory, announcing peers asked at once, and peers polled after a quiet period |
 | Events          | Best header changes, sync completion, peer connections and every message received              |
 | Data requests   | Fetch blocks and transactions from a peer, with a timeout; every block checked against its header's Merkle root and witness commitment |
@@ -607,7 +607,7 @@ An alert on errors is then an alert about the node, not about the network.
 | `net`         | Network constants from haskoin-core (`btc`, `bch`, `btcTest`, ...)        |
 | `pub`         | Publisher that receives every `NodeEvent`                                 |
 | `timeout`     | Seconds of silence, without a pong, or without completing the handshake, before a peer is dropped; also how long the syncing peer may take to send headers, and the quiet period after which every peer is asked for headers |
-| `maxPeerLife` | Seconds after which a peer is dropped, so that connections rotate         |
+| `maxPeerLife` | Seconds after which a peer is dropped, so that connections rotate. Not the peers of `peers`: a configured peer is kept |
 | `connect`     | How to open a connection; usually `withConnection`                        |
 | `logger`      | Where to log; see `withLogger`                                            |
 | `permissions` | Permissions that the nodes of `peers` grant this node with `-whitelist` or `-whitebind`, such as `PermMempool`; see [What a peer allows](#what-a-peer-allows) |

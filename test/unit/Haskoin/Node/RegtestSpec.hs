@@ -383,12 +383,16 @@ peerTests impl = do
       freezeNode c 0
       waitForDisconnect t p `finally` thawNode c 0
 
-  it "drops a peer connected for longer than the most it allows" $
+  -- Rotation is for peers that nobody chose ("Haskoin.Node.PeerMgr"). This
+  -- test once said that the peer was dropped after two seconds, and it was.
+  it "keeps a configured peer past the longest life that it allows a connection" $
     withMinedNode impl 1 $ \c -> do
       addr <- hostAddress c 0
       withTestNode net [addr] withConnection (setMaxPeerLife 2 . setTimeout 4) $ \t -> do
         p <- waitForPeer t
-        waitForDisconnect t p
+        expectNothingWithin 8 "the disconnection of a configured peer" t.events $ \case
+          PeerEvent (PeerDisconnected p') | p == p' -> Just ()
+          _ -> Nothing
 
   it "answers the pings of the node" $ withMinedNode impl 1 $ \c ->
     withRegtestNode c [0] $ \t -> do

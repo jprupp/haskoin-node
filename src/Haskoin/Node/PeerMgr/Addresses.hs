@@ -23,10 +23,16 @@
 --
 -- * __Configured peers are trusted more.__ Addresses from the configuration
 --   are what the operator asked for, so they are never banned and never
---   forgotten: they back off at most 'maxBackoff', even after misbehaving.
---   They are also tried first. Addresses from DNS seeds and gossip are
---   banned for misbehaving, and at most 'maxDiscovered' of each are kept, so
---   gossip cannot exhaust memory.
+--   forgotten. They are tried first, and tried again every
+--   'configuredBackoff' at most, whatever ended the last connection: a node
+--   of the operator that comes back is a peer again within seconds.
+--   Addresses from DNS seeds and gossip are banned for misbehaving, and at
+--   most 'maxDiscovered' of each are kept, so gossip cannot exhaust memory.
+--
+-- * __A configured peer keeps its place.__ While a configured peer has no
+--   connection, a slot is kept for it, and no seed or gossiped address may
+--   take it ('roomForOthers'). Before, the others filled every slot while
+--   a configured peer was away, and it found none when it came back.
 --
 -- * __Seeds and gossip are kept apart.__ Addresses from DNS seeds count
 --   against their own limit. A peer that gossips thousands of addresses can
@@ -65,8 +71,10 @@ module Haskoin.Node.PeerMgr.Addresses
     needsReload,
     markLoaded,
     knownAddresses,
+    roomForOthers,
     retryDelay,
     maxBackoff,
+    configuredBackoff,
     banTime,
     reloadInterval,
     maxDiscovered,
@@ -148,6 +156,13 @@ retryDelay = 1
 -- | Longest wait after failures.
 maxBackoff :: NominalDiffTime
 maxBackoff = 600
+
+-- | Longest wait before a configured address is tried again, whatever
+-- ended its last connection. The only reason for a configured peer to have
+-- no connection is that it takes none, and the node must find out soon
+-- when it does again.
+configuredBackoff :: NominalDiffTime
+configuredBackoff = 10
 
 -- | Wait after a discovered address misbehaved.
 banTime :: NominalDiffTime
@@ -237,12 +252,27 @@ finishAddress ::
 finishAddress now outcome = adjust $ \e ->
   let wait d f = e {state = Waiting (d `addUTCTime` now) f, failures = f}
       backoff f = min maxBackoff (retryDelay * 2 ^ min f 30)
+      most = if e.source == Configured then configuredBackoff else maxBackoff
    in case outcome of
         Disconnected -> wait retryDelay 0
-        Failed -> let f = e.failures + 1 in wait (backoff f) f
+        Failed -> let f = e.failures + 1 in wait (min most (backoff f)) f
         Misbehaved
-          | e.source == Configured -> wait maxBackoff (e.failures + 1)
+          | e.source == Configured -> wait configuredBackoff (e.failures + 1)
           | otherwise -> wait banTime (e.failures + 1)
+
+-- | Whether a seed or gossiped address may be connected to: whether a slot
+-- is free that no configured peer is waiting for.
+--
+-- Given the most connections, the addresses of each configured peer, as
+-- its name resolved, and the addresses of the open connections. A
+-- configured peer that has no connection to any of its addresses has a
+-- slot kept for it, also one whose name resolved to nothing. One name is
+-- one peer: a name with two addresses, as @localhost@ has, keeps one slot
+-- and not two.
+roomForOthers :: (Eq a) => Int -> [[a]] -> [a] -> Bool
+roomForOthers most configured open = length open + length away < most
+  where
+    away = [() | addresses <- configured, not (any (`elem` open) addresses)]
 
 -- | State of an address, or 'Nothing' if it is not known.
 addressState :: (Ord a) => a -> AddressBook a -> Maybe AddressState

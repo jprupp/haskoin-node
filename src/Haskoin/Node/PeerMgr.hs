@@ -22,6 +22,11 @@
 -- in time, or has been connected for longer than 'maxPeerLife'. A
 -- 'PeerDisconnected' event is published when an announced peer goes away.
 --
+-- The static peers of the configuration are the peers that the operator
+-- trusts, and they are kept: never rotated, tried again within seconds
+-- when their connection ends, for as long as it takes, and with a slot
+-- kept for each while it is away.
+--
 -- Most of the @peerMgr*@ functions are used by "Haskoin.Node" to feed messages
 -- received from peers to the peer manager; applications rarely need to call
 -- them directly.
@@ -48,6 +53,15 @@
 --   they behave. A node that keeps the same few peers forever is easier to
 --   isolate from the honest network, and stuck with them if they degrade.
 --   Rotation keeps the peer set fresh.
+--
+-- * __Configured peers stay.__ Rotation is a defence against peers that
+--   nobody chose. A configured peer is a node that the operator trusts,
+--   often their own, and the one whose word an application takes: it is
+--   never rotated. When its connection ends it is tried again every ten
+--   seconds at most ('configuredBackoff'), and meanwhile its slot is kept:
+--   seed and gossiped addresses cannot take it ('roomForOthers'). The only
+--   reason for a configured peer to have no connection is that it takes
+--   none.
 --
 -- * __Silence is failure.__ A peer that sends nothing, or ignores a ping, for
 --   longer than 'timeout' is dropped. Waiting for a peer that has gone away
@@ -186,6 +200,8 @@ data PeerMgr = PeerMgr
     addresses :: !(TVar (AddressBook SockAddr)),
     -- | open connections, fastest peers first
     peers :: !(TVar [OnlinePeer]),
+    -- | the addresses of each configured peer, as its name last resolved
+    configured :: !(TVar [[SockAddr]]),
     -- | how well connected the log last said the node was ('Connected')
     told :: !(TVar Connected)
   }
@@ -243,7 +259,10 @@ data OnlinePeer = OnlinePeer
     mailbox :: !Peer,
     -- | nonce of the version message we sent, used to detect connections to
     -- ourselves
-    nonce :: !Word64
+    nonce :: !Word64,
+    -- | whether it is a static peer of the configuration, which the
+    -- operator trusts: it is never rotated
+    configured :: !Bool
   }
 
 instance Eq OnlinePeer where
@@ -298,6 +317,7 @@ withPeerMgr cfg action = do
     best <- newTVarIO 0
     addresses <- newTVarIO emptyBook
     peers <- newTVarIO []
+    configured <- newTVarIO []
     told <- newTVarIO NoPeers
     let mgr =
           PeerMgr
@@ -307,6 +327,7 @@ withPeerMgr cfg action = do
               best = best,
               addresses = addresses,
               peers = peers,
+              configured = configured,
               told = told
             }
     withAsync (peerManager mgr inbox) $ \a ->
@@ -324,9 +345,14 @@ peerManager mgr inbox = do
     logDebug mgr.config.logger "Awaiting event..."
     dispatch mgr =<< receive inbox
 
--- | Time limits of connections.
-limits :: PeerMgr -> Limits
-limits mgr = Limits {timeout = mgr.config.timeout, maxLife = mgr.config.maxPeerLife}
+-- | Time limits of a connection. One to a configured peer is never
+-- rotated.
+limits :: PeerMgr -> OnlinePeer -> Limits
+limits mgr o =
+  Limits
+    { timeout = mgr.config.timeout,
+      maxLife = if o.configured then Nothing else Just mgr.config.maxPeerLife
+    }
 
 -- | Handle a message sent to the peer manager.
 dispatch :: PeerMgr -> PeerMgrMessage -> IO ()
@@ -364,7 +390,7 @@ peerInput mgr p input = do
     case find ((== p) . (.mailbox)) ops of
       Nothing -> return Nothing
       Just o -> do
-        let (st, actions) = stepPeer (limits mgr) input o.state
+        let (st, actions) = stepPeer (limits mgr o) input o.state
             o' = o {state = st}
         writeTVar mgr.peers (sort (o' : filter (/= o) ops))
         return (Just (o', actions))
@@ -497,7 +523,9 @@ logConnectedPeers mgr = do
 --
 -- Configured peers come first. Otherwise an address is picked at random among
 -- those in a network group that the node is not connected to yet, as Bitcoin
--- Core requires of its automatic outbound connections (see 'netGroup').
+-- Core requires of its automatic outbound connections (see 'netGroup'), and
+-- only while a slot is free that no configured peer is waiting for
+-- ('othersFit').
 getNewPeer :: PeerMgr -> IO (Maybe SockAddr)
 getNewPeer mgr = do
   now <- getCurrentTime
@@ -506,10 +534,20 @@ getNewPeer mgr = do
   r <- randomIO
   atomically $ do
     used <- usedGroups <$> readTVar mgr.peers
+    room <- othersFit mgr
     stateTVar mgr.addresses $ \book ->
-      case takeAddress now r ((`notElem` used) . netGroup) book of
+      case takeAddress now r (\sa -> room && netGroup sa `notElem` used) book of
         Just (sa, book') -> (Just sa, book')
         Nothing -> (Nothing, book)
+
+-- | Whether a seed or gossiped address may be connected to now: a slot is
+-- free, and no configured peer that has no connection is waiting for it
+-- ('roomForOthers').
+othersFit :: PeerMgr -> STM Bool
+othersFit mgr = do
+  open <- map (.address) <$> readTVar mgr.peers
+  names <- readTVar mgr.configured
+  return (roomForOthers mgr.config.maxPeers names open)
 
 -- | Network groups of the open connections.
 usedGroups :: [OnlinePeer] -> [NetGroup]
@@ -525,23 +563,30 @@ loadPeers :: PeerMgr -> UTCTime -> IO ()
 loadPeers mgr now = do
   let net = mgr.config.net
       resolve = fmap concat . mapM (toSockAddr net)
-  configured <- resolve mgr.config.peers
+  -- one list for each name: a name is one peer, whatever it resolves to
+  names <- mapM (toSockAddr net) mgr.config.peers
+  let configured = concat names
   seeds <- if mgr.config.discover then filter isRoutable <$> resolve net.seeds else return []
-  atomically . modifyTVar' mgr.addresses $ \book ->
-    markLoaded now $
-      foldr (addAddress Seeded) (foldr (addAddress Configured) book configured) seeds
+  atomically $ do
+    writeTVar mgr.configured names
+    modifyTVar' mgr.addresses $ \book ->
+      markLoaded now $
+        foldr (addAddress Seeded) (foldr (addAddress Configured) book configured) seeds
 
 -- | Start a peer process for an address taken from the address book and send
 -- it our version, unless there are no free slots, the address is connected
 -- already, or it is a seed or gossiped address in a network group that the
--- node is connected to already. Then the address is given back.
+-- node is connected to already, or one that would take the slot kept for a
+-- configured peer that has no connection. Then the address is given back.
 connectPeer :: PeerMgr -> SockAddr -> IO ()
 connectPeer mgr sa = do
   ops <- readTVarIO mgr.peers
   source <- addressSource sa <$> readTVarIO mgr.addresses
+  room <- atomically (othersFit mgr)
   if
     | length ops >= mgr.config.maxPeers -> giveBack "no free slots"
     | any ((== sa) . (.address)) ops -> giveBack "already connected"
+    | source /= Just Configured && not room -> giveBack "the free slots are kept for configured peers"
     | source /= Just Configured && netGroup sa `elem` usedGroups ops ->
         giveBack "network group in use"
     | otherwise -> do
@@ -585,7 +630,8 @@ connectPeer mgr sa = do
                 state = newPeerState now,
                 async = a,
                 mailbox = p,
-                nonce = nonce
+                nonce = nonce,
+                configured = source == Just Configured
               }
               : x
   where

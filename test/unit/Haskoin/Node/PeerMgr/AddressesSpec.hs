@@ -111,9 +111,35 @@ spec = describe "address book" $ do
   it "bans a discovered address that misbehaved" $
     retryAt 1 (cycleWith Misbehaved 1 (book [1])) `shouldBe` Just (later banTime)
 
-  it "never bans a configured address" $ do
+  it "never bans a configured address, and tries it again within seconds" $ do
     let b = addAddress Configured 1 (book [1])
-    retryAt 1 (cycleWith Misbehaved 1 b) `shouldBe` Just (later maxBackoff)
+    retryAt 1 (cycleWith Misbehaved 1 b) `shouldBe` Just (later configuredBackoff)
+
+  it "tries a configured address that fails again every ten seconds at most, for ever" $ do
+    let own = addAddress Configured 1 emptyBook
+        waits = map (retryAt 1) (drop 1 (iterate (cycleFailed 1) own))
+        cycleFailed a b = finishAddress t0 Failed a (snd (taken (later 1000000) b))
+    take 4 waits `shouldBe` map (Just . later) [2, 4, 8, configuredBackoff]
+    waits !! 200 `shouldBe` Just (later configuredBackoff)
+
+  describe "the slots kept for configured peers" $ do
+    it "lets others in while every configured peer is connected" $ do
+      roomForOthers 3 [[1 :: Int], [2]] [1, 2] `shouldBe` True
+      roomForOthers 3 [[1 :: Int], [2]] [1, 2, 9] `shouldBe` False
+    it "keeps a slot for each configured peer that has no connection" $ do
+      roomForOthers 3 [[1 :: Int], [2]] [1] `shouldBe` True
+      roomForOthers 3 [[1 :: Int], [2]] [1, 9] `shouldBe` False
+      roomForOthers 3 [[1 :: Int], [2]] [9] `shouldBe` False
+      roomForOthers 2 [[1 :: Int], [2]] [] `shouldBe` False
+    it "takes a name with two addresses for one peer" $ do
+      roomForOthers 2 [[1 :: Int, 2]] [2] `shouldBe` True
+      roomForOthers 2 [[1 :: Int, 2]] [9] `shouldBe` False
+    it "keeps a slot for a name that resolved to nothing" $
+      roomForOthers 2 [[] :: [Int]] [9] `shouldBe` False
+    it "never lets the others and the configured peers that are away fill more than there is" $
+      property $ \(most :: Int) (names :: [[Int]]) (open :: [Int]) ->
+        let away = length [() | n <- names, not (any (`elem` open) n)]
+         in roomForOthers most names open == (length open + away < most)
 
   it "keeps a bounded number of discovered addresses" $ do
     let b = book [1 .. maxDiscovered + 10]
