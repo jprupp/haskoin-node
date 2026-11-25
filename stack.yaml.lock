@@ -51,15 +51,15 @@ packages:
     commit: 923fc08d57b29f0dbd7ff37080b3c0f1df619d04
     git: https://github.com/jprupp/podman-test.git
 - completed:
-    commit: b2449f23bb6e15f1729d199ea091969026b54b70
+    commit: a0ba466ad21be4c8c3d3208a5fe44d4d1950e1bb
     git: https://github.com/jprupp/haskoin-core.git
     name: haskoin-core
     pantry-tree:
-      sha256: 20307745d4b3464053c11902e5d1e01c5c06581ce73ac875c80da8d26494818b
+      sha256: dcf336f66dae9bc04d950d154030f4fe396f5717040c5c32c1d143cf08277ff8
       size: 11738
     version: 3.0.0
   original:
-    commit: b2449f23bb6e15f1729d199ea091969026b54b70
+    commit: a0ba466ad21be4c8c3d3208a5fe44d4d1950e1bb
     git: https://github.com/jprupp/haskoin-core.git
 snapshots:
 - completed:
