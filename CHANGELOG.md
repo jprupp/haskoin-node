@@ -144,8 +144,7 @@ or a `Limits` by hand: `OnlinePeer` has a new field, and `maxLife` of
 - Needs haskoin-core 3.0, for its protocol machines. 3.0 also reads the
   token prefix of Bitcoin Cash outputs (CashTokens) and adds a field to
   `Network`, which change nothing here: haskoin-node passes outputs on as
-  they are, and builds no `Network` of its own. Until 3.0 is on Hackage,
-  `stack.yaml` pins a commit of haskoin-core's master.
+  they are, and builds no `Network` of its own.
 - CI runs through the workflow that the Haskell packages of jprupp share in
   [jprupp/tools](https://github.com/jprupp/tools), with the check of
   `stack.yaml` for local paths (`check-stack-paths`) and the cache of the
