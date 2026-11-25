@@ -101,6 +101,12 @@ or a `Limits` by hand: `OnlinePeer` has a new field, and `maxLife` of
   the later of that and the time of the facts (`remoteClock`).
 
 ### Changed
+- **fast-logger 3.3 is accepted** (`>= 3.2 && < 3.4`, where it was
+  `< 3.3`), which Stackage asked for
+  ([stackage#8183](https://github.com/commercialhaskell/stackage/issues/8183)).
+  No code changes. Tested: the whole suite passes with fast-logger 3.3.0,
+  against both nodes too. `stack.yaml` still builds with 3.2.9, the
+  version of its snapshot.
 - **Every concurrent protocol is a pure machine.** The new
   [docs/concurrency.md](docs/concurrency.md) says, for every thread, what it
   owns, the machine that decides what it does, and why no two threads can

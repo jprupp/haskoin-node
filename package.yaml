@@ -55,7 +55,7 @@ library:
     - conduit >= 1.3 && < 1.4
     - conduit-extra >= 1.3 && < 1.4
     - containers >= 0.6 && < 0.8
-    - fast-logger >= 3.2 && < 3.3
+    - fast-logger >= 3.2 && < 3.4
     - haskoin-core >= 3.0 && < 3.1
     - network >= 3.1 && < 3.3
     - nqe >= 0.7.0 && < 0.8
