@@ -12,6 +12,6 @@ extra-deps:
   - rocksdb-query-0.7.0
   - nqe-0.7.0
   - git: https://github.com/jprupp/podman-test.git
-    commit: 607ddbe2c503b67a25581ed9e167f94fdf27c785
+    commit: 923fc08d57b29f0dbd7ff37080b3c0f1df619d04
   - git: https://github.com/jprupp/haskoin-core.git
-    commit: 254b4a9636ab475eeb22c60b7a75067a4615b32f
+    commit: b2449f23bb6e15f1729d199ea091969026b54b70

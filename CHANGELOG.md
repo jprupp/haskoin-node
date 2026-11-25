@@ -6,50 +6,14 @@ and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
-Configured peers are kept. This breaks code that builds an `OnlinePeer`
-or a `Limits` by hand: `OnlinePeer` has a new field, and `maxLife` of
-`Limits` is a `Maybe`.
-
-### Changed
-- **The peers of the configuration are sticky.** They are the peers that
-  the operator trusts, and the only reason for one to have no connection
-  is now that it takes none.
-  - **Never rotated.** `maxPeerLife` no longer applies to a configured
-    peer. Rotation defends against peers that nobody chose. `maxLife` of
-    `Limits` is `Nothing` for such a connection.
-  - **Tried again within ten seconds, for ever.** A configured address
-    that failed waited twice as long each time, up to ten minutes, and
-    ten minutes after its peer broke the protocol. It now waits ten
-    seconds at most, whatever ended the last connection
-    (`configuredBackoff`). A node of the operator that restarts is a peer
-    again within seconds.
-  - **Its slot is kept.** While a configured peer had no connection, seed
-    and gossiped addresses filled every slot, and the peer found none
-    when it came back, until one of them left. A slot is now kept for
-    each configured peer that has no connection, and no other address
-    takes it (`roomForOthers`). One name is one peer, whatever it
-    resolves to.
-  - Tested: the two rules of the address book, as examples and with a
-    property; that a connection without a longest life is not dropped
-    for its age; and, against Bitcoin Core and Bitcoin Cash Node, that a
-    configured peer stays past `maxPeerLife`, where the same test said
-    before that it was dropped. Not tested end to end: a store with
-    discovery whose configured peer is away, which needs a network of
-    strangers.
-
-### Added
-- `chainHasHeaders`: whether a peer is connected and headers are awaited
-  from none. Unlike `chainIsSynced` it does not ask that the best block be
-  recent, and it is not kept once true: it tells a node that is still
-  taking headers from one that has them, on a network where no block was
-  found for hours too.
-- `configured` in `OnlinePeer`: whether the peer is one of the
-  configuration.
-
-## [2.7.0] - 2026-11-22
+## [2.7.0] - 2026-11-25
 
 Peers on Unix sockets, a model of the node at the other end of each
 connection, and haskoin-core 3.0, for haskoin-store 2.0.0.
+
+Configured peers are kept. This breaks code that builds an `OnlinePeer`
+or a `Limits` by hand: `OnlinePeer` has a new field, and `maxLife` of
+`Limits` is a `Maybe`.
 
 ### Added
 - **A model of each peer's node.** Every connection runs the state machine
@@ -94,6 +58,13 @@ connection, and haskoin-core 3.0, for haskoin-store 2.0.0.
   with the new `peerHostAddress`: haskoin-core's `sockToHostAddress` stops
   the program on an address that is not IPv4 or IPv6. A peer or a DNS seed
   can never give a Unix address.
+- `chainHasHeaders`: whether a peer is connected and headers are awaited
+  from none. Unlike `chainIsSynced` it does not ask that the best block be
+  recent, and it is not kept once true: it tells a node that is still
+  taking headers from one that has them, on a network where no block was
+  found for hours too.
+- `configured` in `OnlinePeer`: whether the peer is one of the
+  configuration.
 
 ### Fixed
 - **A peer is announced before its messages.** A peer's messages come from
@@ -202,6 +173,31 @@ connection, and haskoin-core 3.0, for haskoin-store 2.0.0.
   suite is gone. They are still skipped without Podman or with
   `HASKOIN_NODE_SKIP_REGTEST` set, and CI still runs them in a job of their
   own. The container of the nodes may use 2 GiB of memory.
+- **The peers of the configuration are sticky.** They are the peers that
+  the operator trusts, and the only reason for one to have no connection
+  is now that it takes none.
+  - **Never rotated.** `maxPeerLife` no longer applies to a configured
+    peer. Rotation defends against peers that nobody chose. `maxLife` of
+    `Limits` is `Nothing` for such a connection.
+  - **Tried again within ten seconds, for ever.** A configured address
+    that failed waited twice as long each time, up to ten minutes, and
+    ten minutes after its peer broke the protocol. It now waits ten
+    seconds at most, whatever ended the last connection
+    (`configuredBackoff`). A node of the operator that restarts is a peer
+    again within seconds.
+  - **Its slot is kept.** While a configured peer had no connection, seed
+    and gossiped addresses filled every slot, and the peer found none
+    when it came back, until one of them left. A slot is now kept for
+    each configured peer that has no connection, and no other address
+    takes it (`roomForOthers`). One name is one peer, whatever it
+    resolves to.
+  - Tested: the two rules of the address book, as examples and with a
+    property; that a connection without a longest life is not dropped
+    for its age; and, against Bitcoin Core and Bitcoin Cash Node, that a
+    configured peer stays past `maxPeerLife`, where the same test said
+    before that it was dropped. Not tested end to end: a store with
+    discovery whose configured peer is away, which needs a network of
+    strangers.
 
 ## [2.6.1] - 2026-11-18
 
